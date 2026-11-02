@@ -1,14 +1,6 @@
 // The #[server] macro's generated client-side (hydrate) stub trips this —
 // nothing in code we wrote.
 #![allow(clippy::unused_async_trait_impl)]
-// WikiPage's view (app.rs) nests Suspense/Transition/match/closures deep
-// enough that rustc's type-level query recursion for AnyView::into_any's
-// hydrate_async overflows the default 128 limit in release builds —
-// confirmed failing a `cargo leptos build --release` with "queries
-// overflow the depth limit!" otherwise. Debug builds don't hit it, which
-// is why this only ever showed up in a release/Docker build, not CI's
-// debug build or clippy.
-#![recursion_limit = "512"]
 
 pub mod account;
 pub mod app;

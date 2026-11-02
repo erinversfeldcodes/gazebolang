@@ -17,9 +17,9 @@ use crate::dictionary::get_word_definition;
 use crate::dictionary_ui::{ClickableWord, DictionaryDetailsEditor};
 use crate::media_recorder::RecordButton;
 use crate::wiki::{
-    AddPageToCard, CreatePage, DeletePage, MovePage, PageTreeNode, RemovePageFromCard, RenamePage,
-    RestoreRevision, SavePageRevision, cards_for_page, get_page, get_revision_diff,
-    list_page_revisions, list_page_tree, search_pages,
+    AddPageToCard, CreatePage, DeletePage, MovePage, PageRevisionSummary, PageTreeNode,
+    RemovePageFromCard, RenamePage, RestoreRevision, RevisionDiff, SavePageRevision,
+    cards_for_page, get_page, get_revision_diff, list_page_revisions, list_page_tree, search_pages,
 };
 // Only called from the Done handler's #[cfg(feature = "hydrate")] branch
 // (see WikiPage below) — an unused-import warning (and so a clippy -D
@@ -1451,12 +1451,20 @@ fn wiki_tree_level(
 /// `WikiListPage` and `WikiPage` already fetch the tree for their own
 /// purposes, and `WikiPage` needs it for breadcrumbs too, so this avoids a
 /// second independent fetch of the same data on every wiki page).
+///
+/// Returns `AnyView`, like `wiki_tree_level`/`wiki_search_results_view`
+/// below it: `WikiPage` embeds this inline, and leaving it as a plain
+/// `impl IntoView` let its whole nested search/`Transition`/tree type get
+/// inlined into `WikiPage`'s own view type — confirmed as the actual
+/// culprit (named directly in rustc's error) the one time bumping
+/// `recursion_limit` alone wasn't enough to stop `cargo leptos build
+/// --release` overflowing rustc's query-depth limit.
 fn wiki_sidebar(
     pages: std::sync::Arc<Vec<PageTreeNode>>,
     signed_in: bool,
     create: ServerAction<CreatePage>,
     new_title: RwSignal<String>,
-) -> impl IntoView {
+) -> AnyView {
     let create_form = signed_in.then(|| {
         view! {
             <form on:submit=move |ev| {
@@ -1540,6 +1548,7 @@ fn wiki_sidebar(
             </div>
         </aside>
     }
+        .into_any()
 }
 
 /// Pulled out of `wiki_sidebar` purely to keep that function under
@@ -1658,6 +1667,267 @@ fn page_and_descendant_ids(pages: &[PageTreeNode], root: Uuid) -> std::collectio
         }
     }
     ids
+}
+
+/// The delete/move actions `wiki_page_actions_menu` dispatches, plus each
+/// one's own transient UI state — grouped the same way `db.rs`'s
+/// `WordFields` is, so this (and `wiki_page_actions_menu`'s other params)
+/// doesn't trip clippy's `too_many_arguments`.
+#[derive(Clone, Copy)]
+struct WikiPageActions {
+    delete: ServerAction<DeletePage>,
+    delete_armed: RwSignal<bool>,
+    move_page: ServerAction<MovePage>,
+    move_open: RwSignal<bool>,
+}
+
+/// The "⋯" menu — copy link / toggle history / move / delete — plus its
+/// own Move popover and move-dispatch error. Pulled out of `WikiPage`'s
+/// view and `AnyView`-erased, the same reason and the same way as
+/// `wiki_sidebar` above: this specific piece (named directly in rustc's
+/// error) was still enough on its own to overflow `cargo leptos build
+/// --release`'s query-depth limit even after other pieces nearby were
+/// already erased.
+fn wiki_page_actions_menu(
+    id: Uuid,
+    pages: &[PageTreeNode],
+    actions: WikiPageActions,
+    show_history: RwSignal<bool>,
+    diff_target: RwSignal<Option<Uuid>>,
+    link_copied: RwSignal<bool>,
+) -> AnyView {
+    let WikiPageActions {
+        delete,
+        delete_armed,
+        move_page,
+        move_open,
+    } = actions;
+    // Every page except this one and its own descendants — moving under
+    // either would put a cycle in the tree.
+    let excluded = page_and_descendant_ids(pages, id);
+    let move_targets: Vec<(Uuid, String)> = pages
+        .iter()
+        .filter(|p| !excluded.contains(&p.id))
+        .map(|p| (p.id, p.title.clone()))
+        .collect();
+    let more_menu_ref = NodeRef::<html::Details>::new();
+    view! {
+        <details class="wiki-more" node_ref=more_menu_ref>
+            <summary>"⋯"</summary>
+            <div class="wiki-more-items">
+                <button
+                    type="button"
+                    on:click=move |_| {
+                        #[cfg(feature = "hydrate")]
+                        if let Some(window) = web_sys::window()
+                            && let Ok(origin) = window.location().origin()
+                        {
+                            let url = format!("{origin}/wiki/{id}");
+                            let _ = window.navigator().clipboard().write_text(&url);
+                            link_copied.set(true);
+                            set_timeout(
+                                move || link_copied.set(false),
+                                std::time::Duration::from_secs(2),
+                            );
+                        }
+                    }
+                >
+                    {move || if link_copied.get() { "Copied!" } else { "Copy link" }}
+                </button>
+                <button
+                    type="button"
+                    on:click=move |_| {
+                        show_history.update(|s| *s = !*s);
+                        diff_target.set(None);
+                    }
+                >
+                    {move || {
+                        if show_history.get() {
+                            "Hide history"
+                        } else {
+                            "History"
+                        }
+                    }}
+                </button>
+                <button
+                    type="button"
+                    on:click=move |_| {
+                        move_open.update(|s| *s = !*s);
+                        // The native <details> toggling
+                        // itself open/closed and this
+                        // button living inside it are
+                        // independent — without this,
+                        // the "..." dropdown stayed
+                        // open underneath the Move
+                        // popover (confirmed live).
+                        if let Some(el) = more_menu_ref.get() {
+                            el.set_open(false);
+                        }
+                    }
+                >
+                    "Move"
+                </button>
+                <ActionForm action=delete>
+                    <input type="hidden" name="page_id" value=id.to_string() />
+                    {confirm_button("Delete page", delete_armed)}
+                </ActionForm>
+            </div>
+        </details>
+        {wiki_move_popover(id, move_targets, move_page, move_open)}
+    }
+    .into_any()
+}
+
+/// The Move popover `wiki_page_actions_menu`'s own "Move" button opens,
+/// plus its dispatch error. Pulled out mainly to keep that function under
+/// clippy's line-count limit, same reason as `wiki_search_results_view`'s
+/// own doc comment — not a query-depth fix in its own right the way
+/// `wiki_page_actions_menu` itself is, but `AnyView`-erasing it costs
+/// nothing and keeps the pattern consistent.
+fn wiki_move_popover(
+    id: Uuid,
+    move_targets: Vec<(Uuid, String)>,
+    move_page: ServerAction<MovePage>,
+    move_open: RwSignal<bool>,
+) -> impl Fn() -> Option<AnyView> {
+    move || {
+        let popover = move_open.get().then(|| {
+            view! {
+                <div class="wiki-move-popover">
+                    <label>"Move to"</label>
+                    <select on:change=move |ev| {
+                        let value = event_target_value(&ev);
+                        let new_parent_id = Uuid::parse_str(&value).ok();
+                        move_page.dispatch(MovePage { page_id: id, new_parent_id });
+                        move_open.set(false);
+                    }>
+                        <option value="" selected=true disabled=true>
+                            "Choose a page…"
+                        </option>
+                        <option value="">"(top level)"</option>
+                        {move_targets
+                            .iter()
+                            .map(|(target_id, title)| {
+                                view! {
+                                    <option value=target_id.to_string()>{title.clone()}</option>
+                                }
+                            })
+                            .collect_view()}
+                    </select>
+                </div>
+            }
+        });
+        let error = move_page.value().get().and_then(Result::err).map(|e| {
+            view! { <p>"Error moving: " {e.to_string()}</p> }
+        });
+        Some(view! { {popover} {error} }.into_any())
+    }
+}
+
+/// Delete/rename dispatch errors — block-level messages, kept separate
+/// from `wiki_page_actions_menu`'s own button strip rather than squeezed
+/// into it. `AnyView`-erased for the same query-depth reason as that
+/// function.
+fn wiki_page_action_errors(
+    delete: ServerAction<DeletePage>,
+    rename: ServerAction<RenamePage>,
+) -> AnyView {
+    view! {
+        {move || {
+            delete.value().get().and_then(Result::err).map(|e| {
+                view! { <p>"Error deleting: " {e.to_string()}</p> }
+            })
+        }}
+        {move || {
+            rename.value().get().and_then(Result::err).map(|e| {
+                view! { <p>"Error renaming: " {e.to_string()}</p> }
+            })
+        }}
+    }
+    .into_any()
+}
+
+/// The revision history panel — a `Transition`/`Suspend`'d list of past
+/// revisions plus an inline diff viewer. Returns a closure rather than
+/// calling into the view eagerly, since `WikiPage` embeds this reactively
+/// (the same way it already embeds `save_status`): `show_history` toggles
+/// it without the whole page re-resolving. `AnyView`-erased inside for the
+/// same query-depth reason as `wiki_page_actions_menu`.
+fn wiki_history_panel(
+    id: Uuid,
+    signed_in: bool,
+    show_history: RwSignal<bool>,
+    diff_target: RwSignal<Option<Uuid>>,
+    restore: ServerAction<RestoreRevision>,
+    revisions: Resource<Result<Option<Vec<PageRevisionSummary>>, ServerFnError>>,
+    diff: Resource<Result<Option<RevisionDiff>, ServerFnError>>,
+) -> impl Fn() -> Option<AnyView> {
+    move || {
+        show_history.get().then(|| {
+            view! {
+                <Transition fallback=|| view! { <p>"Loading…"</p> }>
+                    {move || Suspend::new(async move {
+                        match revisions.await {
+                            Ok(Some(revs)) if revs.is_empty() => {
+                                view! { <p>"No revisions yet."</p> }.into_any()
+                            }
+                            Ok(Some(revs)) => {
+                                view! {
+                                    <ul class="wiki-history-list">
+                                        {revs
+                                            .into_iter()
+                                            .map(|r| {
+                                                let rid = r.id;
+                                                view! {
+                                                    <li>
+                                                        <span>{r.created_at}</span>
+                                                        <button
+                                                            type="button"
+                                                            on:click=move |_| diff_target.set(Some(rid))
+                                                        >
+                                                            "View diff"
+                                                        </button>
+                                                        {signed_in.then(|| view! {
+                                                            <button
+                                                                type="button"
+                                                                on:click=move |_| {
+                                                                    restore
+                                                                        .dispatch(RestoreRevision {
+                                                                            page_id: id,
+                                                                            revision_id: rid,
+                                                                        });
+                                                                    show_history.set(false);
+                                                                }
+                                                            >
+                                                                "Restore"
+                                                            </button>
+                                                        })}
+                                                    </li>
+                                                }
+                                            })
+                                            .collect_view()}
+                                    </ul>
+                                    {move || Suspend::new(async move {
+                                        diff.await
+                                            .ok()
+                                            .flatten()
+                                            .map(|d| {
+                                                view! {
+                                                    <div class="wiki-diff" inner_html=d.diff_html></div>
+                                                }
+                                            })
+                                    })}
+                                }
+                                    .into_any()
+                            }
+                            _ => ().into_any(),
+                        }
+                    })}
+                </Transition>
+            }
+                .into_any()
+        })
+    }
 }
 
 #[component]
@@ -2093,199 +2363,36 @@ fn WikiPage() -> impl IntoView {
                             }
                         });
 
-                        #[cfg(feature = "hydrate")]
-                        let page_path = format!("/wiki/{id}");
-                        // Every page except this one and its own descendants —
-                        // moving under either would put a cycle in the tree.
-                        let excluded = page_and_descendant_ids(&pages, id);
-                        let move_targets: Vec<(Uuid, String)> = pages
-                            .iter()
-                            .filter(|p| !excluded.contains(&p.id))
-                            .map(|p| (p.id, p.title.clone()))
-                            .collect();
-                        let more_menu_ref = NodeRef::<html::Details>::new();
                         let secondary_actions = signed_in.then(|| {
-                            view! {
-                                <details class="wiki-more" node_ref=more_menu_ref>
-                                    <summary>"⋯"</summary>
-                                    <div class="wiki-more-items">
-                                        <button
-                                            type="button"
-                                            on:click=move |_| {
-                                                #[cfg(feature = "hydrate")]
-                                                if let Some(window) = web_sys::window()
-                                                    && let Ok(origin) = window.location().origin()
-                                                {
-                                                    let url = format!("{origin}{page_path}");
-                                                    let _ = window.navigator().clipboard().write_text(&url);
-                                                    link_copied.set(true);
-                                                    set_timeout(
-                                                        move || link_copied.set(false),
-                                                        std::time::Duration::from_secs(2),
-                                                    );
-                                                }
-                                            }
-                                        >
-                                            {move || if link_copied.get() { "Copied!" } else { "Copy link" }}
-                                        </button>
-                                        <button
-                                            type="button"
-                                            on:click=move |_| {
-                                                show_history.update(|s| *s = !*s);
-                                                diff_target.set(None);
-                                            }
-                                        >
-                                            {move || {
-                                                if show_history.get() {
-                                                    "Hide history"
-                                                } else {
-                                                    "History"
-                                                }
-                                            }}
-                                        </button>
-                                        <button
-                                            type="button"
-                                            on:click=move |_| {
-                                                move_open.update(|s| *s = !*s);
-                                                // The native <details> toggling
-                                                // itself open/closed and this
-                                                // button living inside it are
-                                                // independent — without this,
-                                                // the "..." dropdown stayed
-                                                // open underneath the Move
-                                                // popover (confirmed live).
-                                                if let Some(el) = more_menu_ref.get() {
-                                                    el.set_open(false);
-                                                }
-                                            }
-                                        >
-                                            "Move"
-                                        </button>
-                                        <ActionForm action=delete>
-                                            <input type="hidden" name="page_id" value=id.to_string() />
-                                            {confirm_button("Delete page", delete_armed)}
-                                        </ActionForm>
-                                    </div>
-                                </details>
-                                {move || {
-                                    move_open.get().then(|| {
-                                        view! {
-                                            <div class="wiki-move-popover">
-                                                <label>"Move to"</label>
-                                                <select on:change=move |ev| {
-                                                    let value = event_target_value(&ev);
-                                                    let new_parent_id = Uuid::parse_str(&value).ok();
-                                                    move_page.dispatch(MovePage { page_id: id, new_parent_id });
-                                                    move_open.set(false);
-                                                }>
-                                                    <option value="" selected=true disabled=true>
-                                                        "Choose a page…"
-                                                    </option>
-                                                    <option value="">"(top level)"</option>
-                                                    {move_targets
-                                                        .iter()
-                                                        .map(|(target_id, title)| {
-                                                            view! {
-                                                                <option value=target_id.to_string()>{title.clone()}</option>
-                                                            }
-                                                        })
-                                                        .collect_view()}
-                                                </select>
-                                            </div>
-                                        }
-                                    })
-                                }}
-                                {move || {
-                                    move_page.value().get().and_then(Result::err).map(|e| {
-                                        view! { <p>"Error moving: " {e.to_string()}</p> }
-                                    })
-                                }}
-                            }
+                            wiki_page_actions_menu(
+                                id,
+                                &pages,
+                                WikiPageActions {
+                                    delete,
+                                    delete_armed,
+                                    move_page,
+                                    move_open,
+                                },
+                                show_history,
+                                diff_target,
+                                link_copied,
+                            )
                         });
 
                         // Separate from the menu itself — these are block-
                         // level messages, not something that belongs
                         // squeezed into the title row's button strip.
-                        let action_errors = signed_in.then(|| {
-                            view! {
-                                {move || {
-                                    delete.value().get().and_then(Result::err).map(|e| {
-                                        view! { <p>"Error deleting: " {e.to_string()}</p> }
-                                    })
-                                }}
-                                {move || {
-                                    rename.value().get().and_then(Result::err).map(|e| {
-                                        view! { <p>"Error renaming: " {e.to_string()}</p> }
-                                    })
-                                }}
-                            }
-                        });
+                        let action_errors = signed_in.then(|| wiki_page_action_errors(delete, rename));
 
-                        let history_panel = move || {
-                            show_history.get().then(|| {
-                                view! {
-                                    <Transition fallback=|| view! { <p>"Loading…"</p> }>
-                                        {move || Suspend::new(async move {
-                                            match revisions.await {
-                                                Ok(Some(revs)) if revs.is_empty() => {
-                                                    view! { <p>"No revisions yet."</p> }.into_any()
-                                                }
-                                                Ok(Some(revs)) => {
-                                                    view! {
-                                                        <ul class="wiki-history-list">
-                                                            {revs
-                                                                .into_iter()
-                                                                .map(|r| {
-                                                                    let rid = r.id;
-                                                                    view! {
-                                                                        <li>
-                                                                            <span>{r.created_at}</span>
-                                                                            <button
-                                                                                type="button"
-                                                                                on:click=move |_| diff_target.set(Some(rid))
-                                                                            >
-                                                                                "View diff"
-                                                                            </button>
-                                                                            {signed_in.then(|| view! {
-                                                                                <button
-                                                                                    type="button"
-                                                                                    on:click=move |_| {
-                                                                                        restore
-                                                                                            .dispatch(RestoreRevision {
-                                                                                                page_id: id,
-                                                                                                revision_id: rid,
-                                                                                            });
-                                                                                        show_history.set(false);
-                                                                                    }
-                                                                                >
-                                                                                    "Restore"
-                                                                                </button>
-                                                                            })}
-                                                                        </li>
-                                                                    }
-                                                                })
-                                                                .collect_view()}
-                                                        </ul>
-                                                        {move || Suspend::new(async move {
-                                                            diff.await
-                                                                .ok()
-                                                                .flatten()
-                                                                .map(|d| {
-                                                                    view! {
-                                                                        <div class="wiki-diff" inner_html=d.diff_html></div>
-                                                                    }
-                                                                })
-                                                        })}
-                                                    }
-                                                        .into_any()
-                                                }
-                                                _ => ().into_any(),
-                                            }
-                                        })}
-                                    </Transition>
-                                }
-                            })
-                        };
+                        let history_panel = wiki_history_panel(
+                            id,
+                            signed_in,
+                            show_history,
+                            diff_target,
+                            restore,
+                            revisions,
+                            diff,
+                        );
 
                         view! {
                             {breadcrumbs}
