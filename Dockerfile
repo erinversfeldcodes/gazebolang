@@ -1,3 +1,16 @@
+# --- Editor builder ---------------------------------------------------------
+# wiki-editor.js/.css are gitignored build output (see .gitignore), built
+# fresh here the same way CI's own e2e job does — without this stage,
+# crates/web/public never gets populated, cargo-leptos below has nothing
+# to copy into the site root, and the deployed app silently ships a wiki
+# editor that can never mount.
+FROM node:22-bookworm-slim AS editor-builder
+WORKDIR /app/editor
+COPY editor/package.json editor/package-lock.json ./
+RUN npm ci
+COPY editor/ .
+RUN npm run build
+
 # --- Builder ---------------------------------------------------------------
 # Pinned to the same Debian release as the runtime stage below: the plain
 # `rust:1` tag floats to whatever Debian release is currently latest (it
@@ -17,6 +30,7 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY . .
+COPY --from=editor-builder /app/crates/web/public /app/crates/web/public
 # --precompress also disables cargo-leptos's default parallel front/server
 # build, which otherwise interleaves output badly enough to obscure real
 # build errors.
