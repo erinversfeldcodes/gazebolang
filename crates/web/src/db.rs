@@ -806,6 +806,7 @@ pub struct WordRow {
     pub target_text: String,
     pub part_of_speech: Option<String>,
     pub notes: Option<String>,
+    pub english_translation: Option<String>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -825,13 +826,15 @@ pub struct WordDefinitionRow {
     pub target_text: String,
     pub part_of_speech: Option<String>,
     pub notes: Option<String>,
+    pub english_translation: Option<String>,
     pub examples: Vec<WordExampleRow>,
     pub linked_words: Vec<LinkedWordRow>,
 }
 
 async fn get_word_by_text(pool: &PgPool, target_text: &str) -> sqlx::Result<Option<WordRow>> {
     sqlx::query_as(
-        "SELECT id, target_text, part_of_speech, notes FROM words WHERE target_text = $1",
+        "SELECT id, target_text, part_of_speech, notes, english_translation \
+         FROM words WHERE target_text = $1",
     )
     .bind(target_text)
     .fetch_optional(pool)
@@ -876,6 +879,7 @@ pub async fn get_word_definition(
         target_text: word.target_text,
         part_of_speech: word.part_of_speech,
         notes: word.notes,
+        english_translation: word.english_translation,
         examples,
         linked_words,
     }))
@@ -903,6 +907,19 @@ async fn resolve_or_create_word_id_in_tx(
     .await
 }
 
+/// The headword-level fields `upsert_word_definition` writes, grouped so
+/// adding one more (as `english_translation` just did) doesn't trip
+/// clippy's `too_many_arguments` on the function itself — these three are
+/// already a natural unit (the word's own optional metadata), distinct
+/// from the child-table data (`examples`/`linked_word_texts`) and the
+/// identity/context args (`target_text`/`created_by`) around them.
+#[derive(Default)]
+pub struct WordFields<'a> {
+    pub part_of_speech: Option<&'a str>,
+    pub notes: Option<&'a str>,
+    pub english_translation: Option<&'a str>,
+}
+
 /// Creates or updates `target_text`'s dictionary entry, replacing its
 /// examples and linked words wholesale — the same delete-then-reinsert idiom
 /// `update_card`/`set_card_tags_in_tx` already use for tags. `created_by` is
@@ -913,25 +930,26 @@ pub async fn upsert_word_definition(
     pool: &PgPool,
     target_text: &str,
     created_by: Uuid,
-    part_of_speech: Option<&str>,
-    notes: Option<&str>,
+    fields: WordFields<'_>,
     examples: &[(String, Option<String>)],
     linked_word_texts: &[String],
 ) -> sqlx::Result<Uuid> {
     let mut tx = pool.begin().await?;
 
     let word_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO words (target_text, part_of_speech, notes, created_by) \
-         VALUES ($1, $2, $3, $4) \
+        "INSERT INTO words (target_text, part_of_speech, notes, english_translation, created_by) \
+         VALUES ($1, $2, $3, $4, $5) \
          ON CONFLICT (target_text) DO UPDATE SET \
             part_of_speech = EXCLUDED.part_of_speech, \
             notes = EXCLUDED.notes, \
+            english_translation = EXCLUDED.english_translation, \
             updated_at = now() \
          RETURNING id",
     )
     .bind(target_text)
-    .bind(part_of_speech)
-    .bind(notes)
+    .bind(fields.part_of_speech)
+    .bind(fields.notes)
+    .bind(fields.english_translation)
     .bind(created_by)
     .fetch_one(&mut *tx)
     .await?;
@@ -1158,6 +1176,33 @@ pub async fn move_page(
     Ok(())
 }
 
+/// Reparents a page to the end of its new siblings — the same
+/// MAX(position)+1-in-a-transaction pattern `create_page` uses, so a moved
+/// page doesn't collide with or shuffle the position of pages already in
+/// the target parent.
+pub async fn move_page_to_end(
+    pool: &PgPool,
+    page_id: Uuid,
+    new_parent_id: Option<Uuid>,
+) -> sqlx::Result<()> {
+    let mut tx = pool.begin().await?;
+    let next_position: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(position) + 1, 0) FROM pages \
+         WHERE parent_id IS NOT DISTINCT FROM $1",
+    )
+    .bind(new_parent_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE pages SET parent_id = $1, position = $2 WHERE id = $3")
+        .bind(new_parent_id)
+        .bind(next_position)
+        .bind(page_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn page_has_children(pool: &PgPool, page_id: Uuid) -> sqlx::Result<bool> {
     sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pages WHERE parent_id = $1)")
         .bind(page_id)
@@ -1242,6 +1287,60 @@ pub async fn search_pages(pool: &PgPool, query: &str) -> sqlx::Result<Vec<PageSe
          LIMIT 20",
     )
     .bind(query)
+    .fetch_all(pool)
+    .await
+}
+
+// --- card <-> page links ------------------------------------------------
+// Mirrors deck_cards/add_card_to_deck exactly: a plain many-to-many join,
+// add/remove by pair rather than a replace-the-whole-set upsert.
+
+pub async fn add_page_to_card(pool: &PgPool, card_id: Uuid, page_id: Uuid) -> sqlx::Result<()> {
+    sqlx::query("INSERT INTO card_pages (card_id, page_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+        .bind(card_id)
+        .bind(page_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn remove_page_from_card(
+    pool: &PgPool,
+    card_id: Uuid,
+    page_id: Uuid,
+) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM card_pages WHERE card_id = $1 AND page_id = $2")
+        .bind(card_id)
+        .bind(page_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn card_page_ids(pool: &PgPool, card_id: Uuid) -> sqlx::Result<Vec<Uuid>> {
+    sqlx::query_scalar("SELECT page_id FROM card_pages WHERE card_id = $1")
+        .bind(card_id)
+        .fetch_all(pool)
+        .await
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct LinkedCardRow {
+    pub id: Uuid,
+    pub target_text: String,
+}
+
+/// The cards that cite `page_id` — the wiki page's side of the link,
+/// rendered as a "Cards using this" backlink list so the connection is
+/// visible from the page, not just from the card's edit form.
+pub async fn cards_for_page(pool: &PgPool, page_id: Uuid) -> sqlx::Result<Vec<LinkedCardRow>> {
+    sqlx::query_as(
+        "SELECT c.id, c.target_text FROM cards c \
+         JOIN card_pages cp ON cp.card_id = c.id \
+         WHERE cp.page_id = $1 \
+         ORDER BY c.target_text",
+    )
+    .bind(page_id)
     .fetch_all(pool)
     .await
 }
@@ -1800,8 +1899,11 @@ mod tests {
             &pool,
             "perro",
             user_id,
-            Some("noun"),
-            Some("the common word for dog"),
+            WordFields {
+                part_of_speech: Some("noun"),
+                notes: Some("the common word for dog"),
+                ..Default::default()
+            },
             &[(
                 "El perro corre.".to_string(),
                 Some("The dog runs.".to_string()),
@@ -1824,15 +1926,27 @@ mod tests {
     async fn upsert_word_definition_on_same_text_updates_rather_than_duplicates(pool: PgPool) {
         let user_id = test_user(&pool).await;
 
-        upsert_word_definition(&pool, "casa", user_id, Some("noun"), None, &[], &[])
-            .await
-            .unwrap();
         upsert_word_definition(
             &pool,
             "casa",
             user_id,
-            Some("noun (updated)"),
-            None,
+            WordFields {
+                part_of_speech: Some("noun"),
+                ..Default::default()
+            },
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        upsert_word_definition(
+            &pool,
+            "casa",
+            user_id,
+            WordFields {
+                part_of_speech: Some("noun (updated)"),
+                ..Default::default()
+            },
             &[],
             &[],
         )
@@ -1864,9 +1978,16 @@ mod tests {
     async fn linked_words_are_symmetric_regardless_of_which_side_was_saved(pool: PgPool) {
         let user_id = test_user(&pool).await;
 
-        upsert_word_definition(&pool, "a", user_id, None, None, &[], &["b".to_string()])
-            .await
-            .unwrap();
+        upsert_word_definition(
+            &pool,
+            "a",
+            user_id,
+            WordFields::default(),
+            &[],
+            &["b".to_string()],
+        )
+        .await
+        .unwrap();
 
         let def_b = get_word_definition(&pool, "b").await.unwrap().unwrap();
         assert_eq!(def_b.linked_words.len(), 1);
@@ -1881,16 +2002,22 @@ mod tests {
             &pool,
             "a",
             user_id,
-            None,
-            None,
+            WordFields::default(),
             &[],
             &["b".to_string(), "c".to_string()],
         )
         .await
         .unwrap();
-        upsert_word_definition(&pool, "a", user_id, None, None, &[], &["c".to_string()])
-            .await
-            .unwrap();
+        upsert_word_definition(
+            &pool,
+            "a",
+            user_id,
+            WordFields::default(),
+            &[],
+            &["c".to_string()],
+        )
+        .await
+        .unwrap();
 
         let def_a = get_word_definition(&pool, "a").await.unwrap().unwrap();
         assert_eq!(def_a.linked_words.len(), 1);
@@ -1904,9 +2031,16 @@ mod tests {
     async fn linking_to_a_word_with_no_existing_entry_creates_a_satisfiable_stub_row(pool: PgPool) {
         let user_id = test_user(&pool).await;
 
-        upsert_word_definition(&pool, "a", user_id, None, None, &[], &["stub".to_string()])
-            .await
-            .unwrap();
+        upsert_word_definition(
+            &pool,
+            "a",
+            user_id,
+            WordFields::default(),
+            &[],
+            &["stub".to_string()],
+        )
+        .await
+        .unwrap();
 
         // The stub has no part_of_speech/notes of its own yet, but it
         // exists and is linked.
@@ -1916,9 +2050,19 @@ mod tests {
 
         // Giving the stub its own real entry later updates it in place
         // rather than creating a second `words` row.
-        upsert_word_definition(&pool, "stub", user_id, Some("noun"), None, &[], &[])
-            .await
-            .unwrap();
+        upsert_word_definition(
+            &pool,
+            "stub",
+            user_id,
+            WordFields {
+                part_of_speech: Some("noun"),
+                ..Default::default()
+            },
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM words WHERE target_text = $1")
             .bind("stub")
             .fetch_one(&pool)
@@ -1931,11 +2075,58 @@ mod tests {
     async fn a_word_is_never_linked_to_itself(pool: PgPool) {
         let user_id = test_user(&pool).await;
 
-        upsert_word_definition(&pool, "a", user_id, None, None, &[], &["a".to_string()])
-            .await
-            .unwrap();
+        upsert_word_definition(
+            &pool,
+            "a",
+            user_id,
+            WordFields::default(),
+            &[],
+            &["a".to_string()],
+        )
+        .await
+        .unwrap();
 
         let def_a = get_word_definition(&pool, "a").await.unwrap().unwrap();
         assert!(def_a.linked_words.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn linking_a_card_to_a_page_makes_it_findable_from_either_side(pool: PgPool) {
+        let user_id = test_user(&pool).await;
+        let card_id = create_card(&pool, user_id, card_with_text("corro"), &[])
+            .await
+            .unwrap();
+        let page_id = create_page(&pool, user_id, None, "Present tense", "present-tense")
+            .await
+            .unwrap();
+
+        add_page_to_card(&pool, card_id, page_id).await.unwrap();
+
+        assert_eq!(card_page_ids(&pool, card_id).await.unwrap(), vec![page_id]);
+        let linked = cards_for_page(&pool, page_id).await.unwrap();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].target_text, "corro");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn removing_a_page_from_a_card_excludes_it_again(pool: PgPool) {
+        let user_id = test_user(&pool).await;
+        let card_id = create_card(&pool, user_id, card_with_text("corro"), &[])
+            .await
+            .unwrap();
+        let page_id = create_page(&pool, user_id, None, "Present tense", "present-tense")
+            .await
+            .unwrap();
+        add_page_to_card(&pool, card_id, page_id).await.unwrap();
+
+        remove_page_from_card(&pool, card_id, page_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            card_page_ids(&pool, card_id).await.unwrap(),
+            Vec::<Uuid>::new()
+        );
+        assert!(cards_for_page(&pool, page_id).await.unwrap().is_empty());
     }
 }

@@ -134,6 +134,7 @@ fn render_lookup_result(
         Some(Ok(Some(def))) => view! {
             <h3>{def.target_text}</h3>
             {def.part_of_speech.map(|p| view! { <p class="word-pos">{p}</p> })}
+            {def.english_translation.map(|t| view! { <p class="word-gloss">{t}</p> })}
             {def.notes.map(|n| view! { <p>{n}</p> })}
             {render_examples(def.examples)}
             {render_linked_words(def.linked_words, dialog_ref, lookup, current_word, history)}
@@ -208,6 +209,7 @@ pub fn DictionaryDetailsEditor(
     target_text: Signal<String>,
     #[prop(default = String::new())] part_of_speech_initial: String,
     #[prop(default = String::new())] notes_initial: String,
+    #[prop(default = String::new())] english_translation_initial: String,
     #[prop(default = String::new())] example_target_initial: String,
     #[prop(default = String::new())] example_gloss_initial: String,
     #[prop(default = String::new())] linked_words_initial: String,
@@ -215,6 +217,7 @@ pub fn DictionaryDetailsEditor(
     let save = ServerAction::<SaveWordDefinition>::new();
     let part_of_speech: NodeRef<html::Input> = NodeRef::new();
     let notes: NodeRef<html::Textarea> = NodeRef::new();
+    let english_translation: NodeRef<html::Input> = NodeRef::new();
     let example_target: NodeRef<html::Input> = NodeRef::new();
     let example_gloss: NodeRef<html::Input> = NodeRef::new();
     let linked_words: NodeRef<html::Input> = NodeRef::new();
@@ -222,6 +225,10 @@ pub fn DictionaryDetailsEditor(
     view! {
         <div class="card-section">
             <p class="card-section-heading">"Dictionary details (optional)"</p>
+            <label>
+                "English translation"
+                <input type="text" node_ref=english_translation value=english_translation_initial />
+            </label>
             <label>
                 "Part of speech"
                 <input type="text" node_ref=part_of_speech value=part_of_speech_initial />
@@ -249,6 +256,7 @@ pub fn DictionaryDetailsEditor(
                         target_text: target_text.get_untracked(),
                         part_of_speech: part_of_speech.get().map(|el| el.value()).unwrap_or_default(),
                         notes: notes.get().map(|el| el.value()).unwrap_or_default(),
+                        english_translation: english_translation.get().map(|el| el.value()).unwrap_or_default(),
                         example_target_sentence: example_target.get().map(|el| el.value()).unwrap_or_default(),
                         example_gloss_sentence: example_gloss.get().map(|el| el.value()).unwrap_or_default(),
                         linked_words_raw: linked_words.get().map(|el| el.value()).unwrap_or_default(),

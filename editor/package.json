@@ -1,0 +1,25 @@
+{
+  "name": "editor",
+  "version": "1.0.0",
+  "description": "BlockNote wiki editor island, built separately from the Cargo workspace and loaded only on /wiki routes",
+  "private": true,
+  "scripts": {
+    "build": "vite build"
+  },
+  "type": "module",
+  "dependencies": {
+    "@blocknote/core": "^0.56.0",
+    "@blocknote/mantine": "^0.56.0",
+    "@blocknote/react": "^0.56.0",
+    "@blocknote/xl-multi-column": "^0.56.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  }
+}
