@@ -1451,34 +1451,9 @@ function WikiEditorApp({
     [editor],
   );
 
-  // Cmd/Ctrl+B/I/U — confirmed live that BlockNote doesn't reliably bind
-  // these itself here (dispatching a synthetic keydown reached something
-  // that called preventDefault, but editor.document came back with no
-  // style applied — nothing was actually listening for the *toggle*).
-  // Wired directly rather than chasing why, using the exact same
-  // editor.toggleStyles the toolbar buttons already call successfully.
-  const handleEditorKeyDown = useCallback(
-    (ev: KeyboardEvent) => {
-      if (readOnly) return;
-      const mod = ev.metaKey || ev.ctrlKey;
-      if (!mod) return;
-      const style =
-        ev.key === "b" || ev.key === "B" ? "bold" :
-        ev.key === "i" || ev.key === "I" ? "italic" :
-        ev.key === "u" || ev.key === "U" ? "underline" :
-        null;
-      if (style) {
-        ev.preventDefault();
-        editor.toggleStyles({ [style]: true });
-      }
-    },
-    [editor, readOnly],
-  );
-
   return (
     <div
       className="wiki-editor-shell"
-      onKeyDown={handleEditorKeyDown}
       onDragOver={(ev) => {
         ev.preventDefault();
       }}
