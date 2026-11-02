@@ -214,6 +214,11 @@ struct CardFormFields {
     remove_audio: bool,
     remove_video: bool,
     remove_youtube: bool,
+    // Only ever populated by NewCardPage's deck checkboxes — EditCardPage's
+    // form never emits a `deck_id` field (deck membership there is toggled
+    // immediately via its own server actions, not submitted with this
+    // form), so `cards_update` always sees this empty.
+    deck_ids: Vec<uuid::Uuid>,
 }
 
 /// Pulls every field out of a card create/edit form submission: text
@@ -237,6 +242,7 @@ async fn parse_card_multipart(
         remove_audio: false,
         remove_video: false,
         remove_youtube: false,
+        deck_ids: Vec::new(),
     };
 
     while let Some(field) = multipart
@@ -267,6 +273,15 @@ async fn parse_card_multipart(
                 let trimmed = raw.trim();
                 if !trimmed.is_empty() {
                     fields.image_url = Some(trimmed.to_string());
+                }
+            }
+            // One multipart field per checked checkbox, all sharing this
+            // name — not a single overwritable slot — so a card can be
+            // assigned to any number of decks at creation time.
+            "deck_id" => {
+                let raw = field.text().await.unwrap_or_default();
+                if let Ok(deck_id) = raw.trim().parse() {
+                    fields.deck_ids.push(deck_id);
                 }
             }
             "audio" => fields.audio_url = upload_media_field(state, field, "audio").await?,
@@ -372,8 +387,21 @@ async fn cards_new(
         &parse_tags(&fields.tags_raw),
     )
     .await;
-    if let Err(e) = result {
-        return error_redirect("/new", &e.to_string());
+    let card_id = match result {
+        Ok(id) => id,
+        Err(e) => return error_redirect("/new", &e.to_string()),
+    };
+
+    // Best-effort, same as `upload_media_field` above: the card itself is
+    // already created at this point, so a deck-membership failure here
+    // (only plausible on a genuine DB/connectivity issue — `deck_id`s come
+    // from checkboxes for decks `list_decks` just returned, not user input)
+    // logs and moves on rather than showing an "error" for a card that in
+    // fact exists.
+    for deck_id in fields.deck_ids {
+        if let Err(e) = web::db::add_card_to_deck(&state.db_pool, deck_id, card_id).await {
+            log::error!("failed to assign new card {card_id} to deck {deck_id}: {e}");
+        }
     }
 
     axum::response::Redirect::to("/")
