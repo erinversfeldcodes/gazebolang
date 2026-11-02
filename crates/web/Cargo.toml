@@ -31,6 +31,7 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "q
 s3 = { version = "0.1.38", default-features = false, optional = true, features = ["async", "rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", optional = true }
+similar = { version = "3.2.1", optional = true }
 sqlx = { version = "0.9.0", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "time", "tls-rustls", "uuid"], optional = true }
 time = { version = "0.3.55", features = ["serde"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"], optional = true }
@@ -59,6 +60,7 @@ web-sys = { version = "0.3", optional = true, features = [
     "HtmlInputElement",
     "HtmlDialogElement",
     "Navigator",
+    "Clipboard",
     "Url",
     "Event",
     "EventTarget",
@@ -84,6 +86,7 @@ ssr = [
     "dep:rand",
     "dep:reqwest",
     "dep:serde_json",
+    "dep:similar",
     "dep:tower-cookies",
     "dep:env_logger",
     "dep:s3",
@@ -103,6 +106,11 @@ output-name = "web"
 site-root = "target/site"
 site-pkg-dir = "pkg"
 style-file = "style/main.css"
+# The wiki editor island (editor/, built by `npm run build`) lands here —
+# cargo-leptos copies this dir's contents into site-root verbatim, served
+# alongside pkg/ but outside it, since it's not part of the app's own
+# wasm/js bundle.
+assets-dir = "public"
 site-addr = "127.0.0.1:3000"
 reload-port = 3001
 env = "DEV"

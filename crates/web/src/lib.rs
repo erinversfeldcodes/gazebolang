@@ -15,6 +15,8 @@ pub mod image_search;
 pub mod media_recorder;
 pub mod state;
 pub mod storage;
+pub mod wiki;
+pub mod wiki_editor;
 
 #[cfg(feature = "hydrate")]
 #[wasm_bindgen::prelude::wasm_bindgen]

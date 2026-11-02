@@ -16,13 +16,24 @@ use crate::decks::{
 use crate::dictionary::get_word_definition;
 use crate::dictionary_ui::{ClickableWord, DictionaryDetailsEditor};
 use crate::media_recorder::RecordButton;
+use crate::wiki::{
+    AddPageToCard, CreatePage, DeletePage, MovePage, PageRevisionSummary, PageTreeNode,
+    RemovePageFromCard, RenamePage, RestoreRevision, RevisionDiff, SavePageRevision,
+    cards_for_page, get_page, get_revision_diff, list_page_revisions, list_page_tree, search_pages,
+};
+// Only called from the Done handler's #[cfg(feature = "hydrate")] branch
+// (see WikiPage below) — an unused-import warning (and so a clippy -D
+// warnings failure) under the ssr-only build otherwise.
+#[cfg(feature = "hydrate")]
+use crate::wiki::save_page_revision;
+use crate::wiki_editor::WikiEditor;
 use leptos::html;
 use leptos::prelude::*;
 use leptos_meta::{MetaTags, Stylesheet, Title, provide_meta_context};
 use leptos_router::{
     StaticSegment,
     components::{A, Redirect, Route, Router, Routes},
-    hooks::{use_navigate, use_params_map, use_query_map},
+    hooks::{use_location, use_navigate, use_params_map, use_query_map},
     path,
 };
 use uuid::Uuid;
@@ -296,27 +307,88 @@ pub fn App() -> impl IntoView {
 
         <Router>
             <nav>
-                <A href="/" exact=true>"Cards"</A>
+                // Grouped by purpose rather than 9 flat links: content you
+                // browse stays flat and always visible (including signed
+                // out, since all three are public-read); creating a card
+                // and account/admin actions each collapse into their own
+                // <details> menu, the same disclosure pattern used
+                // everywhere else in this app (Reveal, dictionary details)
+                // rather than a new interaction model. Also makes room for
+                // Grammar without the nav growing past this.
+                <Transition fallback=|| view! { <A href="/" exact=true>"Cards"</A> }>
+                    {move || {
+                        // Read reactively *before* the Suspend's async block
+                        // — a signal read after an .await point inside
+                        // Suspend doesn't reliably retrigger this closure,
+                        // so the current-page highlight would go stale.
+                        let path = use_location().pathname.get();
+                        let in_cards_section =
+                            path == "/" || path == "/new" || path == "/bulk-add"
+                                || path.starts_with("/cards/");
+                        Suspend::new(async move {
+                            // Signed out: a plain link, same as Decks/Grammar
+                            // — there's nothing to add without an account.
+                            // Signed in: folded into one dropdown rather
+                            // than a separate top-level "Add" — card
+                            // creation is the only thing it ever did
+                            // (Decks/Grammar already have their own inline
+                            // "create" UI), so a second nav item for it was
+                            // redundant. The trigger is a real <A>, opened on
+                            // hover (CSS :hover/:focus-within on .nav-menu in
+                            // main.css) rather than click, so clicking it
+                            // navigates straight to "/" instead of toggling
+                            // a menu — which is also why "All cards" isn't
+                            // repeated as a dropdown item below. <A exact>
+                            // only covers the exact "/" match, so the broader
+                            // in-section highlight still needs its own class.
+                            match auth.await.ok().flatten() {
+                                Some(_) => view! {
+                                    <div class="nav-menu">
+                                        <A href="/" exact=true {..} class:nav-menu-current=in_cards_section>
+                                            "Cards"
+                                        </A>
+                                        <div class="nav-menu-items">
+                                            <A href="/new">"Add a card"</A>
+                                            <A href="/bulk-add">"Bulk add"</A>
+                                        </div>
+                                    </div>
+                                }.into_any(),
+                                None => view! { <A href="/" exact=true>"Cards"</A> }.into_any(),
+                            }
+                        })
+                    }}
+                </Transition>
                 " · "
                 <A href="/decks">"Decks"</A>
+                " · "
+                <A href="/wiki">"Grammar"</A>
                 <Transition fallback=|| ()>
-                    {move || Suspend::new(async move {
+                    {move || {
+                        Suspend::new(async move {
                         match auth.await.ok().flatten() {
                             Some(_) => view! {
-                                " · "<A href="/new">"Add a card"</A>
-                                " · "<A href="/bulk-add">"Bulk add"</A>
                                 " · "<A href="/review">"Review"</A>
-                                " · "<A href="/stats">"Stats"</A>
-                                " · "<A href="/settings">"Settings"</A>
-                                " · "<A href="/account">"Account"</A>
-                                " · "<a href="/auth/logout">"Sign out"</a>
+                                " · "
+                                // Opens on hover (see .nav-menu in main.css),
+                                // same as the Cards menu above — clicking
+                                // "Account" navigates straight to /account,
+                                // so it isn't repeated as a dropdown item.
+                                <div class="nav-menu">
+                                    <A href="/account" exact=true>"Account"</A>
+                                    <div class="nav-menu-items">
+                                        <A href="/stats">"Stats"</A>
+                                        <A href="/settings">"Settings"</A>
+                                        <a href="/auth/logout">"Sign out"</a>
+                                    </div>
+                                </div>
                             }.into_any(),
                             None => view! {
                                 " · "<A href="/login">"Sign in"</A>
                                 " · "<A href="/signup">"Sign up"</A>
                             }.into_any(),
                         }
-                    })}
+                        })
+                    }}
                 </Transition>
             </nav>
             <main>
@@ -331,12 +403,21 @@ pub fn App() -> impl IntoView {
                 // shared-card-pool model) instead degrades gracefully: it
                 // renders for everyone, and conditions only the
                 // mutating bits on `signed_in.then(...)`.
-                <Routes fallback=|| "Page not found.">
+                <Routes fallback=|| view! { <p>"Page not found."</p> }>
                     <Route path=StaticSegment("") view=CardListPage/>
                     <Route path=StaticSegment("new") view=NewCardPage/>
                     <Route path=StaticSegment("bulk-add") view=BulkAddPage/>
                     <Route path=path!("/cards/:id") view=EditCardPage/>
                     <Route path=StaticSegment("decks") view=DecksPage/>
+                    <Route path=StaticSegment("wiki") view=WikiListPage/>
+                    // The slug is cosmetic — routing is by :id alone, so a
+                    // page surviving a rename/reparent never breaks a link
+                    // to it, the same reason /cards/:id doesn't carry a
+                    // slug either. *path is unused (not even read via
+                    // use_params_map) on purpose: it only exists so the
+                    // wildcard segment is present for links built as
+                    // /wiki/{id}/{slug} to resolve at all.
+                    <Route path=path!("/wiki/:id/*path") view=WikiPage/>
                     <Route path=StaticSegment("review") view=ReviewPage/>
                     <Route path=StaticSegment("stats") view=StatsPage/>
                     <Route path=StaticSegment("settings") view=SettingsPage/>
@@ -817,10 +898,13 @@ fn EditCardPage() -> impl IntoView {
         }
     });
     let decks = Resource::new(|| (), |()| list_decks());
+    let pages = Resource::new(|| (), |()| list_page_tree());
 
     let delete = ServerAction::<DeleteCard>::new();
     let toggle_deck = ServerAction::<AddCardToDeck>::new();
     let untoggle_deck = ServerAction::<RemoveCardFromDeck>::new();
+    let toggle_page = ServerAction::<AddPageToCard>::new();
+    let untoggle_page = ServerAction::<RemovePageFromCard>::new();
     let audio_input: NodeRef<html::Input> = NodeRef::new();
     let video_input: NodeRef<html::Input> = NodeRef::new();
     let chosen_image_url: RwSignal<Option<String>> = RwSignal::new(None);
@@ -863,6 +947,7 @@ fn EditCardPage() -> impl IntoView {
                             .map(|url| view! { <video controls src=url></video> });
                         let youtube_view = detail.youtube_url.clone().map(youtube_embed);
                         let deck_ids = detail.deck_ids.clone();
+                        let page_ids = detail.page_ids.clone();
 
                         // A signed-in editor sees the word immediately — visual
                         // confirmation of which card this is before the
@@ -918,6 +1003,10 @@ fn EditCardPage() -> impl IntoView {
                                     notes_initial=existing_definition
                                         .as_ref()
                                         .and_then(|d| d.notes.clone())
+                                        .unwrap_or_default()
+                                    english_translation_initial=existing_definition
+                                        .as_ref()
+                                        .and_then(|d| d.english_translation.clone())
                                         .unwrap_or_default()
                                     example_target_initial=first_example
                                         .map(|e| e.target_sentence.clone())
@@ -1024,6 +1113,66 @@ fn EditCardPage() -> impl IntoView {
                                 </div>
                             }
                         };
+                        let page_section = {
+                            let page_ids = page_ids.clone();
+                            view! {
+                                <div class="card-section">
+                                    <p class="card-section-heading">"Grammar pages"</p>
+                                    <Transition fallback=|| view! { <p>"Loading pages…"</p> }>
+                                    {move || {
+                                        let page_ids = page_ids.clone();
+                                        Suspend::new(async move {
+                                            match pages.await {
+                                                Ok(pages) if signed_in => {
+                                                    let mut labeled: Vec<_> = pages
+                                                        .iter()
+                                                        .map(|p| (p.id, page_path_label(&pages, p.id)))
+                                                        .collect();
+                                                    labeled.sort_by(|a, b| a.1.cmp(&b.1));
+                                                    labeled
+                                                        .into_iter()
+                                                        .map(|(page_id, label)| {
+                                                            let on_page = page_ids.contains(&page_id);
+                                                            view! {
+                                                                <label>
+                                                                    <input
+                                                                        type="checkbox"
+                                                                        checked=on_page
+                                                                        on:change=move |ev| {
+                                                                            if event_target_checked(&ev) {
+                                                                                toggle_page.dispatch(AddPageToCard { page_id, card_id: id });
+                                                                            } else {
+                                                                                untoggle_page.dispatch(RemovePageFromCard { page_id, card_id: id });
+                                                                            }
+                                                                        }
+                                                                    />
+                                                                    {label}
+                                                                </label>
+                                                            }
+                                                        })
+                                                        .collect_view()
+                                                        .into_any()
+                                                }
+                                                Ok(pages) => {
+                                                    let labels: Vec<_> = pages
+                                                        .iter()
+                                                        .filter(|p| page_ids.contains(&p.id))
+                                                        .map(|p| page_path_label(&pages, p.id))
+                                                        .collect();
+                                                    if labels.is_empty() {
+                                                        view! { <p>"Not linked to any grammar page."</p> }.into_any()
+                                                    } else {
+                                                        view! { <p>{labels.join(", ")}</p> }.into_any()
+                                                    }
+                                                }
+                                                Err(e) => view! { <p>"Error: " {e.to_string()}</p> }.into_any(),
+                                            }
+                                        })
+                                    }}
+                                    </Transition>
+                                </div>
+                            }
+                        };
                         let delete_form = signed_in.then(|| {
                             let armed = RwSignal::new(false);
                             view! {
@@ -1053,6 +1202,7 @@ fn EditCardPage() -> impl IntoView {
                             {edit_form}
                             {dictionary_editor}
                             {deck_section}
+                            {page_section}
                             {delete_form}
                             {sign_in_prompt}
                         }
@@ -1165,6 +1315,1165 @@ fn DecksPage() -> impl IntoView {
                     Err(e) => view! { <p>"Error: " {e.to_string()}</p> }.into_any(),
                 }
             })}
+        </Transition>
+    }
+}
+
+/// `pages` is the *whole* tree, re-filtered to `parent_id`'s children at
+/// each level — O(pages²) in the worst case, trivial at this app's scale
+/// (a handful of editors' worth of grammar articles, not thousands of
+/// pages). `Arc`, not `&[...]`: each recursive call's `view!` closure needs
+/// to own what it captures (views can outlive the function call that built
+/// them), which a borrow can't satisfy — cloning the `Arc` is a refcount
+/// bump, not a copy of the data. `Arc` rather than the cheaper `Rc`
+/// specifically because `WikiPage` below holds this across an `.await`
+/// inside `Suspend::new`, which requires the held future to be `Send` —
+/// `Rc` isn't. A recursive fn returning `impl IntoView` doesn't compile
+/// either way (the opaque return type can't reference itself), so this
+/// returns `AnyView` instead — the one place in this file that needs to,
+/// for exactly that reason. Taking `Arc<...>` by value rather than
+/// `&Arc<...>` (clippy's usual preference) is deliberate too: every
+/// recursive call needs its own owned clone to move into a `view!` closure,
+/// so a borrowed parameter would just mean cloning it immediately anyway.
+/// `adding_child_to`: at most one node in the whole tree has its inline
+/// "add a child page" field open at a time — Confluence's sidebar "+" does
+/// the same (one target, not a form per row all the time), and a single
+/// shared signal is simpler than threading per-node state through the
+/// recursion.
+#[allow(clippy::needless_pass_by_value)]
+fn wiki_tree_level(
+    pages: std::sync::Arc<Vec<crate::wiki::PageTreeNode>>,
+    parent_id: Option<Uuid>,
+    signed_in: bool,
+    create: ServerAction<CreatePage>,
+    adding_child_to: RwSignal<Option<Uuid>>,
+) -> AnyView {
+    let children: Vec<_> = pages.iter().filter(|p| p.parent_id == parent_id).collect();
+    if children.is_empty() {
+        return ().into_any();
+    }
+    let rows: Vec<_> = children
+        .into_iter()
+        .map(|page| {
+            let page_id = page.id;
+            let href = format!("/wiki/{}/{}", page.id, page.slug);
+            let title = page.title.clone();
+            let sub = wiki_tree_level(
+                pages.clone(),
+                Some(page_id),
+                signed_in,
+                create,
+                adding_child_to,
+            );
+            (page_id, href, title, sub)
+        })
+        .collect();
+    view! {
+        <ul class="wiki-tree">
+            {rows
+                .into_iter()
+                .map(|(page_id, href, title, sub)| {
+                    let new_child_title = RwSignal::new(String::new());
+                    view! {
+                        <li>
+                            <details open>
+                                <summary>
+                                    <A href=href>{title}</A>
+                                    {signed_in.then(|| view! {
+                                        // prevent_default so this click adds a
+                                        // child instead of toggling the
+                                        // <details> open/closed — summary's
+                                        // native behavior otherwise fires on
+                                        // any click landing inside it.
+                                        <button
+                                            type="button"
+                                            class="wiki-tree-add"
+                                            title="Add a child page here"
+                                            on:click=move |ev| {
+                                                ev.prevent_default();
+                                                adding_child_to.update(|cur| {
+                                                    *cur = if *cur == Some(page_id) {
+                                                        None
+                                                    } else {
+                                                        Some(page_id)
+                                                    };
+                                                });
+                                            }
+                                        >
+                                            "+"
+                                        </button>
+                                    })}
+                                </summary>
+                                {move || {
+                                    (adding_child_to.get() == Some(page_id))
+                                        .then(|| view! {
+                                            <form
+                                                class="wiki-tree-add-form"
+                                                on:submit=move |ev| {
+                                                    ev.prevent_default();
+                                                    let title = new_child_title.get();
+                                                    if !title.trim().is_empty() {
+                                                        create
+                                                            .dispatch(CreatePage {
+                                                                parent_id: Some(page_id),
+                                                                title,
+                                                            });
+                                                        adding_child_to.set(None);
+                                                    }
+                                                }
+                                            >
+                                                <input
+                                                    type="text"
+                                                    placeholder="Page title"
+                                                    required
+                                                    prop:value=move || new_child_title.get()
+                                                    on:input=move |ev| {
+                                                        new_child_title.set(event_target_value(&ev));
+                                                    }
+                                                />
+                                                <button type="submit">"Add"</button>
+                                            </form>
+                                        })
+                                }}
+                                {sub}
+                            </details>
+                        </li>
+                    }
+                })
+                .collect_view()}
+        </ul>
+    }
+    .into_any()
+}
+
+/// The sidebar's own tree + "new top-level page" form, built from data the
+/// caller already resolved (not a `#[component]`/its own `Resource` — both
+/// `WikiListPage` and `WikiPage` already fetch the tree for their own
+/// purposes, and `WikiPage` needs it for breadcrumbs too, so this avoids a
+/// second independent fetch of the same data on every wiki page).
+///
+/// Returns `AnyView`, like `wiki_tree_level`/`wiki_search_results_view`
+/// below it: `WikiPage` embeds this inline, and leaving it as a plain
+/// `impl IntoView` let its whole nested search/`Transition`/tree type get
+/// inlined into `WikiPage`'s own view type — confirmed as the actual
+/// culprit (named directly in rustc's error) the one time bumping
+/// `recursion_limit` alone wasn't enough to stop `cargo leptos build
+/// --release` overflowing rustc's query-depth limit.
+fn wiki_sidebar(
+    pages: std::sync::Arc<Vec<PageTreeNode>>,
+    signed_in: bool,
+    create: ServerAction<CreatePage>,
+    new_title: RwSignal<String>,
+) -> AnyView {
+    let create_form = signed_in.then(|| {
+        view! {
+            <form on:submit=move |ev| {
+                ev.prevent_default();
+                let title = new_title.get();
+                if !title.trim().is_empty() {
+                    create.dispatch(CreatePage { parent_id: None, title });
+                    new_title.set(String::new());
+                }
+            }>
+                <label>
+                    "New page"
+                    <input
+                        type="text"
+                        placeholder="Page title"
+                        required
+                        prop:value=move || new_title.get()
+                        on:input=move |ev| new_title.set(event_target_value(&ev))
+                    />
+                </label>
+                <button type="submit">"Create"</button>
+            </form>
+        }
+    });
+    let adding_child_to = RwSignal::new(None::<Uuid>);
+    let tree_view = if pages.is_empty() {
+        view! { <p class="wiki-sidebar-empty">"No pages yet."</p> }.into_any()
+    } else {
+        wiki_tree_level(pages, None, signed_in, create, adding_child_to)
+    };
+
+    // Full-text search over `search_pages` (Postgres tsvector, already built
+    // for this — just never wired to anything in the UI). Re-fetches on
+    // every keystroke rather than debouncing: at this app's scale (a
+    // handful of editors' worth of pages) that's not a real cost, and it
+    // keeps this simple. The tree and the results list both stay mounted
+    // (toggled with `style:display`, not conditionally rendered) because
+    // `create_form`/`tree_view` aren't `Clone` and a reactive `{move || ..}`
+    // block needs to rebuild its content on every call, which would require
+    // cloning them.
+    let search_query = RwSignal::new(String::new());
+    let search_results = Resource::new(
+        move || search_query.get(),
+        |q| async move {
+            let q = q.trim().to_string();
+            if q.is_empty() {
+                Ok(Vec::new())
+            } else {
+                search_pages(q).await
+            }
+        },
+    );
+    let searching = move || !search_query.get().trim().is_empty();
+
+    view! {
+        <aside class="wiki-sidebar">
+            <A attr:class="wiki-sidebar-home" href="/wiki">"All pages"</A>
+            <div class="wiki-search">
+                <input
+                    type="search"
+                    class="wiki-search-input"
+                    placeholder="Search pages…"
+                    prop:value=move || search_query.get()
+                    on:input=move |ev| search_query.set(event_target_value(&ev))
+                />
+            </div>
+            <div
+                class="wiki-search-results"
+                style:display=move || if searching() { "block" } else { "none" }
+            >
+                <Transition fallback=|| view! { <p class="wiki-sidebar-empty">"Searching…"</p> }>
+                    {move || Suspend::new(async move { wiki_search_results_view(search_results.await) })}
+                </Transition>
+            </div>
+            <div
+                class="wiki-tree-wrap"
+                style:display=move || if searching() { "none" } else { "block" }
+            >
+                {create_form}
+                {tree_view}
+            </div>
+        </aside>
+    }
+        .into_any()
+}
+
+/// Pulled out of `wiki_sidebar` purely to keep that function under
+/// clippy's line-count limit — the match itself has no reason to live
+/// inline in the `Suspend` closure.
+fn wiki_search_results_view(
+    results: Result<Vec<crate::wiki::PageSearchResult>, ServerFnError>,
+) -> AnyView {
+    match results {
+        Err(e) => view! { <p class="wiki-sidebar-empty">"Error: " {e.to_string()}</p> }.into_any(),
+        Ok(results) if results.is_empty() => {
+            view! { <p class="wiki-sidebar-empty">"No matches."</p> }.into_any()
+        }
+        Ok(results) => view! {
+            <ul class="wiki-search-result-list">
+                {results
+                    .into_iter()
+                    .map(|r| {
+                        let href = format!("/wiki/{}/{}", r.id, r.slug);
+                        view! {
+                            <li>
+                                <A href=href>{r.title}</A>
+                                <p class="wiki-search-snippet" inner_html=r.snippet></p>
+                            </li>
+                        }
+                    })
+                    .collect_view()}
+            </ul>
+        }
+        .into_any(),
+    }
+}
+
+/// Same ancestor walk as `wiki_breadcrumbs`, but as a plain "Parent ›
+/// Child" string rather than a view — used where a page needs to be
+/// identified in a flat list (the card-edit "Grammar pages" picker) rather
+/// than rendered as its own page's nav trail.
+fn page_path_label(pages: &[PageTreeNode], id: Uuid) -> String {
+    let mut chain = Vec::new();
+    let mut cursor = Some(id);
+    while let Some(id) = cursor {
+        let Some(node) = pages.iter().find(|p| p.id == id) else {
+            break;
+        };
+        chain.push(node.title.clone());
+        cursor = node.parent_id;
+    }
+    chain.reverse();
+    chain.join(" › ")
+}
+
+/// Walks `current_id`'s `parent_id` chain back to a root, using the same
+/// tree data the sidebar already has — one query answers both, rather than
+/// a dedicated "ancestors of X" endpoint.
+fn wiki_breadcrumbs(pages: &[PageTreeNode], current_id: Uuid) -> impl IntoView {
+    let mut chain = Vec::new();
+    let mut cursor = Some(current_id);
+    while let Some(id) = cursor {
+        let Some(node) = pages.iter().find(|p| p.id == id) else {
+            break;
+        };
+        chain.push((node.id, node.title.clone(), node.slug.clone()));
+        cursor = node.parent_id;
+    }
+    chain.reverse();
+    let crumb_count = chain.len();
+    view! {
+        <nav class="wiki-breadcrumbs" aria-label="Breadcrumb">
+            <A href="/wiki">"Grammar"</A>
+            {chain
+                .into_iter()
+                .enumerate()
+                .map(|(i, (id, title, slug))| {
+                    let is_last = i + 1 == crumb_count;
+                    view! {
+                        <span class="wiki-breadcrumb-sep">"›"</span>
+                        {if is_last {
+                            view! { <span>{title}</span> }.into_any()
+                        } else {
+                            let href = format!("/wiki/{id}/{slug}");
+                            view! { <A href=href>{title}</A> }.into_any()
+                        }}
+                    }
+                })
+                .collect_view()}
+        </nav>
+    }
+}
+
+/// `root` itself plus every page transitively parented under it — the set
+/// the "Move" picker (`WikiPage`) must exclude from its target list, since
+/// reparenting a page under itself or one of its own descendants would
+/// put a cycle in the tree. Computed client-side from data already
+/// fetched for the tree, rather than a second recursive query — the
+/// server-side `move_page` trusts this list was built correctly and
+/// doesn't re-derive/re-check it itself (see the doc comment on
+/// `wiki::move_page`).
+fn page_and_descendant_ids(pages: &[PageTreeNode], root: Uuid) -> std::collections::HashSet<Uuid> {
+    let mut ids = std::collections::HashSet::new();
+    ids.insert(root);
+    // Fixed-point over parent_id links rather than a real tree walk —
+    // `pages` is small (a handful of wiki pages, not thousands), so a
+    // few extra passes over the whole list costs nothing and needs no
+    // children-adjacency structure to be built first.
+    loop {
+        let before = ids.len();
+        for p in pages {
+            if let Some(parent) = p.parent_id
+                && ids.contains(&parent)
+            {
+                ids.insert(p.id);
+            }
+        }
+        if ids.len() == before {
+            break;
+        }
+    }
+    ids
+}
+
+/// The delete/move actions `wiki_page_actions_menu` dispatches, plus each
+/// one's own transient UI state — grouped the same way `db.rs`'s
+/// `WordFields` is, so this (and `wiki_page_actions_menu`'s other params)
+/// doesn't trip clippy's `too_many_arguments`.
+#[derive(Clone, Copy)]
+struct WikiPageActions {
+    delete: ServerAction<DeletePage>,
+    delete_armed: RwSignal<bool>,
+    move_page: ServerAction<MovePage>,
+    move_open: RwSignal<bool>,
+}
+
+/// The "⋯" menu — copy link / toggle history / move / delete — plus its
+/// own Move popover and move-dispatch error. Pulled out of `WikiPage`'s
+/// view and `AnyView`-erased, the same reason and the same way as
+/// `wiki_sidebar` above: this specific piece (named directly in rustc's
+/// error) was still enough on its own to overflow `cargo leptos build
+/// --release`'s query-depth limit even after other pieces nearby were
+/// already erased.
+fn wiki_page_actions_menu(
+    id: Uuid,
+    pages: &[PageTreeNode],
+    actions: WikiPageActions,
+    show_history: RwSignal<bool>,
+    diff_target: RwSignal<Option<Uuid>>,
+    link_copied: RwSignal<bool>,
+) -> AnyView {
+    let WikiPageActions {
+        delete,
+        delete_armed,
+        move_page,
+        move_open,
+    } = actions;
+    // Every page except this one and its own descendants — moving under
+    // either would put a cycle in the tree.
+    let excluded = page_and_descendant_ids(pages, id);
+    let move_targets: Vec<(Uuid, String)> = pages
+        .iter()
+        .filter(|p| !excluded.contains(&p.id))
+        .map(|p| (p.id, p.title.clone()))
+        .collect();
+    let more_menu_ref = NodeRef::<html::Details>::new();
+    view! {
+        <details class="wiki-more" node_ref=more_menu_ref>
+            <summary>"⋯"</summary>
+            <div class="wiki-more-items">
+                <button
+                    type="button"
+                    on:click=move |_| {
+                        #[cfg(feature = "hydrate")]
+                        if let Some(window) = web_sys::window()
+                            && let Ok(origin) = window.location().origin()
+                        {
+                            let url = format!("{origin}/wiki/{id}");
+                            let _ = window.navigator().clipboard().write_text(&url);
+                            link_copied.set(true);
+                            set_timeout(
+                                move || link_copied.set(false),
+                                std::time::Duration::from_secs(2),
+                            );
+                        }
+                    }
+                >
+                    {move || if link_copied.get() { "Copied!" } else { "Copy link" }}
+                </button>
+                <button
+                    type="button"
+                    on:click=move |_| {
+                        show_history.update(|s| *s = !*s);
+                        diff_target.set(None);
+                    }
+                >
+                    {move || {
+                        if show_history.get() {
+                            "Hide history"
+                        } else {
+                            "History"
+                        }
+                    }}
+                </button>
+                <button
+                    type="button"
+                    on:click=move |_| {
+                        move_open.update(|s| *s = !*s);
+                        // The native <details> toggling
+                        // itself open/closed and this
+                        // button living inside it are
+                        // independent — without this,
+                        // the "..." dropdown stayed
+                        // open underneath the Move
+                        // popover (confirmed live).
+                        if let Some(el) = more_menu_ref.get() {
+                            el.set_open(false);
+                        }
+                    }
+                >
+                    "Move"
+                </button>
+                <ActionForm action=delete>
+                    <input type="hidden" name="page_id" value=id.to_string() />
+                    {confirm_button("Delete page", delete_armed)}
+                </ActionForm>
+            </div>
+        </details>
+        {wiki_move_popover(id, move_targets, move_page, move_open)}
+    }
+    .into_any()
+}
+
+/// The Move popover `wiki_page_actions_menu`'s own "Move" button opens,
+/// plus its dispatch error. Pulled out mainly to keep that function under
+/// clippy's line-count limit, same reason as `wiki_search_results_view`'s
+/// own doc comment — not a query-depth fix in its own right the way
+/// `wiki_page_actions_menu` itself is, but `AnyView`-erasing it costs
+/// nothing and keeps the pattern consistent.
+fn wiki_move_popover(
+    id: Uuid,
+    move_targets: Vec<(Uuid, String)>,
+    move_page: ServerAction<MovePage>,
+    move_open: RwSignal<bool>,
+) -> impl Fn() -> Option<AnyView> {
+    move || {
+        let popover = move_open.get().then(|| {
+            view! {
+                <div class="wiki-move-popover">
+                    <label>"Move to"</label>
+                    <select on:change=move |ev| {
+                        let value = event_target_value(&ev);
+                        let new_parent_id = Uuid::parse_str(&value).ok();
+                        move_page.dispatch(MovePage { page_id: id, new_parent_id });
+                        move_open.set(false);
+                    }>
+                        <option value="" selected=true disabled=true>
+                            "Choose a page…"
+                        </option>
+                        <option value="">"(top level)"</option>
+                        {move_targets
+                            .iter()
+                            .map(|(target_id, title)| {
+                                view! {
+                                    <option value=target_id.to_string()>{title.clone()}</option>
+                                }
+                            })
+                            .collect_view()}
+                    </select>
+                </div>
+            }
+        });
+        let error = move_page.value().get().and_then(Result::err).map(|e| {
+            view! { <p>"Error moving: " {e.to_string()}</p> }
+        });
+        Some(view! { {popover} {error} }.into_any())
+    }
+}
+
+/// Delete/rename dispatch errors — block-level messages, kept separate
+/// from `wiki_page_actions_menu`'s own button strip rather than squeezed
+/// into it. `AnyView`-erased for the same query-depth reason as that
+/// function.
+fn wiki_page_action_errors(
+    delete: ServerAction<DeletePage>,
+    rename: ServerAction<RenamePage>,
+) -> AnyView {
+    view! {
+        {move || {
+            delete.value().get().and_then(Result::err).map(|e| {
+                view! { <p>"Error deleting: " {e.to_string()}</p> }
+            })
+        }}
+        {move || {
+            rename.value().get().and_then(Result::err).map(|e| {
+                view! { <p>"Error renaming: " {e.to_string()}</p> }
+            })
+        }}
+    }
+    .into_any()
+}
+
+/// The revision history panel — a `Transition`/`Suspend`'d list of past
+/// revisions plus an inline diff viewer. Returns a closure rather than
+/// calling into the view eagerly, since `WikiPage` embeds this reactively
+/// (the same way it already embeds `save_status`): `show_history` toggles
+/// it without the whole page re-resolving. `AnyView`-erased inside for the
+/// same query-depth reason as `wiki_page_actions_menu`.
+fn wiki_history_panel(
+    id: Uuid,
+    signed_in: bool,
+    show_history: RwSignal<bool>,
+    diff_target: RwSignal<Option<Uuid>>,
+    restore: ServerAction<RestoreRevision>,
+    revisions: Resource<Result<Option<Vec<PageRevisionSummary>>, ServerFnError>>,
+    diff: Resource<Result<Option<RevisionDiff>, ServerFnError>>,
+) -> impl Fn() -> Option<AnyView> {
+    move || {
+        show_history.get().then(|| {
+            view! {
+                <Transition fallback=|| view! { <p>"Loading…"</p> }>
+                    {move || Suspend::new(async move {
+                        match revisions.await {
+                            Ok(Some(revs)) if revs.is_empty() => {
+                                view! { <p>"No revisions yet."</p> }.into_any()
+                            }
+                            Ok(Some(revs)) => {
+                                view! {
+                                    <ul class="wiki-history-list">
+                                        {revs
+                                            .into_iter()
+                                            .map(|r| {
+                                                let rid = r.id;
+                                                view! {
+                                                    <li>
+                                                        <span>{r.created_at}</span>
+                                                        <button
+                                                            type="button"
+                                                            on:click=move |_| diff_target.set(Some(rid))
+                                                        >
+                                                            "View diff"
+                                                        </button>
+                                                        {signed_in.then(|| view! {
+                                                            <button
+                                                                type="button"
+                                                                on:click=move |_| {
+                                                                    restore
+                                                                        .dispatch(RestoreRevision {
+                                                                            page_id: id,
+                                                                            revision_id: rid,
+                                                                        });
+                                                                    show_history.set(false);
+                                                                }
+                                                            >
+                                                                "Restore"
+                                                            </button>
+                                                        })}
+                                                    </li>
+                                                }
+                                            })
+                                            .collect_view()}
+                                    </ul>
+                                    {move || Suspend::new(async move {
+                                        diff.await
+                                            .ok()
+                                            .flatten()
+                                            .map(|d| {
+                                                view! {
+                                                    <div class="wiki-diff" inner_html=d.diff_html></div>
+                                                }
+                                            })
+                                    })}
+                                }
+                                    .into_any()
+                            }
+                            _ => ().into_any(),
+                        }
+                    })}
+                </Transition>
+            }
+                .into_any()
+        })
+    }
+}
+
+#[component]
+fn WikiListPage() -> impl IntoView {
+    let auth = Resource::new(|| (), |()| current_user_name());
+    let create = ServerAction::<CreatePage>::new();
+    let new_title = RwSignal::new(String::new());
+    let tree = Resource::new(move || create.version().get(), |_| list_page_tree());
+
+    // Creating a page and then leaving the writer to go find it themselves
+    // in the tree was the whole "terrible UX" complaint — jump straight
+    // into it, same as Confluence/Docs do.
+    let navigate = use_navigate();
+    Effect::new(move |_| {
+        if let Some(Ok(id)) = create.value().get() {
+            navigate(
+                &format!("/wiki/{id}"),
+                leptos_router::NavigateOptions::default(),
+            );
+        }
+    });
+
+    view! {
+        <h1>"Grammar"</h1>
+        <p class="page-intro">
+            "Articles about the language's grammar and structure — anyone signed in can write or reorganize a page."
+        </p>
+        <Transition fallback=|| view! { <p>"Loading…"</p> }>
+            {move || Suspend::new(async move {
+                let signed_in = auth.await.ok().flatten().is_some();
+                match tree.await {
+                    Err(e) => view! { <p>"Error: " {e.to_string()}</p> }.into_any(),
+                    Ok(pages) => {
+                        let sidebar =
+                            wiki_sidebar(std::sync::Arc::new(pages), signed_in, create, new_title);
+                        view! {
+                            <div class="wiki-shell">
+                                {sidebar}
+                                <div class="wiki-content">
+                                    <p class="wiki-article-empty">
+                                        "Pick a page from the list, or start a new one."
+                                    </p>
+                                </div>
+                            </div>
+                        }
+                            .into_any()
+                    }
+                }
+            })}
+        </Transition>
+    }
+}
+
+#[component]
+fn WikiPage() -> impl IntoView {
+    let auth = Resource::new(|| (), |()| current_user_name());
+    let params = use_params_map();
+    let page_id = move || {
+        params
+            .read()
+            .get("id")
+            .and_then(|id| Uuid::parse_str(&id).ok())
+    };
+
+    let save = ServerAction::<SavePageRevision>::new();
+    let create = ServerAction::<CreatePage>::new();
+    let rename = ServerAction::<RenamePage>::new();
+    let delete = ServerAction::<DeletePage>::new();
+    let restore = ServerAction::<RestoreRevision>::new();
+    let move_page = ServerAction::<MovePage>::new();
+
+    // Same as WikiListPage: jump straight into a newly created page (root
+    // or child, via either "New page" form or the tree's inline "+")
+    // instead of leaving the writer to go find it themselves.
+    let navigate = use_navigate();
+    Effect::new(move |_| {
+        if let Some(Ok(id)) = create.value().get() {
+            navigate(
+                &format!("/wiki/{id}"),
+                leptos_router::NavigateOptions::default(),
+            );
+        }
+    });
+
+    let delete_armed = RwSignal::new(false);
+    let show_history = RwSignal::new(false);
+    let move_open = RwSignal::new(false);
+    let diff_target = RwSignal::new(None::<Uuid>);
+    let new_root_title = RwSignal::new(String::new());
+    // Confluence/Docs both default to a clean read view with an explicit
+    // Edit button, not an always-live canvas — reverted back to that after
+    // live feedback against real Confluence screenshots; see the "Edit"/
+    // "Done" button below.
+    let editing = RwSignal::new(false);
+    // Bumped exactly once, by the "Done" handler below, when leaving edit
+    // mode — the one explicit signal that forces `page` to refetch (see its
+    // own comment: it deliberately ignores save.version(), since refetching
+    // mid-edit is what was destroying the live editor on every autosave
+    // tick). Without this, the read view `page` feeds would keep showing
+    // whatever was loaded before editing began, forever — confirmed live:
+    // "/tab" and a columns edit both landed correctly in the database but
+    // never appeared in the read view until a full page reload.
+    let page_refresh = RwSignal::new(0u32);
+    let link_copied = RwSignal::new(false);
+    // Kept in sync with the server (see the Effect below) and read by the
+    // autosave loop — plain signals, not part of the page Resource itself,
+    // so the inline title edit and the editor's own autosave can both
+    // update/read them without forcing a full page refetch on every click.
+    let title_signal = RwSignal::new(String::new());
+    // Compared against content_json, not content_markdown — the markdown
+    // export is lossy (see render_blocks_html's doc comment in wiki.rs: it
+    // drops text/highlight color outright and has no representation for
+    // alignment at all), so a dirty-check against it treats a color- or
+    // alignment-only edit as "nothing changed" and never saves it. Confirmed
+    // live: applying color, then later alignment, to already-saved text —
+    // no new typing either time — never dispatched a save at all, silently,
+    // both times, with the exact right-looking editor state right up until
+    // the page left edit mode and the change was simply gone.
+    let last_saved_content_json = RwSignal::new(String::new());
+
+    let tree = Resource::new(
+        move || {
+            (
+                create.version().get(),
+                rename.version().get(),
+                delete.version().get(),
+                move_page.version().get(),
+            )
+        },
+        |_| list_page_tree(),
+    );
+    // Not keyed on save.version() — confirmed live this was the actual
+    // cause of a separate, worse bug than it looks like at a glance:
+    // selecting text in the editor, then watching the highlight vanish a
+    // few seconds later. `page` refetching rebuilds the <WikiEditor> view
+    // below from scratch (new BlockNoteView, new BlockNote editor
+    // instance), since it's rendered from this Resource's resolved value —
+    // every autosave tick was round-tripping to the server and then tearing
+    // down and remounting the live, currently-being-typed-into editor with
+    // whatever it just fetched back, which blows away the DOM selection
+    // (and, worse, would silently discard any keystrokes typed during that
+    // round trip, landing after the fetch but before the remount replaced
+    // the DOM under them). last_saved_content_json/title_signal don't need
+    // this refetch to stay in sync either — the autosave loop and the
+    // Done handler already set them directly, from the exact content_json
+    // they just sent, right after each dispatch (see last_saved_content_json
+    // below). rename/restore still belong here: both genuinely replace the
+    // page's content/title from outside the live editor (restore loads a
+    // past revision; the live editor has no idea), so re-fetching for those
+    // is the correct behavior, not a bug. page_refresh is the Done handler's
+    // own explicit, one-shot way to ask for the same refetch when leaving
+    // edit mode — see its own comment.
+    let page = Resource::new(
+        move || {
+            (
+                page_id(),
+                rename.version().get(),
+                restore.version().get(),
+                page_refresh.get(),
+            )
+        },
+        |(id, ..)| async move {
+            match id {
+                Some(id) => get_page(id).await,
+                None => Ok(None),
+            }
+        },
+    );
+    // The card side of the link (EditCardPage's "Grammar pages" checkboxes)
+    // has no presence on this route to key a version signal off, so this
+    // just re-fetches whenever the page itself changes — same as `page`.
+    let linked_cards = Resource::new(page_id, |id| async move {
+        match id {
+            Some(id) => cards_for_page(id).await,
+            None => Ok(Vec::new()),
+        }
+    });
+    let revisions = Resource::new(
+        move || {
+            (
+                page_id(),
+                show_history.get(),
+                save.version().get(),
+                restore.version().get(),
+            )
+        },
+        |(id, show, ..)| async move {
+            match (id, show) {
+                (Some(id), true) => list_page_revisions(id).await.map(Some),
+                _ => Ok(None),
+            }
+        },
+    );
+    let diff = Resource::new(
+        move || (page_id(), diff_target.get()),
+        |(page_id, revision_id)| async move {
+            match (page_id, revision_id) {
+                (Some(page_id), Some(revision_id)) => {
+                    get_revision_diff(page_id, revision_id).await.map(Some)
+                }
+                _ => Ok(None),
+            }
+        },
+    );
+
+    // Keeps title_signal/last_saved_content_json in step with the server's
+    // current truth — fires on first load and again after a rename/restore
+    // (since `page` itself refetches on those; a save keeps them in sync
+    // directly instead, see the autosave loop and the Done handler below —
+    // `page` deliberately doesn't refetch on save, see its own comment).
+    // Reading `page.get()` here (not awaiting it) is what keeps this a
+    // plain, immediately-rerunning Effect rather than another async
+    // Suspend block.
+    Effect::new(move |_| {
+        if let Some(Ok(Some(p))) = page.get() {
+            title_signal.set(p.title);
+            last_saved_content_json.set(p.content_json);
+        }
+    });
+
+    // Autosave — spawned once per distinct page_id (this Effect's closure
+    // reads nothing else reactively, so it only reruns on navigation, not
+    // on every save it itself triggers). Confluence's own answer to "don't
+    // lose work": content saves itself periodically while you're writing,
+    // full stop, no button to remember to click. The real gap against
+    // Confluence specifically — a save here still lands in page_revisions
+    // directly rather than a separate draft, so frequent edits do mean more
+    // history entries than a deliberate "Publish" model would — is a
+    // tradeoff accepted for now rather than adding draft storage on top of
+    // everything else in flight; noted as the honest follow-up.
+    #[cfg(feature = "hydrate")]
+    Effect::new(move |_| {
+        let Some(id) = page_id() else { return };
+        let mount_id = crate::wiki_editor::wiki_editor_mount_id(id);
+        // Cancelled via on_cleanup, not by re-reading page_id() — this loop
+        // outlives the Effect run that spawned it (it's a detached
+        // wasm_bindgen_futures task, not something Leptos's own reactive
+        // cleanup can reach into mid-sleep), so if WikiPage itself gets
+        // disposed entirely (navigating to a non-wiki route) while this is
+        // sleeping, page_id() would try to read params — owned by that now-
+        // disposed scope — and panic. Confirmed live: navigating away from
+        // a wiki page while its autosave loop was mid-wait reliably crashed
+        // the whole app's reactive runtime this way. on_cleanup fires on
+        // both a route-triggered rerun of this Effect (a new page_id) and
+        // on WikiPage's own disposal, so one flag covers both cases this
+        // loop needs to stop for.
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let cancelled = cancelled.clone();
+            // on_cleanup requires Send + Sync (it's not wasm-specific) even
+            // though this whole app is single-threaded — an AtomicBool is
+            // the plain-std type satisfying that, not a sign of any real
+            // cross-thread sharing here.
+            on_cleanup(move || cancelled.store(true, std::sync::atomic::Ordering::Relaxed));
+        }
+        wasm_bindgen_futures::spawn_local(async move {
+            loop {
+                crate::wiki_editor::sleep_ms(6000).await;
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                // Errs here just mean no editor is mounted (signed-out, or
+                // not loaded yet) — nothing to autosave, keep waiting.
+                let Ok(content_json) = crate::wiki_editor::get_document(&mount_id).await else {
+                    continue;
+                };
+                if content_json == last_saved_content_json.get_untracked() {
+                    continue;
+                }
+                let Ok(content_markdown) = crate::wiki_editor::get_markdown(&mount_id).await else {
+                    continue;
+                };
+                save.dispatch(SavePageRevision {
+                    page_id: id,
+                    title: title_signal.get_untracked(),
+                    content_json: content_json.clone(),
+                    content_markdown,
+                });
+                last_saved_content_json.set(content_json);
+            }
+        });
+    });
+
+    view! {
+        <Transition fallback=|| view! { <p>"Loading…"</p> }>
+            {move || {
+                // Read *before* Suspend's async block, same reason as the
+                // nav's current-page highlight: a plain signal read after
+                // an .await point inside Suspend doesn't reliably retrigger
+                // this closure, so toggling Edit/Done would never actually
+                // re-render the page.
+                let is_editing = editing.get();
+                Suspend::new(async move {
+                let signed_in = auth.await.ok().flatten().is_some();
+                let pages = tree.await.unwrap_or_default();
+                let pages = std::sync::Arc::new(pages);
+                let sidebar =
+                    wiki_sidebar(pages.clone(), signed_in, create, new_root_title);
+
+                let body = match page.await {
+                    Err(e) => view! { <p>"Error: " {e.to_string()}</p> }.into_any(),
+                    // A bare, unstyled sentence floating next to the sidebar
+                    // with no way back was a real dead end — most often hit
+                    // by a stale link to a page someone else just deleted.
+                    // Same card chrome as every other state here, plus the
+                    // one thing actually useful to do next.
+                    Ok(None) => view! {
+                        <div class="wiki-article">
+                            <p>"This page doesn't exist — it may have been deleted."</p>
+                            <p><A href="/wiki">"← All pages"</A></p>
+                        </div>
+                    }
+                    .into_any(),
+                    Ok(Some(p)) => {
+                        let id = p.id;
+                        let content_json = p.content_json.clone();
+                        let content_html = p.content_html.clone();
+                        let is_empty = p.content_markdown.trim().is_empty();
+                        let breadcrumbs = wiki_breadcrumbs(&pages, id);
+
+                        // The title *is* the heading — Confluence and Docs
+                        // both let you rename a page by just editing its
+                        // title in place, not through a separate form. Only
+                        // commits (dispatches RenamePage) on blur/Enter, and
+                        // only if it actually changed.
+                        let commit_title = move || {
+                            let value = title_signal.get_untracked();
+                            if !value.trim().is_empty() {
+                                rename.dispatch(RenamePage { page_id: id, title: value });
+                            }
+                        };
+                        let title_view = if signed_in && is_editing {
+                            view! {
+                                <input
+                                    class="wiki-title-input"
+                                    type="text"
+                                    prop:value=move || title_signal.get()
+                                    on:input=move |ev| title_signal.set(event_target_value(&ev))
+                                    on:blur=move |_| commit_title()
+                                    on:keydown=move |ev| {
+                                        if ev.key() == "Enter" {
+                                            ev.prevent_default();
+                                            commit_title();
+                                        }
+                                    }
+                                />
+                            }
+                                .into_any()
+                        } else {
+                            view! { <h1>{move || title_signal.get()}</h1> }.into_any()
+                        };
+
+                        let save_status = move || {
+                            if save.pending().get() {
+                                Some("Saving…")
+                            } else if save.value().get().is_some_and(|r| r.is_ok()) {
+                                Some("Saved")
+                            } else {
+                                None
+                            }
+                        };
+
+                        // "Done" flushes one last save before leaving edit
+                        // mode — the autosave loop runs every 6s, so without
+                        // this, clicking Done right after typing could drop
+                        // up to 6 seconds of work. Awaited directly via
+                        // save_page_revision rather than save.dispatch(): the
+                        // read view editing.set(false) is about to reveal
+                        // needs this exact save to have actually landed, not
+                        // just been fired off — dispatch() returns before
+                        // the request completes, which would race
+                        // page_refresh below. page_refresh bumps
+                        // unconditionally, not only when this branch has
+                        // something to flush, because an earlier autosave
+                        // tick during this same edit session may already
+                        // have saved content that `page` was never asked to
+                        // refetch for either (autosave deliberately doesn't
+                        // bump page_refresh — see its own comment). This is
+                        // the one point refetching is safe: the editor is
+                        // about to unmount, so there's no live selection
+                        // left to lose. Confirmed live this was a real bug,
+                        // not hypothetical: a columns edit and a text
+                        // deletion both landed correctly in the database but
+                        // never appeared in the read view.
+                        let edit_toggle = signed_in.then(|| {
+                            if is_editing {
+                                view! {
+                                    <button
+                                        type="button"
+                                        class="wiki-edit-toggle"
+                                        on:click=move |_| {
+                                            #[cfg(feature = "hydrate")]
+                                            {
+                                                let mount_id = crate::wiki_editor::wiki_editor_mount_id(id);
+                                                wasm_bindgen_futures::spawn_local(async move {
+                                                    if let Ok(content_json)
+                                                        = crate::wiki_editor::get_document(&mount_id).await
+                                                        && content_json != last_saved_content_json.get_untracked()
+                                                        && let Ok(content_markdown)
+                                                            = crate::wiki_editor::get_markdown(&mount_id).await
+                                                        && save_page_revision(
+                                                            id,
+                                                            title_signal.get_untracked(),
+                                                            content_json.clone(),
+                                                            content_markdown,
+                                                        )
+                                                        .await
+                                                        .is_ok()
+                                                    {
+                                                        last_saved_content_json.set(content_json);
+                                                    }
+                                                    page_refresh.update(|n| *n += 1);
+                                                    editing.set(false);
+                                                });
+                                            }
+                                            #[cfg(not(feature = "hydrate"))]
+                                            editing.set(false);
+                                        }
+                                    >
+                                        "Done"
+                                    </button>
+                                }.into_any()
+                            } else {
+                                view! {
+                                    <button
+                                        type="button"
+                                        class="wiki-edit-toggle"
+                                        on:click=move |_| editing.set(true)
+                                    >
+                                        "Edit"
+                                    </button>
+                                }.into_any()
+                            }
+                        });
+
+                        let secondary_actions = signed_in.then(|| {
+                            wiki_page_actions_menu(
+                                id,
+                                &pages,
+                                WikiPageActions {
+                                    delete,
+                                    delete_armed,
+                                    move_page,
+                                    move_open,
+                                },
+                                show_history,
+                                diff_target,
+                                link_copied,
+                            )
+                        });
+
+                        // Separate from the menu itself — these are block-
+                        // level messages, not something that belongs
+                        // squeezed into the title row's button strip.
+                        let action_errors = signed_in.then(|| wiki_page_action_errors(delete, rename));
+
+                        let history_panel = wiki_history_panel(
+                            id,
+                            signed_in,
+                            show_history,
+                            diff_target,
+                            restore,
+                            revisions,
+                            diff,
+                        );
+
+                        view! {
+                            {breadcrumbs}
+                            <div class="wiki-title-row">
+                                {title_view}
+                                <div class="wiki-title-row-actions">
+                                    {move || {
+                                        save_status()
+                                            .map(|s| view! { <span class="wiki-save-status">{s}</span> })
+                                    }}
+                                    {edit_toggle}
+                                    {secondary_actions}
+                                </div>
+                            </div>
+                            {action_errors}
+                            {history_panel}
+                            {
+                                if signed_in && is_editing {
+                                    view! {
+                                        // wiki-editor.js/.css are injected by WikiEditor itself
+                                        // (see wiki_editor.rs) rather than declared here via
+                                        // leptos_meta — confirmed live that a <Script>/
+                                        // <Stylesheet> declared outside a stable top-level
+                                        // position never actually lands in the DOM. Only
+                                        // mounted while actually editing — a page that's only
+                                        // ever read never ships BlockNote/React at all.
+                                        <WikiEditor
+                                            page_id=id
+                                            initial_document_json=content_json.clone()
+                                            read_only=false
+                                        />
+                                    }
+                                        .into_any()
+                                } else if is_empty {
+                                    view! {
+                                        <p class="wiki-article-empty">"This page is empty."</p>
+                                    }
+                                        .into_any()
+                                } else {
+                                    view! { <div class="wiki-article" inner_html=content_html.clone()></div> }
+                                        .into_any()
+                                }
+                            }
+                            // The card side of this link (EditCardPage's "Grammar
+                            // pages" checkboxes) is the only place to *create* it —
+                            // this is purely a read-only backlink list, so the
+                            // connection a card makes to this page is visible from
+                            // here too, not just from the card's own edit form.
+                            <Transition fallback=|| ()>
+                                {move || Suspend::new(async move {
+                                    match linked_cards.await {
+                                        Ok(cards) if !cards.is_empty() => {
+                                            view! {
+                                                <div class="card-section">
+                                                    <p class="card-section-heading">"Cards using this page"</p>
+                                                    <ul class="ledger">
+                                                        {cards.into_iter().map(|c| {
+                                                            let href = format!("/cards/{}", c.id);
+                                                            view! { <li><A href=href>{c.target_text}</A></li> }
+                                                        }).collect_view()}
+                                                    </ul>
+                                                </div>
+                                            }.into_any()
+                                        }
+                                        _ => ().into_any(),
+                                    }
+                                })}
+                            </Transition>
+                        }
+                            .into_any()
+                    }
+                };
+
+                view! {
+                    <div class="wiki-shell">
+                        {sidebar}
+                        <div class="wiki-content">{body}</div>
+                    </div>
+                }
+                })
+            }}
         </Transition>
     }
 }

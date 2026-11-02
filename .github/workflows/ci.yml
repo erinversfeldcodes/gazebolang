@@ -129,6 +129,22 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: sqlx-cli,cargo-leptos,just
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editor/package-lock.json
+      # wiki-editor.js/.css are gitignored build output (see .gitignore's
+      # comment on them) — built here the same way the Dockerfile's
+      # editor-builder stage does for a real deploy. Without this,
+      # window.mountWikiEditor never exists and every wiki e2e test times
+      # out waiting for .wiki-editor-toolbar, since cargo-leptos has
+      # nothing in crates/web/public to copy into the site root.
+      - name: Build wiki editor island
+        working-directory: editor
+        run: |
+          npm ci
+          npm run build
       # Only the garage service, not the whole compose stack — Postgres
       # here is the `services:` container above (port 5432), not
       # docker-compose.yml's (port 55432, for local dev only).
@@ -144,9 +160,6 @@ jobs:
         # step below — rather than mixed into this step's own transient
         # output.
         run: ./target/debug/web > web-server.log 2>&1 &
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:

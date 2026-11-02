@@ -18,6 +18,7 @@ pub struct WordDefinition {
     pub target_text: String,
     pub part_of_speech: Option<String>,
     pub notes: Option<String>,
+    pub english_translation: Option<String>,
     pub examples: Vec<WordExample>,
     pub linked_words: Vec<LinkedWord>,
 }
@@ -29,6 +30,7 @@ impl From<crate::db::WordDefinitionRow> for WordDefinition {
             target_text: r.target_text,
             part_of_speech: r.part_of_speech,
             notes: r.notes,
+            english_translation: r.english_translation,
             examples: r
                 .examples
                 .into_iter()
@@ -108,6 +110,7 @@ pub async fn save_word_definition(
     target_text: String,
     part_of_speech: String,
     notes: String,
+    english_translation: String,
     example_target_sentence: String,
     example_gloss_sentence: String,
     linked_words_raw: String,
@@ -127,8 +130,11 @@ pub async fn save_word_definition(
         &state.db_pool,
         target_text,
         user.id,
-        non_empty_trimmed(&part_of_speech).as_deref(),
-        non_empty_trimmed(&notes).as_deref(),
+        crate::db::WordFields {
+            part_of_speech: non_empty_trimmed(&part_of_speech).as_deref(),
+            notes: non_empty_trimmed(&notes).as_deref(),
+            english_translation: non_empty_trimmed(&english_translation).as_deref(),
+        },
         &examples,
         &linked,
     )

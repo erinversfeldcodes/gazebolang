@@ -24,6 +24,7 @@ pub struct CardDetail {
     pub two_way: bool,
     pub tags: Vec<String>,
     pub deck_ids: Vec<Uuid>,
+    pub page_ids: Vec<Uuid>,
 }
 
 /// Which side of a review-queue card is the prompt. See
@@ -169,6 +170,9 @@ pub async fn get_card(card_id: Uuid) -> Result<Option<CardDetail>, ServerFnError
     let deck_ids = crate::db::card_deck_ids(&state.db_pool, card_id)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let page_ids = crate::db::card_page_ids(&state.db_pool, card_id)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
     Ok(Some(CardDetail {
         id: card.id,
         image_url: card.image_url,
@@ -179,6 +183,7 @@ pub async fn get_card(card_id: Uuid) -> Result<Option<CardDetail>, ServerFnError
         two_way: card.two_way,
         tags,
         deck_ids,
+        page_ids,
     }))
 }
 

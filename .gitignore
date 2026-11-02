@@ -4,6 +4,12 @@
 # Leptos build output
 /crates/web/target
 
+# editor/'s compiled output (npm run build) — generated, not source; built
+# fresh by CI/deploy the same way cargo-leptos's own pkg/ output is, never
+# committed. editor/'s own source + package-lock.json are still tracked.
+/crates/web/public/*.js
+/crates/web/public/*.css
+
 # Local secrets
 .env
 .env.local
