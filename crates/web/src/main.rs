@@ -625,8 +625,15 @@ async fn connect_with_retry(database_url: &str) -> sqlx::PgPool {
     let mut attempt = 0;
     loop {
         attempt += 1;
+        // A single EditCardPage load alone fires 4 concurrent resources
+        // (auth, card, decks, pages), each needing its own pooled
+        // connection at once — 5 total leaves next to no headroom for a
+        // second concurrent visitor on this 4-user app, and connections
+        // queue (not error) when the pool's exhausted, which is exactly
+        // what a Playwright run against the preview stack surfaced as a
+        // slow-but-silent request rather than a crash.
         match sqlx::postgres::PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(20)
             .connect(database_url)
             .await
         {
