@@ -187,18 +187,21 @@ pub async fn get_card(card_id: Uuid) -> Result<Option<CardDetail>, ServerFnError
     else {
         return Ok(None);
     };
-    let tags = crate::db::card_tags(&state.db_pool, card_id)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let deck_ids = crate::db::card_deck_ids(&state.db_pool, card_id)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let page_ids = crate::db::card_page_ids(&state.db_pool, card_id)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let linked_cards = crate::db::linked_cards(&state.db_pool, card_id)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?
+    // Four independent reads, each keyed only on `card_id` — none depends
+    // on another's result. Previously awaited one at a time (5 serialized
+    // Neon round trips per get_card call, holding a pool connection for
+    // the sum of all five instead of the slowest one); under concurrent
+    // load that compounds directly into exactly the kind of latency that
+    // blows a client-side e2e timeout. Running them concurrently cuts
+    // get_card's wall-clock cost to roughly one round trip.
+    let (tags, deck_ids, page_ids, linked_cards) = tokio::try_join!(
+        crate::db::card_tags(&state.db_pool, card_id),
+        crate::db::card_deck_ids(&state.db_pool, card_id),
+        crate::db::card_page_ids(&state.db_pool, card_id),
+        crate::db::linked_cards(&state.db_pool, card_id),
+    )
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let linked_cards = linked_cards
         .into_iter()
         .map(|l| CardLink {
             linked_card_id: l.linked_card_id,
