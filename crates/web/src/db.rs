@@ -1345,6 +1345,99 @@ pub async fn cards_for_page(pool: &PgPool, page_id: Uuid) -> sqlx::Result<Vec<Li
     .await
 }
 
+// --- card <-> card typed links -------------------------------------------
+// Unlike deck_cards/card_pages, storage order is never canonicalized by
+// sorting the two UUIDs: back_chain_step is directional (card_id = earlier
+// step, linked_card_id = later step), and canonicalizing would destroy
+// that order. A reverse-order duplicate of the same (pair, link_type) is
+// blocked instead by the card_links_unordered_pair_idx expression unique
+// index (see the migration), so a plain `ON CONFLICT DO NOTHING` is
+// race-free without an application-level existence check.
+
+pub async fn add_card_link(
+    pool: &PgPool,
+    card_id: Uuid,
+    linked_card_id: Uuid,
+    link_type: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO card_links (card_id, linked_card_id, link_type) \
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(card_id)
+    .bind(linked_card_id)
+    .bind(link_type)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn remove_card_link(
+    pool: &PgPool,
+    card_id: Uuid,
+    linked_card_id: Uuid,
+    link_type: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "DELETE FROM card_links WHERE link_type = $3 \
+         AND ((card_id = $1 AND linked_card_id = $2) OR (card_id = $2 AND linked_card_id = $1))",
+    )
+    .bind(card_id)
+    .bind(linked_card_id)
+    .bind(link_type)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CardLinkRow {
+    pub linked_card_id: Uuid,
+    pub target_text: String,
+    pub link_type: String,
+    /// True when the queried card was stored as `card_id` rather than
+    /// `linked_card_id` — i.e. it's the earlier step for a directional
+    /// type like `back_chain_step`. Meaningless but harmless for the
+    /// symmetric types (`minimal_pair`, `sound_spelling`).
+    pub is_source: bool,
+}
+
+pub async fn linked_cards(pool: &PgPool, card_id: Uuid) -> sqlx::Result<Vec<CardLinkRow>> {
+    sqlx::query_as(
+        "SELECT CASE WHEN cl.card_id = $1 THEN cl.linked_card_id ELSE cl.card_id END AS linked_card_id, \
+                c.target_text, cl.link_type, (cl.card_id = $1) AS is_source \
+         FROM card_links cl \
+         JOIN cards c ON c.id = (CASE WHEN cl.card_id = $1 THEN cl.linked_card_id ELSE cl.card_id END) \
+         WHERE cl.card_id = $1 OR cl.linked_card_id = $1 \
+         ORDER BY cl.link_type, c.target_text",
+    )
+    .bind(card_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Cards a link-picker can search by text — reuses `CardRow`/`CARD_COLUMNS`
+/// rather than a bare `{id, target_text}` projection: `cards.target_text`
+/// has no uniqueness constraint (unlike `words.target_text`), so two
+/// different cards can share the same text, and the picker needs the media
+/// fields too to tell them apart.
+pub async fn search_cards(
+    pool: &PgPool,
+    query: &str,
+    exclude_card_id: Uuid,
+) -> sqlx::Result<Vec<CardRow>> {
+    let sql = format!(
+        "SELECT {CARD_COLUMNS} FROM cards c \
+         WHERE c.target_text ILIKE $1 AND c.id != $2 \
+         ORDER BY c.target_text LIMIT 10"
+    );
+    sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(format!("%{query}%"))
+        .bind(exclude_card_id)
+        .fetch_all(pool)
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2128,5 +2221,194 @@ mod tests {
             Vec::<Uuid>::new()
         );
         assert!(cards_for_page(&pool, page_id).await.unwrap().is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_link_is_findable_from_either_card_regardless_of_insert_order(pool: PgPool) {
+        let user_id = test_user(&pool).await;
+        let card_a = create_card(&pool, user_id, card_with_text("pan"), &[])
+            .await
+            .unwrap();
+        let card_b = create_card(&pool, user_id, card_with_text("pin"), &[])
+            .await
+            .unwrap();
+
+        add_card_link(&pool, card_a, card_b, "minimal_pair")
+            .await
+            .unwrap();
+
+        let from_a = linked_cards(&pool, card_a).await.unwrap();
+        assert_eq!(from_a.len(), 1);
+        assert_eq!(from_a[0].linked_card_id, card_b);
+        assert_eq!(from_a[0].target_text, "pin");
+
+        let from_b = linked_cards(&pool, card_b).await.unwrap();
+        assert_eq!(from_b.len(), 1);
+        assert_eq!(from_b[0].linked_card_id, card_a);
+        assert_eq!(from_b[0].target_text, "pan");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn adding_the_same_link_twice_is_a_no_op(pool: PgPool) {
+        let user_id = test_user(&pool).await;
+        let card_a = create_card(&pool, user_id, card_with_text("pan"), &[])
+            .await
+            .unwrap();
+        let card_b = create_card(&pool, user_id, card_with_text("pin"), &[])
+            .await
+            .unwrap();
+
+        add_card_link(&pool, card_a, card_b, "minimal_pair")
+            .await
+            .unwrap();
+        add_card_link(&pool, card_a, card_b, "minimal_pair")
+            .await
+            .unwrap();
+
+        assert_eq!(linked_cards(&pool, card_a).await.unwrap().len(), 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn adding_the_reverse_order_of_an_existing_link_does_not_create_a_duplicate_row(
+        pool: PgPool,
+    ) {
+        let user_id = test_user(&pool).await;
+        let card_a = create_card(&pool, user_id, card_with_text("pan"), &[])
+            .await
+            .unwrap();
+        let card_b = create_card(&pool, user_id, card_with_text("pin"), &[])
+            .await
+            .unwrap();
+
+        add_card_link(&pool, card_a, card_b, "minimal_pair")
+            .await
+            .unwrap();
+        // Same unordered pair/type, opposite column order — the
+        // card_links_unordered_pair_idx expression unique index should
+        // block this as a duplicate, not create a second row.
+        add_card_link(&pool, card_b, card_a, "minimal_pair")
+            .await
+            .unwrap();
+
+        assert_eq!(linked_cards(&pool, card_a).await.unwrap().len(), 1);
+        assert_eq!(linked_cards(&pool, card_b).await.unwrap().len(), 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_same_pair_can_hold_two_different_link_types_simultaneously(pool: PgPool) {
+        let user_id = test_user(&pool).await;
+        let card_a = create_card(&pool, user_id, card_with_text("pan"), &[])
+            .await
+            .unwrap();
+        let card_b = create_card(&pool, user_id, card_with_text("pin"), &[])
+            .await
+            .unwrap();
+
+        add_card_link(&pool, card_a, card_b, "minimal_pair")
+            .await
+            .unwrap();
+        add_card_link(&pool, card_a, card_b, "sound_spelling")
+            .await
+            .unwrap();
+
+        let links = linked_cards(&pool, card_a).await.unwrap();
+        assert_eq!(links.len(), 2);
+        let mut link_types: Vec<_> = links.iter().map(|l| l.link_type.clone()).collect();
+        link_types.sort();
+        assert_eq!(link_types, vec!["minimal_pair", "sound_spelling"]);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn removing_a_link_removes_it_regardless_of_which_order_it_was_inserted_in(pool: PgPool) {
+        let user_id = test_user(&pool).await;
+        let card_a = create_card(&pool, user_id, card_with_text("pan"), &[])
+            .await
+            .unwrap();
+        let card_b = create_card(&pool, user_id, card_with_text("pin"), &[])
+            .await
+            .unwrap();
+        add_card_link(&pool, card_a, card_b, "minimal_pair")
+            .await
+            .unwrap();
+
+        // Removed via the reverse order from how it was inserted.
+        remove_card_link(&pool, card_b, card_a, "minimal_pair")
+            .await
+            .unwrap();
+
+        assert!(linked_cards(&pool, card_a).await.unwrap().is_empty());
+        assert!(linked_cards(&pool, card_b).await.unwrap().is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn deleting_either_card_in_a_link_cascades_the_link_row(pool: PgPool) {
+        let user_id = test_user(&pool).await;
+        let card_a = create_card(&pool, user_id, card_with_text("pan"), &[])
+            .await
+            .unwrap();
+        let card_b = create_card(&pool, user_id, card_with_text("pin"), &[])
+            .await
+            .unwrap();
+        let card_c = create_card(&pool, user_id, card_with_text("ton"), &[])
+            .await
+            .unwrap();
+        let card_d = create_card(&pool, user_id, card_with_text("tan"), &[])
+            .await
+            .unwrap();
+        // card_a is stored as card_id in this row...
+        add_card_link(&pool, card_a, card_b, "minimal_pair")
+            .await
+            .unwrap();
+        // ...and card_d is stored as linked_card_id in this one.
+        add_card_link(&pool, card_c, card_d, "minimal_pair")
+            .await
+            .unwrap();
+
+        delete_card(&pool, card_a).await.unwrap();
+        delete_card(&pool, card_d).await.unwrap();
+
+        assert!(linked_cards(&pool, card_b).await.unwrap().is_empty());
+        assert!(linked_cards(&pool, card_c).await.unwrap().is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn linked_cards_reports_which_side_is_the_source_for_a_directed_link(pool: PgPool) {
+        let user_id = test_user(&pool).await;
+        let earlier_step = create_card(&pool, user_id, card_with_text("na"), &[])
+            .await
+            .unwrap();
+        let later_step = create_card(&pool, user_id, card_with_text("nation"), &[])
+            .await
+            .unwrap();
+
+        add_card_link(&pool, earlier_step, later_step, "back_chain_step")
+            .await
+            .unwrap();
+
+        let from_earlier = linked_cards(&pool, earlier_step).await.unwrap();
+        assert_eq!(from_earlier.len(), 1);
+        assert!(from_earlier[0].is_source);
+
+        let from_later = linked_cards(&pool, later_step).await.unwrap();
+        assert_eq!(from_later.len(), 1);
+        assert!(!from_later[0].is_source);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_cards_matches_by_substring_and_excludes_the_given_card(pool: PgPool) {
+        let user_id = test_user(&pool).await;
+        let pan = create_card(&pool, user_id, card_with_text("pan"), &[])
+            .await
+            .unwrap();
+        let pin = create_card(&pool, user_id, card_with_text("pin"), &[])
+            .await
+            .unwrap();
+        create_card(&pool, user_id, card_with_text("gato"), &[])
+            .await
+            .unwrap();
+
+        let results = search_cards(&pool, "p", pan).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, pin);
     }
 }

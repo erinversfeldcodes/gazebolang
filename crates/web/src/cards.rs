@@ -25,7 +25,30 @@ pub struct CardDetail {
     pub tags: Vec<String>,
     pub deck_ids: Vec<Uuid>,
     pub page_ids: Vec<Uuid>,
+    pub linked_cards: Vec<CardLink>,
 }
+
+/// A typed relationship to another card (minimal pair, back-chain step,
+/// sound-spelling correspondence — see `LINK_TYPES`). `is_source` is only
+/// meaningful for the directional type: true means this card was stored as
+/// the earlier step relative to `linked_card_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CardLink {
+    pub linked_card_id: Uuid,
+    pub target_text: String,
+    pub link_type: String,
+    pub is_source: bool,
+}
+
+/// The known card-relationship types: (value stored in the DB, UI label,
+/// whether order between the two cards is meaningful). Shared between
+/// `add_card_link`'s validation and `app.rs`'s `CardLinksSection` UI so
+/// there's exactly one place that knows what a valid `link_type` is.
+pub const LINK_TYPES: &[(&str, &str, bool)] = &[
+    ("minimal_pair", "Minimal pair", false),
+    ("back_chain_step", "Back-chain step", true),
+    ("sound_spelling", "Sound-spelling correspondence", false),
+];
 
 /// Which side of a review-queue card is the prompt. See
 /// `crate::db::Direction` for why this is a queue-slot property, not a
@@ -164,15 +187,29 @@ pub async fn get_card(card_id: Uuid) -> Result<Option<CardDetail>, ServerFnError
     else {
         return Ok(None);
     };
-    let tags = crate::db::card_tags(&state.db_pool, card_id)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let deck_ids = crate::db::card_deck_ids(&state.db_pool, card_id)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-    let page_ids = crate::db::card_page_ids(&state.db_pool, card_id)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    // Four independent reads, each keyed only on `card_id` — none depends
+    // on another's result. Previously awaited one at a time (5 serialized
+    // Neon round trips per get_card call, holding a pool connection for
+    // the sum of all five instead of the slowest one); under concurrent
+    // load that compounds directly into exactly the kind of latency that
+    // blows a client-side e2e timeout. Running them concurrently cuts
+    // get_card's wall-clock cost to roughly one round trip.
+    let (tags, deck_ids, page_ids, linked_cards) = tokio::try_join!(
+        crate::db::card_tags(&state.db_pool, card_id),
+        crate::db::card_deck_ids(&state.db_pool, card_id),
+        crate::db::card_page_ids(&state.db_pool, card_id),
+        crate::db::linked_cards(&state.db_pool, card_id),
+    )
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let linked_cards = linked_cards
+        .into_iter()
+        .map(|l| CardLink {
+            linked_card_id: l.linked_card_id,
+            target_text: l.target_text,
+            link_type: l.link_type,
+            is_source: l.is_source,
+        })
+        .collect();
     Ok(Some(CardDetail {
         id: card.id,
         image_url: card.image_url,
@@ -184,7 +221,65 @@ pub async fn get_card(card_id: Uuid) -> Result<Option<CardDetail>, ServerFnError
         tags,
         deck_ids,
         page_ids,
+        linked_cards,
     }))
+}
+
+#[server]
+pub async fn add_card_link(
+    card_id: Uuid,
+    linked_card_id: Uuid,
+    link_type: String,
+) -> Result<(), ServerFnError> {
+    require_user().await?;
+    if card_id == linked_card_id {
+        return Err(ServerFnError::new("a card can't be linked to itself"));
+    }
+    if !LINK_TYPES.iter().any(|(value, _, _)| *value == link_type) {
+        return Err(ServerFnError::new("unknown link type"));
+    }
+    let state = expect_context::<crate::state::AppState>();
+    crate::db::add_card_link(&state.db_pool, card_id, linked_card_id, &link_type)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+#[server]
+pub async fn remove_card_link(
+    card_id: Uuid,
+    linked_card_id: Uuid,
+    link_type: String,
+) -> Result<(), ServerFnError> {
+    require_user().await?;
+    let state = expect_context::<crate::state::AppState>();
+    crate::db::remove_card_link(&state.db_pool, card_id, linked_card_id, &link_type)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
+#[server]
+pub async fn search_cards(
+    query: String,
+    exclude_card_id: Uuid,
+) -> Result<Vec<Card>, ServerFnError> {
+    // Public, same as list_cards/get_card: browsing the shared card pool
+    // needs no auth, only mutating it does.
+    let state = expect_context::<crate::state::AppState>();
+    let rows = crate::db::search_cards(&state.db_pool, &query, exclude_card_id)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    Ok(rows
+        .into_iter()
+        .map(|r| Card {
+            id: r.id,
+            image_url: r.image_url,
+            audio_url: r.audio_url,
+            video_url: r.video_url,
+            youtube_url: r.youtube_url,
+            target_text: r.target_text,
+            two_way: r.two_way,
+        })
+        .collect())
 }
 
 /// A client-facing image search result — see

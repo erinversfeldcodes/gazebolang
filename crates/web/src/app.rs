@@ -7,8 +7,9 @@ use crate::account::{
     SignUp, UpdateEmail, UpdateName, current_profile, current_user_name, user_stats,
 };
 use crate::cards::{
-    DeleteCard, DirectionInput, GradeCard, GradeInput, ImageSearchResult, ImportCardImage,
-    ReviewOrderInput, SearchCardImages, get_card, list_tags, review_queue,
+    AddCardLink, CardLink, DeleteCard, DirectionInput, GradeCard, GradeInput, ImageSearchResult,
+    ImportCardImage, LINK_TYPES, RemoveCardLink, ReviewOrderInput, SearchCardImages, get_card,
+    list_tags, review_queue, search_cards,
 };
 use crate::decks::{
     AddCardToDeck, CreateDeck, Deck, DeleteDeck, RemoveCardFromDeck, RenameDeck, list_decks,
@@ -16,6 +17,9 @@ use crate::decks::{
 use crate::dictionary::{WordDefinition, get_word_definition};
 use crate::dictionary_ui::{ClickableWord, DictionaryDetailsEditor};
 use crate::media_recorder::RecordButton;
+use crate::trainer_back_chain::BackChainGamePage;
+use crate::trainer_minimal_pairs::MinimalPairTrainerPage;
+use crate::trainer_spelling::SpellingTestPage;
 use crate::wiki::{
     AddPageToCard, CreatePage, DeletePage, MovePage, PageRevisionSummary, PageTreeNode,
     RemovePageFromCard, RenamePage, RestoreRevision, RevisionDiff, SavePageRevision,
@@ -44,7 +48,7 @@ use uuid::Uuid;
 /// pasted), so this is just the embed markup — no parsing needed. Shared
 /// across the card list, card detail, and review pages rather than
 /// repeated, since it's the exact same three attributes everywhere.
-fn youtube_embed(url: String) -> impl IntoView {
+pub(crate) fn youtube_embed(url: String) -> impl IntoView {
     view! { <iframe src=url width="560" height="315" allowfullscreen=true></iframe> }
 }
 
@@ -363,12 +367,31 @@ pub fn App() -> impl IntoView {
                 <A href="/decks">"Decks"</A>
                 " · "
                 <A href="/wiki">"Grammar"</A>
+                // Public like Decks/Grammar — nothing is mutated or
+                // persisted by walking a back-chain, so it needs no
+                // account, unlike the other two practice modes below.
+                " · "
+                <A href="/train/back-chain">"Back-chain"</A>
                 <Transition fallback=|| ()>
                     {move || {
                         Suspend::new(async move {
                         match auth.await.ok().flatten() {
                             Some(_) => view! {
                                 " · "<A href="/review">"Review"</A>
+                                " · "
+                                // Opens on hover (see .nav-menu in main.css),
+                                // same as the Cards/Account menus — minimal
+                                // pairs and the spelling test both need an
+                                // account (their attempts are per-user), so
+                                // this dropdown lives in the signed-in-only
+                                // branch, unlike Back-chain above.
+                                <div class="nav-menu">
+                                    <A href="/train/minimal-pairs" exact=true>"Practice"</A>
+                                    <div class="nav-menu-items">
+                                        <A href="/train/minimal-pairs">"Minimal pairs"</A>
+                                        <A href="/train/spelling">"Spelling test"</A>
+                                    </div>
+                                </div>
                                 " · "
                                 // Opens on hover (see .nav-menu in main.css),
                                 // same as the Cards menu above — clicking
@@ -425,6 +448,16 @@ pub fn App() -> impl IntoView {
                     // /wiki/{id}/{slug} to resolve at all.
                     <Route path=path!("/wiki/:id/*path") view=WikiPage/>
                     <Route path=StaticSegment("review") view=ReviewPage/>
+                    // path!, not StaticSegment: StaticSegment matches
+                    // exactly one path segment and 404s on any `/` inside
+                    // its literal that the real URL hasn't already
+                    // consumed — confirmed live — so a single StaticSegment
+                    // can never match a multi-segment literal like
+                    // "train/minimal-pairs". Same reason /cards/:id and
+                    // /wiki/:id/*path above use path! instead.
+                    <Route path=path!("/train/minimal-pairs") view=MinimalPairTrainerPage/>
+                    <Route path=path!("/train/back-chain") view=BackChainGamePage/>
+                    <Route path=path!("/train/spelling") view=SpellingTestPage/>
                     <Route path=StaticSegment("stats") view=StatsPage/>
                     <Route path=StaticSegment("settings") view=SettingsPage/>
                     <Route path=StaticSegment("account") view=AccountPage/>
@@ -1236,6 +1269,189 @@ fn PageAssignmentSection(
     }
 }
 
+fn link_type_label(value: &str) -> &'static str {
+    LINK_TYPES
+        .iter()
+        .find(|(v, _, _)| *v == value)
+        .map_or("Unknown", |(_, label, _)| label)
+}
+
+fn link_type_is_directional(value: &str) -> bool {
+    LINK_TYPES
+        .iter()
+        .find(|(v, _, _)| *v == value)
+        .is_some_and(|(_, _, directional)| *directional)
+}
+
+/// The "Related cards" section of `EditCardPage` — typed links to other
+/// specific cards (minimal pairs, back-chain steps, sound-spelling
+/// correspondences), distinct from the shared-label grouping tags/decks/
+/// pages already provide. See `cards::LINK_TYPES` for the known types and
+/// which one is directional. Live-search-as-you-type re-fetches on every
+/// keystroke rather than debouncing, same precedent as the wiki sidebar's
+/// page search — fine at this app's scale.
+#[component]
+fn CardLinksSection(
+    card_id: Uuid,
+    linked_cards: Vec<CardLink>,
+    signed_in: bool,
+    add_link: ServerAction<AddCardLink>,
+    remove_link: ServerAction<RemoveCardLink>,
+) -> impl IntoView {
+    let link_type = RwSignal::new(LINK_TYPES[0].0.to_string());
+    // Only consulted for the one directional link type — which card goes
+    // in `card_id` vs `linked_card_id` on dispatch.
+    let comes_before = RwSignal::new(true);
+    let search_query = RwSignal::new(String::new());
+    let search_results = Resource::new(
+        move || search_query.get(),
+        move |q| async move {
+            let q = q.trim().to_string();
+            if q.is_empty() {
+                Ok(Vec::new())
+            } else {
+                search_cards(q, card_id).await
+            }
+        },
+    );
+
+    let links_list = if linked_cards.is_empty() {
+        view! { <p>"Not linked to any other card."</p> }.into_any()
+    } else {
+        view! {
+            <ul>
+                {linked_cards
+                    .into_iter()
+                    .map(|link| {
+                        let label = link_type_label(&link.link_type);
+                        let arrow = if link_type_is_directional(&link.link_type) {
+                            if link.is_source { "→ " } else { "← " }
+                        } else {
+                            ""
+                        };
+                        let linked_card_id = link.linked_card_id;
+                        let remove_link_type = link.link_type.clone();
+                        view! {
+                            <li>
+                                {arrow}{link.target_text}" (" {label} ")"
+                                {signed_in.then(|| {
+                                    let remove_link_type = remove_link_type.clone();
+                                    view! {
+                                        " "
+                                        <button
+                                            type="button"
+                                            on:click=move |_| {
+                                                remove_link.dispatch(RemoveCardLink {
+                                                    card_id,
+                                                    linked_card_id,
+                                                    link_type: remove_link_type.clone(),
+                                                });
+                                            }
+                                        >
+                                            "Remove"
+                                        </button>
+                                    }
+                                })}
+                            </li>
+                        }
+                    })
+                    .collect_view()}
+            </ul>
+        }
+        .into_any()
+    };
+
+    let add_form = signed_in.then(|| {
+        view! {
+            <div class="card-links-add">
+                <label>
+                    "Link type "
+                    <select
+                        prop:value=move || link_type.get()
+                        on:change=move |ev| link_type.set(event_target_value(&ev))
+                    >
+                        {LINK_TYPES.iter().map(|(value, label, _)| {
+                            view! { <option value=*value>{*label}</option> }
+                        }).collect_view()}
+                    </select>
+                </label>
+                {move || link_type_is_directional(&link_type.get()).then(|| view! {
+                    <span>
+                        <label>
+                            <input
+                                type="radio"
+                                name="card-link-direction"
+                                prop:checked=move || comes_before.get()
+                                on:change=move |_| comes_before.set(true)
+                            />
+                            "This card comes before the one I pick"
+                        </label>
+                        " "
+                        <label>
+                            <input
+                                type="radio"
+                                name="card-link-direction"
+                                prop:checked=move || !comes_before.get()
+                                on:change=move |_| comes_before.set(false)
+                            />
+                            "Comes after"
+                        </label>
+                    </span>
+                })}
+                <br />
+                <input
+                    type="search"
+                    placeholder="Search cards to link…"
+                    prop:value=move || search_query.get()
+                    on:input=move |ev| search_query.set(event_target_value(&ev))
+                />
+                <Transition fallback=|| ()>
+                    {move || Suspend::new(async move {
+                        match search_results.await {
+                            Ok(results) => results
+                                .into_iter()
+                                .map(|result| {
+                                    let picked_id = result.id;
+                                    view! {
+                                        <button
+                                            type="button"
+                                            on:click=move |_| {
+                                                let (from, to) = if comes_before.get() {
+                                                    (card_id, picked_id)
+                                                } else {
+                                                    (picked_id, card_id)
+                                                };
+                                                add_link.dispatch(AddCardLink {
+                                                    card_id: from,
+                                                    linked_card_id: to,
+                                                    link_type: link_type.get(),
+                                                });
+                                                search_query.set(String::new());
+                                            }
+                                        >
+                                            {result.target_text.clone()}
+                                        </button>
+                                    }
+                                })
+                                .collect_view()
+                                .into_any(),
+                            Err(e) => view! { <p>"Error: " {e.to_string()}</p> }.into_any(),
+                        }
+                    })}
+                </Transition>
+            </div>
+        }
+    });
+
+    view! {
+        <div class="card-section">
+            <p class="card-section-heading">"Related cards"</p>
+            {links_list}
+            {add_form}
+        </div>
+    }
+}
+
 /// The delete button + its own dispatch error — pulled out of
 /// `EditCardPage`'s view (pure decomposition, no behavior change). The
 /// `delete` action's navigate-on-success `Effect` stays in the parent,
@@ -1271,9 +1487,24 @@ fn EditCardPage() -> impl IntoView {
     // completed save — see that component's doc comment for why this is
     // needed now that saving no longer hard-reloads the page.
     let card_refresh = RwSignal::new(0usize);
+    let add_link = ServerAction::<AddCardLink>::new();
+    let remove_link = ServerAction::<RemoveCardLink>::new();
+    // Unlike deck/page checkboxes (whose checked-ness falls back on native
+    // DOM state after a click, so they never needed this), the "Related
+    // cards" list is plain rendered content re-derived from `card` each
+    // time — it has no such fallback, so add_link/remove_link's own
+    // version signals are folded into this Resource's key too, same
+    // precedent as ReviewPage keying its queue on `grade.version()`.
     let card = Resource::new(
-        move || (card_id(), card_refresh.get()),
-        |(id, _)| async move {
+        move || {
+            (
+                card_id(),
+                card_refresh.get(),
+                add_link.version().get(),
+                remove_link.version().get(),
+            )
+        },
+        |(id, ..)| async move {
             match id {
                 Some(id) => get_card(id).await,
                 None => Ok(None),
@@ -1326,6 +1557,16 @@ fn EditCardPage() -> impl IntoView {
                             .ok()
                             .flatten();
 
+                        // Every child component here returns `impl IntoView`,
+                        // not `AnyView` — fine individually, but composing
+                        // all seven nested types inline into this one view!
+                        // overflowed rustc's query-depth limit in a release
+                        // build (confirmed live: "queries overflow the depth
+                        // limit!", naming this exact closure). `.into_any()`
+                        // on each caps the type at this boundary instead of
+                        // inlining it further — same fix already used by
+                        // `wiki_sidebar`/`wiki_tree_level` above for the same
+                        // failure mode, see that doc comment for the history.
                         let preview = view! {
                             <CardPreviewHeader
                                 image_url=detail.image_url.clone()
@@ -1336,26 +1577,33 @@ fn EditCardPage() -> impl IntoView {
                                 tags=detail.tags.clone()
                                 signed_in=signed_in
                             />
-                        };
-                        let dictionary_editor = signed_in.then(|| view! {
-                            <CardDictionarySection
-                                target_text_signal=target_text_signal
-                                existing_definition=existing_definition
-                            />
+                        }
+                        .into_any();
+                        let dictionary_editor = signed_in.then(|| {
+                            view! {
+                                <CardDictionarySection
+                                    target_text_signal=target_text_signal
+                                    existing_definition=existing_definition
+                                />
+                            }
+                            .into_any()
                         });
-                        let edit_form = signed_in.then(|| view! {
-                            <CardEditForm
-                                id=id
-                                target_text=detail.target_text.clone()
-                                tags=detail.tags.clone()
-                                two_way=detail.two_way
-                                has_image=detail.image_url.is_some()
-                                has_audio=detail.audio_url.is_some()
-                                has_video=detail.video_url.is_some()
-                                has_youtube=detail.youtube_url.is_some()
-                                target_text_signal=target_text_signal
-                                card_refresh=card_refresh
-                            />
+                        let edit_form = signed_in.then(|| {
+                            view! {
+                                <CardEditForm
+                                    id=id
+                                    target_text=detail.target_text.clone()
+                                    tags=detail.tags.clone()
+                                    two_way=detail.two_way
+                                    has_image=detail.image_url.is_some()
+                                    has_audio=detail.audio_url.is_some()
+                                    has_video=detail.video_url.is_some()
+                                    has_youtube=detail.youtube_url.is_some()
+                                    target_text_signal=target_text_signal
+                                    card_refresh=card_refresh
+                                />
+                            }
+                            .into_any()
                         });
                         let deck_section = view! {
                             <DeckAssignmentSection
@@ -1366,7 +1614,8 @@ fn EditCardPage() -> impl IntoView {
                                 toggle_deck=toggle_deck
                                 untoggle_deck=untoggle_deck
                             />
-                        };
+                        }
+                        .into_any();
                         let page_section = view! {
                             <PageAssignmentSection
                                 card_id=id
@@ -1376,12 +1625,24 @@ fn EditCardPage() -> impl IntoView {
                                 toggle_page=toggle_page
                                 untoggle_page=untoggle_page
                             />
-                        };
-                        let delete_form = signed_in.then(|| view! {
-                            <DeleteCardSection card_id=id delete=delete />
+                        }
+                        .into_any();
+                        let links_section = view! {
+                            <CardLinksSection
+                                card_id=id
+                                linked_cards=detail.linked_cards.clone()
+                                signed_in=signed_in
+                                add_link=add_link
+                                remove_link=remove_link
+                            />
+                        }
+                        .into_any();
+                        let delete_form = signed_in.then(|| {
+                            view! { <DeleteCardSection card_id=id delete=delete /> }.into_any()
                         });
                         let sign_in_prompt = (!signed_in).then(|| {
                             view! { <p><A href="/login">"Sign in"</A>" to edit this card."</p> }
+                                .into_any()
                         });
 
                         view! {
@@ -1390,6 +1651,7 @@ fn EditCardPage() -> impl IntoView {
                             {dictionary_editor}
                             {deck_section}
                             {page_section}
+                            {links_section}
                             {delete_form}
                             {sign_in_prompt}
                         }
