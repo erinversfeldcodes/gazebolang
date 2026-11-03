@@ -7,8 +7,9 @@ use crate::account::{
     SignUp, UpdateEmail, UpdateName, current_profile, current_user_name, user_stats,
 };
 use crate::cards::{
-    DeleteCard, DirectionInput, GradeCard, GradeInput, ImageSearchResult, ImportCardImage,
-    ReviewOrderInput, SearchCardImages, get_card, list_tags, review_queue,
+    AddCardLink, CardLink, DeleteCard, DirectionInput, GradeCard, GradeInput, ImageSearchResult,
+    ImportCardImage, LINK_TYPES, RemoveCardLink, ReviewOrderInput, SearchCardImages, get_card,
+    list_tags, review_queue, search_cards,
 };
 use crate::decks::{
     AddCardToDeck, CreateDeck, Deck, DeleteDeck, RemoveCardFromDeck, RenameDeck, list_decks,
@@ -1236,6 +1237,189 @@ fn PageAssignmentSection(
     }
 }
 
+fn link_type_label(value: &str) -> &'static str {
+    LINK_TYPES
+        .iter()
+        .find(|(v, _, _)| *v == value)
+        .map_or("Unknown", |(_, label, _)| label)
+}
+
+fn link_type_is_directional(value: &str) -> bool {
+    LINK_TYPES
+        .iter()
+        .find(|(v, _, _)| *v == value)
+        .is_some_and(|(_, _, directional)| *directional)
+}
+
+/// The "Related cards" section of `EditCardPage` — typed links to other
+/// specific cards (minimal pairs, back-chain steps, sound-spelling
+/// correspondences), distinct from the shared-label grouping tags/decks/
+/// pages already provide. See `cards::LINK_TYPES` for the known types and
+/// which one is directional. Live-search-as-you-type re-fetches on every
+/// keystroke rather than debouncing, same precedent as the wiki sidebar's
+/// page search — fine at this app's scale.
+#[component]
+fn CardLinksSection(
+    card_id: Uuid,
+    linked_cards: Vec<CardLink>,
+    signed_in: bool,
+    add_link: ServerAction<AddCardLink>,
+    remove_link: ServerAction<RemoveCardLink>,
+) -> impl IntoView {
+    let link_type = RwSignal::new(LINK_TYPES[0].0.to_string());
+    // Only consulted for the one directional link type — which card goes
+    // in `card_id` vs `linked_card_id` on dispatch.
+    let comes_before = RwSignal::new(true);
+    let search_query = RwSignal::new(String::new());
+    let search_results = Resource::new(
+        move || search_query.get(),
+        move |q| async move {
+            let q = q.trim().to_string();
+            if q.is_empty() {
+                Ok(Vec::new())
+            } else {
+                search_cards(q, card_id).await
+            }
+        },
+    );
+
+    let links_list = if linked_cards.is_empty() {
+        view! { <p>"Not linked to any other card."</p> }.into_any()
+    } else {
+        view! {
+            <ul>
+                {linked_cards
+                    .into_iter()
+                    .map(|link| {
+                        let label = link_type_label(&link.link_type);
+                        let arrow = if link_type_is_directional(&link.link_type) {
+                            if link.is_source { "→ " } else { "← " }
+                        } else {
+                            ""
+                        };
+                        let linked_card_id = link.linked_card_id;
+                        let remove_link_type = link.link_type.clone();
+                        view! {
+                            <li>
+                                {arrow}{link.target_text}" (" {label} ")"
+                                {signed_in.then(|| {
+                                    let remove_link_type = remove_link_type.clone();
+                                    view! {
+                                        " "
+                                        <button
+                                            type="button"
+                                            on:click=move |_| {
+                                                remove_link.dispatch(RemoveCardLink {
+                                                    card_id,
+                                                    linked_card_id,
+                                                    link_type: remove_link_type.clone(),
+                                                });
+                                            }
+                                        >
+                                            "Remove"
+                                        </button>
+                                    }
+                                })}
+                            </li>
+                        }
+                    })
+                    .collect_view()}
+            </ul>
+        }
+        .into_any()
+    };
+
+    let add_form = signed_in.then(|| {
+        view! {
+            <div class="card-links-add">
+                <label>
+                    "Link type "
+                    <select
+                        prop:value=move || link_type.get()
+                        on:change=move |ev| link_type.set(event_target_value(&ev))
+                    >
+                        {LINK_TYPES.iter().map(|(value, label, _)| {
+                            view! { <option value=*value>{*label}</option> }
+                        }).collect_view()}
+                    </select>
+                </label>
+                {move || link_type_is_directional(&link_type.get()).then(|| view! {
+                    <span>
+                        <label>
+                            <input
+                                type="radio"
+                                name="card-link-direction"
+                                prop:checked=move || comes_before.get()
+                                on:change=move |_| comes_before.set(true)
+                            />
+                            "This card comes before the one I pick"
+                        </label>
+                        " "
+                        <label>
+                            <input
+                                type="radio"
+                                name="card-link-direction"
+                                prop:checked=move || !comes_before.get()
+                                on:change=move |_| comes_before.set(false)
+                            />
+                            "Comes after"
+                        </label>
+                    </span>
+                })}
+                <br />
+                <input
+                    type="search"
+                    placeholder="Search cards to link…"
+                    prop:value=move || search_query.get()
+                    on:input=move |ev| search_query.set(event_target_value(&ev))
+                />
+                <Transition fallback=|| ()>
+                    {move || Suspend::new(async move {
+                        match search_results.await {
+                            Ok(results) => results
+                                .into_iter()
+                                .map(|result| {
+                                    let picked_id = result.id;
+                                    view! {
+                                        <button
+                                            type="button"
+                                            on:click=move |_| {
+                                                let (from, to) = if comes_before.get() {
+                                                    (card_id, picked_id)
+                                                } else {
+                                                    (picked_id, card_id)
+                                                };
+                                                add_link.dispatch(AddCardLink {
+                                                    card_id: from,
+                                                    linked_card_id: to,
+                                                    link_type: link_type.get(),
+                                                });
+                                                search_query.set(String::new());
+                                            }
+                                        >
+                                            {result.target_text.clone()}
+                                        </button>
+                                    }
+                                })
+                                .collect_view()
+                                .into_any(),
+                            Err(e) => view! { <p>"Error: " {e.to_string()}</p> }.into_any(),
+                        }
+                    })}
+                </Transition>
+            </div>
+        }
+    });
+
+    view! {
+        <div class="card-section">
+            <p class="card-section-heading">"Related cards"</p>
+            {links_list}
+            {add_form}
+        </div>
+    }
+}
+
 /// The delete button + its own dispatch error — pulled out of
 /// `EditCardPage`'s view (pure decomposition, no behavior change). The
 /// `delete` action's navigate-on-success `Effect` stays in the parent,
@@ -1271,9 +1455,24 @@ fn EditCardPage() -> impl IntoView {
     // completed save — see that component's doc comment for why this is
     // needed now that saving no longer hard-reloads the page.
     let card_refresh = RwSignal::new(0usize);
+    let add_link = ServerAction::<AddCardLink>::new();
+    let remove_link = ServerAction::<RemoveCardLink>::new();
+    // Unlike deck/page checkboxes (whose checked-ness falls back on native
+    // DOM state after a click, so they never needed this), the "Related
+    // cards" list is plain rendered content re-derived from `card` each
+    // time — it has no such fallback, so add_link/remove_link's own
+    // version signals are folded into this Resource's key too, same
+    // precedent as ReviewPage keying its queue on `grade.version()`.
     let card = Resource::new(
-        move || (card_id(), card_refresh.get()),
-        |(id, _)| async move {
+        move || {
+            (
+                card_id(),
+                card_refresh.get(),
+                add_link.version().get(),
+                remove_link.version().get(),
+            )
+        },
+        |(id, ..)| async move {
             match id {
                 Some(id) => get_card(id).await,
                 None => Ok(None),
@@ -1377,6 +1576,15 @@ fn EditCardPage() -> impl IntoView {
                                 untoggle_page=untoggle_page
                             />
                         };
+                        let links_section = view! {
+                            <CardLinksSection
+                                card_id=id
+                                linked_cards=detail.linked_cards.clone()
+                                signed_in=signed_in
+                                add_link=add_link
+                                remove_link=remove_link
+                            />
+                        };
                         let delete_form = signed_in.then(|| view! {
                             <DeleteCardSection card_id=id delete=delete />
                         });
@@ -1390,6 +1598,7 @@ fn EditCardPage() -> impl IntoView {
                             {dictionary_editor}
                             {deck_section}
                             {page_section}
+                            {links_section}
                             {delete_form}
                             {sign_in_prompt}
                         }
