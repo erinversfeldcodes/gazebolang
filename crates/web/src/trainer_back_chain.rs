@@ -7,6 +7,11 @@
 //! through `crate::db`, to avoid a shared-file dependency with that
 //! parallel work.
 
+// #[component] already enforces call sites use the returned view; clippy's
+// pedantic must_use_candidate doesn't see through the macro expansion —
+// same rationale/precedent as app.rs's own identical allow.
+#![allow(clippy::must_use_candidate)]
+
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use uuid::Uuid;

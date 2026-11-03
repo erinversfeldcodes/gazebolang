@@ -6,6 +6,12 @@
 //! two others (a minimal-pair trainer and a back-chaining game) on
 //! separate worktrees, and going through the shared `db.rs` would have
 //! made all three agents' work collide on one file.
+
+// #[component] already enforces call sites use the returned view; clippy's
+// pedantic must_use_candidate doesn't see through the macro expansion —
+// same rationale/precedent as app.rs's own identical allow.
+#![allow(clippy::must_use_candidate)]
+
 use leptos::prelude::*;
 use leptos_router::components::{A, Redirect};
 use serde::{Deserialize, Serialize};

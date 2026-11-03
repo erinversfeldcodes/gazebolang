@@ -1557,6 +1557,16 @@ fn EditCardPage() -> impl IntoView {
                             .ok()
                             .flatten();
 
+                        // Every child component here returns `impl IntoView`,
+                        // not `AnyView` — fine individually, but composing
+                        // all seven nested types inline into this one view!
+                        // overflowed rustc's query-depth limit in a release
+                        // build (confirmed live: "queries overflow the depth
+                        // limit!", naming this exact closure). `.into_any()`
+                        // on each caps the type at this boundary instead of
+                        // inlining it further — same fix already used by
+                        // `wiki_sidebar`/`wiki_tree_level` above for the same
+                        // failure mode, see that doc comment for the history.
                         let preview = view! {
                             <CardPreviewHeader
                                 image_url=detail.image_url.clone()
@@ -1567,26 +1577,33 @@ fn EditCardPage() -> impl IntoView {
                                 tags=detail.tags.clone()
                                 signed_in=signed_in
                             />
-                        };
-                        let dictionary_editor = signed_in.then(|| view! {
-                            <CardDictionarySection
-                                target_text_signal=target_text_signal
-                                existing_definition=existing_definition
-                            />
+                        }
+                        .into_any();
+                        let dictionary_editor = signed_in.then(|| {
+                            view! {
+                                <CardDictionarySection
+                                    target_text_signal=target_text_signal
+                                    existing_definition=existing_definition
+                                />
+                            }
+                            .into_any()
                         });
-                        let edit_form = signed_in.then(|| view! {
-                            <CardEditForm
-                                id=id
-                                target_text=detail.target_text.clone()
-                                tags=detail.tags.clone()
-                                two_way=detail.two_way
-                                has_image=detail.image_url.is_some()
-                                has_audio=detail.audio_url.is_some()
-                                has_video=detail.video_url.is_some()
-                                has_youtube=detail.youtube_url.is_some()
-                                target_text_signal=target_text_signal
-                                card_refresh=card_refresh
-                            />
+                        let edit_form = signed_in.then(|| {
+                            view! {
+                                <CardEditForm
+                                    id=id
+                                    target_text=detail.target_text.clone()
+                                    tags=detail.tags.clone()
+                                    two_way=detail.two_way
+                                    has_image=detail.image_url.is_some()
+                                    has_audio=detail.audio_url.is_some()
+                                    has_video=detail.video_url.is_some()
+                                    has_youtube=detail.youtube_url.is_some()
+                                    target_text_signal=target_text_signal
+                                    card_refresh=card_refresh
+                                />
+                            }
+                            .into_any()
                         });
                         let deck_section = view! {
                             <DeckAssignmentSection
@@ -1597,7 +1614,8 @@ fn EditCardPage() -> impl IntoView {
                                 toggle_deck=toggle_deck
                                 untoggle_deck=untoggle_deck
                             />
-                        };
+                        }
+                        .into_any();
                         let page_section = view! {
                             <PageAssignmentSection
                                 card_id=id
@@ -1607,7 +1625,8 @@ fn EditCardPage() -> impl IntoView {
                                 toggle_page=toggle_page
                                 untoggle_page=untoggle_page
                             />
-                        };
+                        }
+                        .into_any();
                         let links_section = view! {
                             <CardLinksSection
                                 card_id=id
@@ -1616,12 +1635,14 @@ fn EditCardPage() -> impl IntoView {
                                 add_link=add_link
                                 remove_link=remove_link
                             />
-                        };
-                        let delete_form = signed_in.then(|| view! {
-                            <DeleteCardSection card_id=id delete=delete />
+                        }
+                        .into_any();
+                        let delete_form = signed_in.then(|| {
+                            view! { <DeleteCardSection card_id=id delete=delete /> }.into_any()
                         });
                         let sign_in_prompt = (!signed_in).then(|| {
                             view! { <p><A href="/login">"Sign in"</A>" to edit this card."</p> }
+                                .into_any()
                         });
 
                         view! {

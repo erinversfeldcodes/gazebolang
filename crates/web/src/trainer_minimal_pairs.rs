@@ -1,5 +1,12 @@
+// #[component] already enforces call sites use the returned view; clippy's
+// pedantic must_use_candidate doesn't see through the macro expansion —
+// same rationale/precedent as app.rs's own identical allow.
+#![allow(clippy::must_use_candidate)]
+
 use leptos::prelude::*;
 use leptos_router::components::{A, Redirect};
+#[cfg(feature = "ssr")]
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -13,6 +20,23 @@ pub struct MinimalPairRound {
     pub prompt_card_id: Uuid,
     pub option_a: (Uuid, String), // (card_id, target_text)
     pub option_b: (Uuid, String),
+}
+
+/// A `card_links`/`cards` join row for one minimal-pair round, before the
+/// prompt-side/slot-order coin flips in `minimal_pair_round` below decide
+/// which card is the prompt and which UI slot each lands in. A named
+/// module-level type rather than a function-local one, matching this
+/// file's other query-row structs — `a`/`b` deliberately match the SQL's
+/// own join aliases.
+#[cfg(feature = "ssr")]
+#[derive(sqlx::FromRow)]
+struct PairCandidateRow {
+    card_id: Uuid,
+    linked_card_id: Uuid,
+    a_audio_url: String,
+    a_target_text: String,
+    b_audio_url: String,
+    b_target_text: String,
 }
 
 #[cfg(feature = "ssr")]
@@ -38,17 +62,7 @@ pub async fn minimal_pair_round() -> Result<Option<MinimalPairRound>, ServerFnEr
     // A pair with no audio on either side isn't drillable as a
     // sound-discrimination exercise, so it's skipped entirely rather than
     // degrading to something else.
-    #[derive(sqlx::FromRow)]
-    struct Row {
-        card_id: Uuid,
-        linked_card_id: Uuid,
-        a_audio_url: String,
-        a_target_text: String,
-        b_audio_url: String,
-        b_target_text: String,
-    }
-
-    let row: Option<Row> = sqlx::query_as(
+    let row: Option<PairCandidateRow> = sqlx::query_as(
         "SELECT cl.card_id, cl.linked_card_id, \
          a.audio_url AS a_audio_url, a.target_text AS a_target_text, \
          b.audio_url AS b_audio_url, b.target_text AS b_target_text \
@@ -72,7 +86,6 @@ pub async fn minimal_pair_round() -> Result<Option<MinimalPairRound>, ServerFnEr
     // lands in. Independent on purpose, so the "correct" option never
     // correlates with a fixed slot or with whichever card happened to be
     // `card_id` vs `linked_card_id` in storage.
-    use rand::RngExt;
     let mut rng = rand::rng();
     let prompt_is_a: bool = rng.random();
     let swap_slots: bool = rng.random();
@@ -100,6 +113,10 @@ pub async fn minimal_pair_round() -> Result<Option<MinimalPairRound>, ServerFnEr
 }
 
 #[server]
+// `card_a_id`/`card_b_id` mirror the table's own column names (and the
+// pair's inherent a/b shape) — clearer here than any less-similar
+// alternative would be.
+#[allow(clippy::similar_names)]
 pub async fn submit_minimal_pair_attempt(
     card_a_id: Uuid,
     card_b_id: Uuid,
@@ -133,6 +150,11 @@ struct AttemptFeedback {
 }
 
 #[component]
+// `card_a_id`/`card_b_id` (and their `text_a`/`text_b`,
+// `text_a_for_click`/`text_b_for_click` counterparts below) mirror the
+// pair's own inherent a/b shape — clearer here than any less-similar
+// alternative would be.
+#[allow(clippy::similar_names)]
 pub fn MinimalPairTrainerPage() -> impl IntoView {
     let auth = Resource::new(|| (), |()| crate::account::current_user_name());
     let round_refresh = RwSignal::new(0usize);

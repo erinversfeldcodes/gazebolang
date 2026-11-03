@@ -1397,8 +1397,8 @@ pub struct CardLinkRow {
     pub link_type: String,
     /// True when the queried card was stored as `card_id` rather than
     /// `linked_card_id` — i.e. it's the earlier step for a directional
-    /// type like back_chain_step. Meaningless but harmless for the
-    /// symmetric types (minimal_pair, sound_spelling).
+    /// type like `back_chain_step`. Meaningless but harmless for the
+    /// symmetric types (`minimal_pair`, `sound_spelling`).
     pub is_source: bool,
 }
 
