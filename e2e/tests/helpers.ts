@@ -44,6 +44,25 @@ export async function withServerResponse<T>(
   return result;
 }
 
+// Same race as withServerResponse, for a plain <Form> that posts straight to
+// a hand-written axum route (e.g. CardEditForm's POST to /cards/:id) rather
+// than a `/api/<fn>` server action — there's no fnName to match on, only the
+// request path.
+export async function withFormResponse<T>(
+  page: Page,
+  pathPattern: RegExp,
+  trigger: () => Promise<T>,
+): Promise<T> {
+  const [, result] = await Promise.all([
+    page.waitForResponse(
+      (res) =>
+        res.request().method() === "POST" && pathPattern.test(new URL(res.url()).pathname),
+    ),
+    trigger(),
+  ]);
+  return result;
+}
+
 // Creates a card and a deck containing only that card. Scoping a spec's
 // review to its own deck (rather than the shared pool's review queue) is
 // what makes it safe under parallel execution: specs running concurrently

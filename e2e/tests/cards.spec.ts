@@ -1,5 +1,5 @@
 import { test, expect } from "./fixtures";
-import { uniqueWord } from "./helpers";
+import { uniqueWord, withFormResponse } from "./helpers";
 
 test("creating a card shows it in the shared card list", async ({ page }) => {
   const word = uniqueWord("cards-spec");
@@ -44,7 +44,19 @@ test("editing a card updates its word and is reflected in the list", async ({ pa
   // exact: true — the edit page's always-visible dictionary-details
   // section has its own "Save dictionary details" button, which "Save"
   // would otherwise substring-match too.
-  await page.getByRole("button", { name: "Save", exact: true }).click();
+  //
+  // This save lands on the *same* /cards/:id URL we're already on, so
+  // `toHaveURL` below was never actually proof the save round-tripped — it
+  // was already true before the click. Nothing else forced a wait for it
+  // either, so the `page.goto("/")` a few lines down used to fire while the
+  // POST was still in flight and cancel it outright (status -1 in a CI
+  // trace) — the edit was silently lost, and the list page correctly
+  // showed the pre-edit word. withFormResponse closes that race by waiting
+  // for the POST's own response first, same fix withServerResponse applies
+  // to /api/ server actions elsewhere.
+  await withFormResponse(page, /^\/cards\/[0-9a-f-]+$/, () =>
+    page.getByRole("button", { name: "Save", exact: true }).click(),
+  );
 
   await expect(page).toHaveURL(/\/cards\/[0-9a-f-]+$/);
   await expect(page.getByLabel("Target-language word/phrase")).toHaveValue(updated);
