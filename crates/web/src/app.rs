@@ -17,6 +17,9 @@ use crate::decks::{
 use crate::dictionary::{WordDefinition, get_word_definition};
 use crate::dictionary_ui::{ClickableWord, DictionaryDetailsEditor};
 use crate::media_recorder::RecordButton;
+use crate::trainer_back_chain::BackChainGamePage;
+use crate::trainer_minimal_pairs::MinimalPairTrainerPage;
+use crate::trainer_spelling::SpellingTestPage;
 use crate::wiki::{
     AddPageToCard, CreatePage, DeletePage, MovePage, PageRevisionSummary, PageTreeNode,
     RemovePageFromCard, RenamePage, RestoreRevision, RevisionDiff, SavePageRevision,
@@ -45,7 +48,7 @@ use uuid::Uuid;
 /// pasted), so this is just the embed markup — no parsing needed. Shared
 /// across the card list, card detail, and review pages rather than
 /// repeated, since it's the exact same three attributes everywhere.
-fn youtube_embed(url: String) -> impl IntoView {
+pub(crate) fn youtube_embed(url: String) -> impl IntoView {
     view! { <iframe src=url width="560" height="315" allowfullscreen=true></iframe> }
 }
 
@@ -364,12 +367,31 @@ pub fn App() -> impl IntoView {
                 <A href="/decks">"Decks"</A>
                 " · "
                 <A href="/wiki">"Grammar"</A>
+                // Public like Decks/Grammar — nothing is mutated or
+                // persisted by walking a back-chain, so it needs no
+                // account, unlike the other two practice modes below.
+                " · "
+                <A href="/train/back-chain">"Back-chain"</A>
                 <Transition fallback=|| ()>
                     {move || {
                         Suspend::new(async move {
                         match auth.await.ok().flatten() {
                             Some(_) => view! {
                                 " · "<A href="/review">"Review"</A>
+                                " · "
+                                // Opens on hover (see .nav-menu in main.css),
+                                // same as the Cards/Account menus — minimal
+                                // pairs and the spelling test both need an
+                                // account (their attempts are per-user), so
+                                // this dropdown lives in the signed-in-only
+                                // branch, unlike Back-chain above.
+                                <div class="nav-menu">
+                                    <A href="/train/minimal-pairs" exact=true>"Practice"</A>
+                                    <div class="nav-menu-items">
+                                        <A href="/train/minimal-pairs">"Minimal pairs"</A>
+                                        <A href="/train/spelling">"Spelling test"</A>
+                                    </div>
+                                </div>
                                 " · "
                                 // Opens on hover (see .nav-menu in main.css),
                                 // same as the Cards menu above — clicking
@@ -426,6 +448,16 @@ pub fn App() -> impl IntoView {
                     // /wiki/{id}/{slug} to resolve at all.
                     <Route path=path!("/wiki/:id/*path") view=WikiPage/>
                     <Route path=StaticSegment("review") view=ReviewPage/>
+                    // path!, not StaticSegment: StaticSegment matches
+                    // exactly one path segment and 404s on any `/` inside
+                    // its literal that the real URL hasn't already
+                    // consumed — confirmed live — so a single StaticSegment
+                    // can never match a multi-segment literal like
+                    // "train/minimal-pairs". Same reason /cards/:id and
+                    // /wiki/:id/*path above use path! instead.
+                    <Route path=path!("/train/minimal-pairs") view=MinimalPairTrainerPage/>
+                    <Route path=path!("/train/back-chain") view=BackChainGamePage/>
+                    <Route path=path!("/train/spelling") view=SpellingTestPage/>
                     <Route path=StaticSegment("stats") view=StatsPage/>
                     <Route path=StaticSegment("settings") view=SettingsPage/>
                     <Route path=StaticSegment("account") view=AccountPage/>
