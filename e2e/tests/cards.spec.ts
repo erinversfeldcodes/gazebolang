@@ -74,6 +74,56 @@ test("deleting a card removes it from the list", async ({ page }) => {
   await expect(page.locator("li", { hasText: word })).toHaveCount(0);
 });
 
+test("submitting an invalid YouTube link on the new-card form shows an inline error", async ({
+  page,
+}) => {
+  const word = uniqueWord("cards-spec-invalid-youtube");
+
+  await page.goto("/new");
+  await page.getByLabel("Target-language word/phrase").fill(word);
+  await page.getByLabel("Or link a YouTube video").fill("https://example.com/not-a-youtube-link");
+  await page.getByRole("button", { name: "Add" }).click();
+
+  // This form submits via leptos_router's <Form> (AJAX, redirect-follow via
+  // client-side navigate), not a hard page reload — this is the regression
+  // guard for that specifically: the error must still land back on /new
+  // with the banner rendered, not silently vanish (see form_error_banner's
+  // doc comment in app.rs for why it has to read reactively now).
+  await expect(page).toHaveURL(/\/new\?error=/);
+  await expect(page.getByText("Error:")).toBeVisible();
+  await expect(page.locator("li", { hasText: word })).toHaveCount(0);
+});
+
+test("saving an edited card with an invalid YouTube link shows an inline error without losing the page", async ({
+  page,
+}) => {
+  const word = uniqueWord("cards-spec-edit-invalid-youtube");
+
+  await page.goto("/new");
+  await page.getByLabel("Target-language word/phrase").fill(word);
+  await page.getByRole("button", { name: "Add" }).click();
+  await expect(page).toHaveURL("/");
+
+  await page.locator("li", { hasText: word }).getByRole("link", { name: "Edit" }).click();
+  // A syntactically well-formed URL that still isn't a YouTube link — the
+  // field is `type="url"`, so anything that isn't even URL-shaped (e.g.
+  // "not a link at all") gets blocked by the browser's own native
+  // constraint validation before the click ever reaches our submit
+  // handler, which would test nothing about the server-side rejection
+  // this is actually meant to guard.
+  await page.getByLabel("Replace YouTube link (optional)").fill("https://example.com/not-a-youtube-link");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+
+  await expect(page).toHaveURL(/\/cards\/[0-9a-f-]+\?error=/);
+  await expect(page.getByText("Error:")).toBeVisible();
+  // The regression this guards: EditCardPage's `card` Resource is keyed
+  // only on the card id, which doesn't change on this redirect, so
+  // without `card_refresh` wired to <Form>'s own `version` prop it would
+  // never re-fetch — confirmed live this used to leave the page stuck
+  // showing stale data after a save.
+  await expect(page.getByLabel("Target-language word/phrase")).toHaveValue(word);
+});
+
 test("an anonymous visitor sees a card read-only, with no edit form", async ({ page, browser }) => {
   const word = uniqueWord("cards-spec-anon");
 

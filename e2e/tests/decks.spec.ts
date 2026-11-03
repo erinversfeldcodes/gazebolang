@@ -51,6 +51,32 @@ test("removing a card from a deck excludes it from that deck's filter again", as
   await expect(page.locator("li", { hasText: word })).toHaveCount(0);
 });
 
+test("checking a deck on the new-card form assigns it without a separate edit step", async ({
+  page,
+}) => {
+  const deckName = uniqueWord("decks-spec-create");
+  const word = uniqueWord("decks-spec-create-card");
+
+  await page.goto("/decks");
+  await page.getByLabel("New deck name").fill(deckName);
+  await page.getByRole("button", { name: "Create" }).click();
+  await expect(page.getByRole("link", { name: deckName })).toBeVisible();
+
+  await page.goto("/new");
+  await page.getByLabel("Target-language word/phrase").fill(word);
+  await page.getByLabel(deckName).check();
+  await page.getByRole("button", { name: "Add" }).click();
+  await expect(page).toHaveURL("/");
+
+  await page.getByLabel("Filter by deck").selectOption(deckName);
+  await expect(page.locator("li", { hasText: word })).toHaveCount(1);
+
+  // Additive, not a replacement for the automatic default-deck membership
+  // every card still gets regardless of which other decks were checked.
+  await page.getByLabel("Filter by deck").selectOption("Default");
+  await expect(page.locator("li", { hasText: word })).toHaveCount(1);
+});
+
 test("a newly created card automatically lands in the Default deck", async ({ page }) => {
   const word = uniqueWord("decks-spec-default");
 

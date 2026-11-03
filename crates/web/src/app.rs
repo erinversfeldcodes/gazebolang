@@ -11,9 +11,9 @@ use crate::cards::{
     ReviewOrderInput, SearchCardImages, get_card, list_tags, review_queue,
 };
 use crate::decks::{
-    AddCardToDeck, CreateDeck, DeleteDeck, RemoveCardFromDeck, RenameDeck, list_decks,
+    AddCardToDeck, CreateDeck, Deck, DeleteDeck, RemoveCardFromDeck, RenameDeck, list_decks,
 };
-use crate::dictionary::get_word_definition;
+use crate::dictionary::{WordDefinition, get_word_definition};
 use crate::dictionary_ui::{ClickableWord, DictionaryDetailsEditor};
 use crate::media_recorder::RecordButton;
 use crate::wiki::{
@@ -32,7 +32,7 @@ use leptos::prelude::*;
 use leptos_meta::{MetaTags, Stylesheet, Title, provide_meta_context};
 use leptos_router::{
     StaticSegment,
-    components::{A, Redirect, Route, Router, Routes},
+    components::{A, Form, Redirect, Route, Router, Routes},
     hooks::{use_location, use_navigate, use_params_map, use_query_map},
     path,
 };
@@ -52,14 +52,15 @@ fn youtube_embed(url: String) -> impl IntoView {
 /// handlers (`cards_new`/`cards_bulk`/`cards_update`) on a failed
 /// submission, see `error_redirect` there — with the same `"Error: "`
 /// paragraph every `ActionForm`-based error in this file already uses. A
-/// plain, one-time read rather than a reactive signal: these pages are
-/// only ever reached with `?error=` set via a fresh full-page redirect
-/// (never a client-side route change), so there's nothing for it to react
-/// to after mount.
+/// reactive read (every call site embeds this as `{move || form_error_banner()}`):
+/// `leptos_router::Form`'s same-origin redirect handling navigates
+/// client-side rather than hard-reloading, so a `?error=` that lands after
+/// a `Form` submit is a query change on an already-mounted route, not a
+/// fresh mount — a `get_untracked()` read here would never see it.
 fn form_error_banner() -> impl IntoView {
     let query = use_query_map();
     query
-        .get_untracked()
+        .get()
         .get("error")
         .map(|message| view! { <p>"Error: " {message}</p> })
 }
@@ -392,17 +393,22 @@ pub fn App() -> impl IntoView {
                 </Transition>
             </nav>
             <main>
-                // Two deliberately different auth-gating shapes below, not
-                // an accident of implementation order: a page with no
-                // meaningful signed-out use (NewCardPage, BulkAddPage,
-                // ReviewPage, StatsPage, SettingsPage, AccountPage) hard-
-                // redirects to /login via a `<Redirect>` inside its own
-                // Suspend block. A page with a genuine public read-only
-                // view (CardListPage, EditCardPage, DecksPage — browsing
-                // cards/decks is intentionally open to anyone, per the
-                // shared-card-pool model) instead degrades gracefully: it
-                // renders for everyone, and conditions only the
-                // mutating bits on `signed_in.then(...)`.
+                // Three deliberately different auth-gating shapes below,
+                // not an accident of implementation order:
+                //  1. No meaningful signed-out use (NewCardPage,
+                //     BulkAddPage, ReviewPage, StatsPage, SettingsPage,
+                //     AccountPage) hard-redirects to /login via a
+                //     `<Redirect>` inside its own Suspend block.
+                //  2. A genuine public read-only view (EditCardPage,
+                //     DecksPage, WikiListPage, WikiPage — browsing
+                //     cards/decks/wiki pages is intentionally open to
+                //     anyone, per the shared-pool model) instead degrades
+                //     gracefully: it renders for everyone, and conditions
+                //     only the mutating bits on `signed_in.then(...)`.
+                //  3. CardListPage checks nothing at all — its
+                //     `<details>`/"Reveal" is a content-reveal idiom
+                //     (hide the answer, not the page), unrelated to
+                //     sign-in state.
                 <Routes fallback=|| view! { <p>"Page not found."</p> }>
                     <Route path=StaticSegment("") view=CardListPage/>
                     <Route path=StaticSegment("new") view=NewCardPage/>
@@ -687,6 +693,10 @@ fn CardListPage() -> impl IntoView {
 #[component]
 fn NewCardPage() -> impl IntoView {
     let auth = Resource::new(|| (), |()| current_user_name());
+    // Created alongside `auth`, before the Suspend below, so it fetches in
+    // parallel rather than serialized behind auth resolving first — same
+    // discipline `EditCardPage` uses for its own `decks`/`pages` resources.
+    let decks = Resource::new(|| (), |()| list_decks());
     let audio_input: NodeRef<html::Input> = NodeRef::new();
     let video_input: NodeRef<html::Input> = NodeRef::new();
     let chosen_image_url: RwSignal<Option<String>> = RwSignal::new(None);
@@ -694,14 +704,14 @@ fn NewCardPage() -> impl IntoView {
 
     view! {
         <h1>"Add a card"</h1>
-        {form_error_banner()}
+        {move || form_error_banner()}
         <Transition fallback=|| view! { <p>"Loading…"</p> }>
             {move || Suspend::new(async move {
                 if auth.await.ok().flatten().is_none() {
                     return view! { <Redirect path="/login"/> }.into_any();
                 }
                 view! {
-                    <form method="post" action="/cards/new" enctype="multipart/form-data">
+                    <Form method="post" action="/cards/new" enctype="multipart/form-data".to_string()>
                         <label>
                             "Target-language word/phrase"
                             <input
@@ -720,8 +730,42 @@ fn NewCardPage() -> impl IntoView {
                             <input type="checkbox" name="two_way" />
                             "Two-way: also review back → front, scheduled independently"
                         </label>
+                        // Unchecked by default — there's no existing
+                        // membership to reflect for a card that doesn't
+                        // exist yet. Chosen deck ids ride this same
+                        // multipart POST (see the "deck_id" arm in
+                        // main.rs's parse_card_multipart) rather than a
+                        // separate step, since there's no card id to
+                        // dispatch a deck-toggle action against until the
+                        // handler creates one.
+                        <div class="card-section">
+                            <p class="card-section-heading">"Decks"</p>
+                            <Transition fallback=|| view! { <p>"Loading decks…"</p> }>
+                                {move || Suspend::new(async move {
+                                    match decks.await {
+                                        Ok(decks) => decks
+                                            .into_iter()
+                                            .map(|deck| {
+                                                view! {
+                                                    <label>
+                                                        <input
+                                                            type="checkbox"
+                                                            name="deck_id"
+                                                            value=deck.id.to_string()
+                                                        />
+                                                        {deck.name}
+                                                    </label>
+                                                }
+                                            })
+                                            .collect_view()
+                                            .into_any(),
+                                        Err(e) => view! { <p>"Error: " {e.to_string()}</p> }.into_any(),
+                                    }
+                                })}
+                            </Transition>
+                        </div>
                         <button type="submit">"Add"</button>
-                    </form>
+                    </Form>
                     <DictionaryDetailsEditor target_text=target_text_signal.into() />
                 }
                 .into_any()
@@ -798,7 +842,7 @@ fn BulkAddPage() -> impl IntoView {
         <p class="page-intro">
             "Faster than adding one at a time — paste a whole list, check the parsed results, then create them together."
         </p>
-        {form_error_banner()}
+        {move || form_error_banner()}
         <Transition fallback=|| view! { <p>"Loading…"</p> }>
             {move || Suspend::new(async move {
                 if auth.await.ok().flatten().is_none() {
@@ -826,7 +870,7 @@ fn BulkAddPage() -> impl IntoView {
                             }
                         })
                     }}
-                    <form method="post" action="/cards/bulk" enctype="multipart/form-data">
+                    <Form method="post" action="/cards/bulk" enctype="multipart/form-data".to_string()>
                         {move || {
                             drafts
                                 .get()
@@ -872,11 +916,343 @@ fn BulkAddPage() -> impl IntoView {
                             (!drafts.get().is_empty())
                                 .then(|| view! { <button type="submit">"Create all cards"</button> })
                         }}
-                    </form>
+                    </Form>
                 }
                 .into_any()
             })}
         </Transition>
+    }
+}
+
+/// The read-only media + word preview shown above `EditCardPage`'s edit
+/// form — pulled out of its view (pure decomposition, no behavior change),
+/// since the two are only ever rendered together inside one
+/// `.review-card` block.
+#[component]
+fn CardPreviewHeader(
+    image_url: Option<String>,
+    audio_url: Option<String>,
+    video_url: Option<String>,
+    youtube_url: Option<String>,
+    target_text: String,
+    tags: Vec<String>,
+    signed_in: bool,
+) -> impl IntoView {
+    let image_view = image_url.map(|url| view! { <img src=url alt="" /> });
+    let audio_view = audio_url.map(|url| view! { <audio controls src=url></audio> });
+    let video_view = video_url.map(|url| view! { <video controls src=url></video> });
+    let youtube_view = youtube_url.map(youtube_embed);
+    let tags_display = tags.join(", ");
+    let info = view! {
+        <div class="word-display"><ClickableWord text=target_text /></div>
+        {(!tags.is_empty()).then(|| view! { <p>"Tags: " {tags_display}</p> })}
+    };
+    // A signed-in editor sees the word immediately — visual confirmation of
+    // which card this is before the (possibly media-heavy) form below it. A
+    // signed-out visitor instead gets the same reveal-then-show shape as
+    // ReviewPage's forward direction: media is the prompt, the word is
+    // hidden behind "Reveal". Browsing a card to self-test is open to
+    // anyone; it's only *grading* (ReviewPage's Again/Hard/Good/Easy, which
+    // writes to the Anki-derived SRS state) that requires an account —
+    // there's no grading UI here at all.
+    let word_preview = if signed_in {
+        info.into_any()
+    } else {
+        view! {
+            <details>
+                <summary>"Reveal"</summary>
+                {info}
+            </details>
+        }
+        .into_any()
+    };
+    view! {
+        <div class="review-card">
+            {image_view}
+            {audio_view}
+            {video_view}
+            {youtube_view}
+            {word_preview}
+        </div>
+    }
+}
+
+/// Thin wrapper around `DictionaryDetailsEditor` for `EditCardPage` — pulled
+/// out of its view (pure decomposition, no behavior change). The
+/// `get_word_definition` fetch stays in the parent (already sequential on
+/// `detail` there, nothing to run in parallel by moving it here) — this
+/// just takes the already-resolved result and builds the editor's
+/// `*_initial` props from it.
+#[component]
+fn CardDictionarySection(
+    target_text_signal: RwSignal<String>,
+    existing_definition: Option<WordDefinition>,
+) -> impl IntoView {
+    let first_example = existing_definition
+        .as_ref()
+        .and_then(|d| d.examples.first());
+    view! {
+        <DictionaryDetailsEditor
+            target_text=target_text_signal.into()
+            part_of_speech_initial=existing_definition
+                .as_ref()
+                .and_then(|d| d.part_of_speech.clone())
+                .unwrap_or_default()
+            notes_initial=existing_definition
+                .as_ref()
+                .and_then(|d| d.notes.clone())
+                .unwrap_or_default()
+            english_translation_initial=existing_definition
+                .as_ref()
+                .and_then(|d| d.english_translation.clone())
+                .unwrap_or_default()
+            example_target_initial=first_example
+                .map(|e| e.target_sentence.clone())
+                .unwrap_or_default()
+            example_gloss_initial=first_example
+                .and_then(|e| e.gloss_sentence.clone())
+                .unwrap_or_default()
+            linked_words_initial=existing_definition
+                .as_ref()
+                .map(|d| {
+                    d.linked_words
+                        .iter()
+                        .map(|l| l.target_text.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default()
+        />
+    }
+}
+
+/// `EditCardPage`'s multipart save form — pulled out of its view (pure
+/// decomposition, no behavior change beyond what `card_refresh` below
+/// fixes). Owns `chosen_image_url`/`audio_input`/`video_input` itself, the
+/// same way `NewCardPage` already owns its own copies, since nothing
+/// outside this form needs them.
+///
+/// `card_refresh` is `EditCardPage`'s `card` Resource-refetch signal,
+/// wired to `<Form>`'s own `version` prop (bumped on every completed
+/// submit). A plain `<form>` POST used to make this unnecessary — its
+/// hard page reload re-fetched everything from scratch regardless. `<Form>`
+/// instead redirect-follows via a client-side `navigate()`, which does
+/// nothing here: saving redirects back to this same `/cards/{id}` route,
+/// so `card`'s Resource (keyed only on the id, which hasn't changed) would
+/// never refetch and the page would keep showing pre-save data — confirmed
+/// live (a YouTube-link removal visibly failed to clear the embed after
+/// Save, with the DB write itself having actually succeeded).
+#[component]
+fn CardEditForm(
+    id: Uuid,
+    target_text: String,
+    tags: Vec<String>,
+    two_way: bool,
+    has_image: bool,
+    has_audio: bool,
+    has_video: bool,
+    has_youtube: bool,
+    target_text_signal: RwSignal<String>,
+    card_refresh: RwSignal<usize>,
+) -> impl IntoView {
+    let audio_input: NodeRef<html::Input> = NodeRef::new();
+    let video_input: NodeRef<html::Input> = NodeRef::new();
+    let chosen_image_url: RwSignal<Option<String>> = RwSignal::new(None);
+    let action = format!("/cards/{id}");
+    let tags_value = tags.join(", ");
+    view! {
+        <Form
+            method="post"
+            action=action
+            enctype="multipart/form-data".to_string()
+            version=card_refresh
+        >
+            <label>
+                "Target-language word/phrase"
+                <input
+                    type="text"
+                    name="target_text"
+                    value=target_text
+                    on:input=move |ev| target_text_signal.set(event_target_value(&ev))
+                />
+            </label>
+            <label>"Tags (comma separated)" <input type="text" name="tags" value=tags_value /></label>
+            <MediaAttachmentFields
+                editing=true
+                chosen_image_url=chosen_image_url
+                audio_input=audio_input
+                video_input=video_input
+                has_image=has_image
+                has_audio=has_audio
+                has_video=has_video
+                has_youtube=has_youtube
+            />
+            <label>
+                <input type="checkbox" name="two_way" checked=two_way />
+                "Two-way: also review back → front, scheduled independently"
+            </label>
+            <button type="submit">"Save"</button>
+        </Form>
+    }
+}
+
+/// The "Decks" section of `EditCardPage` — pulled out of its view (pure
+/// decomposition, no behavior change). `decks` is created in the parent
+/// and passed in rather than fetched here: `EditCardPage` creates it before
+/// the per-card `Suspend` so it loads in parallel with `card`/`auth` —
+/// fetching it here instead would serialize it behind `card` resolving
+/// first.
+#[component]
+fn DeckAssignmentSection(
+    card_id: Uuid,
+    deck_ids: Vec<Uuid>,
+    signed_in: bool,
+    decks: Resource<Result<Vec<Deck>, ServerFnError>>,
+    toggle_deck: ServerAction<AddCardToDeck>,
+    untoggle_deck: ServerAction<RemoveCardFromDeck>,
+) -> impl IntoView {
+    view! {
+        <div class="card-section">
+            <p class="card-section-heading">"Decks"</p>
+            <Transition fallback=|| view! { <p>"Loading decks…"</p> }>
+            {move || {
+                let deck_ids = deck_ids.clone();
+                Suspend::new(async move {
+                    match decks.await {
+                        Ok(decks) if signed_in => decks
+                            .into_iter()
+                            .map(|deck| {
+                                let in_deck = deck_ids.contains(&deck.id);
+                                let deck_id = deck.id;
+                                view! {
+                                    <label>
+                                        <input
+                                            type="checkbox"
+                                            checked=in_deck
+                                            on:change=move |ev| {
+                                                if event_target_checked(&ev) {
+                                                    toggle_deck.dispatch(AddCardToDeck { deck_id, card_id });
+                                                } else {
+                                                    untoggle_deck.dispatch(RemoveCardFromDeck { deck_id, card_id });
+                                                }
+                                            }
+                                        />
+                                        {deck.name}
+                                    </label>
+                                }
+                            })
+                            .collect_view()
+                            .into_any(),
+                        Ok(decks) => {
+                            let names: Vec<_> = decks
+                                .into_iter()
+                                .filter(|d| deck_ids.contains(&d.id))
+                                .map(|d| d.name)
+                                .collect();
+                            if names.is_empty() {
+                                view! { <p>"Not in any deck."</p> }.into_any()
+                            } else {
+                                view! { <p>{names.join(", ")}</p> }.into_any()
+                            }
+                        }
+                        Err(e) => view! { <p>"Error: " {e.to_string()}</p> }.into_any(),
+                    }
+                })
+            }}
+            </Transition>
+        </div>
+    }
+}
+
+/// The "Grammar pages" section of `EditCardPage` — pulled out of its view
+/// (pure decomposition, no behavior change). Same parallel-fetch reasoning
+/// as `DeckAssignmentSection`: `pages` is created in the parent and passed
+/// in, not fetched here.
+#[component]
+fn PageAssignmentSection(
+    card_id: Uuid,
+    page_ids: Vec<Uuid>,
+    signed_in: bool,
+    pages: Resource<Result<Vec<PageTreeNode>, ServerFnError>>,
+    toggle_page: ServerAction<AddPageToCard>,
+    untoggle_page: ServerAction<RemovePageFromCard>,
+) -> impl IntoView {
+    view! {
+        <div class="card-section">
+            <p class="card-section-heading">"Grammar pages"</p>
+            <Transition fallback=|| view! { <p>"Loading pages…"</p> }>
+            {move || {
+                let page_ids = page_ids.clone();
+                Suspend::new(async move {
+                    match pages.await {
+                        Ok(pages) if signed_in => {
+                            let mut labeled: Vec<_> = pages
+                                .iter()
+                                .map(|p| (p.id, page_path_label(&pages, p.id)))
+                                .collect();
+                            labeled.sort_by(|a, b| a.1.cmp(&b.1));
+                            labeled
+                                .into_iter()
+                                .map(|(page_id, label)| {
+                                    let on_page = page_ids.contains(&page_id);
+                                    view! {
+                                        <label>
+                                            <input
+                                                type="checkbox"
+                                                checked=on_page
+                                                on:change=move |ev| {
+                                                    if event_target_checked(&ev) {
+                                                        toggle_page.dispatch(AddPageToCard { card_id, page_id });
+                                                    } else {
+                                                        untoggle_page.dispatch(RemovePageFromCard { card_id, page_id });
+                                                    }
+                                                }
+                                            />
+                                            {label}
+                                        </label>
+                                    }
+                                })
+                                .collect_view()
+                                .into_any()
+                        }
+                        Ok(pages) => {
+                            let labels: Vec<_> = pages
+                                .iter()
+                                .filter(|p| page_ids.contains(&p.id))
+                                .map(|p| page_path_label(&pages, p.id))
+                                .collect();
+                            if labels.is_empty() {
+                                view! { <p>"Not linked to any grammar page."</p> }.into_any()
+                            } else {
+                                view! { <p>{labels.join(", ")}</p> }.into_any()
+                            }
+                        }
+                        Err(e) => view! { <p>"Error: " {e.to_string()}</p> }.into_any(),
+                    }
+                })
+            }}
+            </Transition>
+        </div>
+    }
+}
+
+/// The delete button + its own dispatch error — pulled out of
+/// `EditCardPage`'s view (pure decomposition, no behavior change). The
+/// `delete` action's navigate-on-success `Effect` stays in the parent,
+/// exactly as today — it doesn't live next to this form there either.
+#[component]
+fn DeleteCardSection(card_id: Uuid, delete: ServerAction<DeleteCard>) -> impl IntoView {
+    let armed = RwSignal::new(false);
+    view! {
+        <ActionForm action=delete>
+            <input type="hidden" name="card_id" value=card_id.to_string() />
+            {confirm_button("Delete card", armed)}
+        </ActionForm>
+        {move || {
+            delete.value().get().and_then(Result::err).map(|e| {
+                view! { <p>"Error: " {e.to_string()}</p> }
+            })
+        }}
     }
 }
 
@@ -891,12 +1267,19 @@ fn EditCardPage() -> impl IntoView {
             .and_then(|id| Uuid::parse_str(&id).ok())
     };
 
-    let card = Resource::new(card_id, |id| async move {
-        match id {
-            Some(id) => get_card(id).await,
-            None => Ok(None),
-        }
-    });
+    // Bumped by `CardEditForm`'s `<Form version=card_refresh>` on every
+    // completed save — see that component's doc comment for why this is
+    // needed now that saving no longer hard-reloads the page.
+    let card_refresh = RwSignal::new(0usize);
+    let card = Resource::new(
+        move || (card_id(), card_refresh.get()),
+        |(id, _)| async move {
+            match id {
+                Some(id) => get_card(id).await,
+                None => Ok(None),
+            }
+        },
+    );
     let decks = Resource::new(|| (), |()| list_decks());
     let pages = Resource::new(|| (), |()| list_page_tree());
 
@@ -905,9 +1288,6 @@ fn EditCardPage() -> impl IntoView {
     let untoggle_deck = ServerAction::<RemoveCardFromDeck>::new();
     let toggle_page = ServerAction::<AddPageToCard>::new();
     let untoggle_page = ServerAction::<RemovePageFromCard>::new();
-    let audio_input: NodeRef<html::Input> = NodeRef::new();
-    let video_input: NodeRef<html::Input> = NodeRef::new();
-    let chosen_image_url: RwSignal<Option<String>> = RwSignal::new(None);
 
     let navigate = use_navigate();
     Effect::new(move |_| {
@@ -921,7 +1301,7 @@ fn EditCardPage() -> impl IntoView {
 
     view! {
         <h1>"Card"</h1>
-        {form_error_banner()}
+        {move || form_error_banner()}
         <Transition fallback=|| view! { <p>"Loading…"</p> }>
             {move || Suspend::new(async move {
                 let Some(id) = card_id() else {
@@ -932,53 +1312,9 @@ fn EditCardPage() -> impl IntoView {
                     Ok(None) => view! { <p>"Card not found."</p> }.into_any(),
                     Err(e) => view! { <p>"Error: " {e.to_string()}</p> }.into_any(),
                     Ok(Some(detail)) => {
-                        let action = format!("/cards/{id}");
-                        let image_view = detail
-                            .image_url
-                            .clone()
-                            .map(|url| view! { <img src=url alt="" /> });
-                        let audio_view = detail
-                            .audio_url
-                            .clone()
-                            .map(|url| view! { <audio controls src=url></audio> });
-                        let video_view = detail
-                            .video_url
-                            .clone()
-                            .map(|url| view! { <video controls src=url></video> });
-                        let youtube_view = detail.youtube_url.clone().map(youtube_embed);
                         let deck_ids = detail.deck_ids.clone();
                         let page_ids = detail.page_ids.clone();
 
-                        // A signed-in editor sees the word immediately — visual
-                        // confirmation of which card this is before the
-                        // (possibly media-heavy) form below it. A signed-out
-                        // visitor instead gets the same reveal-then-show shape
-                        // as ReviewPage's forward direction: media is the
-                        // prompt, the word is hidden behind "Reveal". Browsing
-                        // a card to self-test is open to anyone; it's only
-                        // *grading* (ReviewPage's Again/Hard/Good/Easy, which
-                        // writes to the Anki-derived SRS state) that requires
-                        // an account — there's no grading UI here at all.
-                        let word_preview = {
-                            let target_text = detail.target_text.clone();
-                            let tags_display = detail.tags.join(", ");
-                            let info = view! {
-                                <div class="word-display"><ClickableWord text=target_text /></div>
-                                {(!detail.tags.is_empty())
-                                    .then(|| view! { <p>"Tags: " {tags_display}</p> })}
-                            };
-                            if signed_in {
-                                info.into_any()
-                            } else {
-                                view! {
-                                    <details>
-                                        <summary>"Reveal"</summary>
-                                        {info}
-                                    </details>
-                                }
-                                .into_any()
-                            }
-                        };
                         // Tracks the input's *current* value reactively, so
                         // the "Dictionary details" editor below always saves
                         // against whatever's actually typed — including a
@@ -989,216 +1325,67 @@ fn EditCardPage() -> impl IntoView {
                             .await
                             .ok()
                             .flatten();
-                        let dictionary_editor = signed_in.then(|| {
-                            let first_example = existing_definition
-                                .as_ref()
-                                .and_then(|d| d.examples.first());
-                            view! {
-                                <DictionaryDetailsEditor
-                                    target_text=target_text_signal.into()
-                                    part_of_speech_initial=existing_definition
-                                        .as_ref()
-                                        .and_then(|d| d.part_of_speech.clone())
-                                        .unwrap_or_default()
-                                    notes_initial=existing_definition
-                                        .as_ref()
-                                        .and_then(|d| d.notes.clone())
-                                        .unwrap_or_default()
-                                    english_translation_initial=existing_definition
-                                        .as_ref()
-                                        .and_then(|d| d.english_translation.clone())
-                                        .unwrap_or_default()
-                                    example_target_initial=first_example
-                                        .map(|e| e.target_sentence.clone())
-                                        .unwrap_or_default()
-                                    example_gloss_initial=first_example
-                                        .and_then(|e| e.gloss_sentence.clone())
-                                        .unwrap_or_default()
-                                    linked_words_initial=existing_definition
-                                        .as_ref()
-                                        .map(|d| {
-                                            d.linked_words
-                                                .iter()
-                                                .map(|l| l.target_text.clone())
-                                                .collect::<Vec<_>>()
-                                                .join(", ")
-                                        })
-                                        .unwrap_or_default()
-                                />
-                            }
-                        });
-                        let edit_form = signed_in.then(|| {
-                            let tags_value = detail.tags.join(", ");
-                            view! {
-                                <form method="post" action=action enctype="multipart/form-data">
-                                    <label>
-                                        "Target-language word/phrase"
-                                        <input
-                                            type="text"
-                                            name="target_text"
-                                            value=detail.target_text.clone()
-                                            on:input=move |ev| target_text_signal.set(event_target_value(&ev))
-                                        />
-                                    </label>
-                                    <label>"Tags (comma separated)" <input type="text" name="tags" value=tags_value /></label>
-                                    <MediaAttachmentFields
-                                        editing=true
-                                        chosen_image_url=chosen_image_url
-                                        audio_input=audio_input
-                                        video_input=video_input
-                                        has_image=detail.image_url.is_some()
-                                        has_audio=detail.audio_url.is_some()
-                                        has_video=detail.video_url.is_some()
-                                        has_youtube=detail.youtube_url.is_some()
-                                    />
-                                    <label>
-                                        <input type="checkbox" name="two_way" checked=detail.two_way />
-                                        "Two-way: also review back → front, scheduled independently"
-                                    </label>
-                                    <button type="submit">"Save"</button>
-                                </form>
-                            }
-                        });
-                        let deck_section = {
-                            let deck_ids = deck_ids.clone();
-                            view! {
-                                <div class="card-section">
-                                    <p class="card-section-heading">"Decks"</p>
-                                    <Transition fallback=|| view! { <p>"Loading decks…"</p> }>
-                                    {move || {
-                                        let deck_ids = deck_ids.clone();
-                                        Suspend::new(async move {
-                                            match decks.await {
-                                                Ok(decks) if signed_in => decks
-                                                    .into_iter()
-                                                    .map(|deck| {
-                                                        let in_deck = deck_ids.contains(&deck.id);
-                                                        let deck_id = deck.id;
-                                                        view! {
-                                                            <label>
-                                                                <input
-                                                                    type="checkbox"
-                                                                    checked=in_deck
-                                                                    on:change=move |ev| {
-                                                                        if event_target_checked(&ev) {
-                                                                            toggle_deck.dispatch(AddCardToDeck { deck_id, card_id: id });
-                                                                        } else {
-                                                                            untoggle_deck.dispatch(RemoveCardFromDeck { deck_id, card_id: id });
-                                                                        }
-                                                                    }
-                                                                />
-                                                                {deck.name}
-                                                            </label>
-                                                        }
-                                                    })
-                                                    .collect_view()
-                                                    .into_any(),
-                                                Ok(decks) => {
-                                                    let names: Vec<_> = decks
-                                                        .into_iter()
-                                                        .filter(|d| deck_ids.contains(&d.id))
-                                                        .map(|d| d.name)
-                                                        .collect();
-                                                    if names.is_empty() {
-                                                        view! { <p>"Not in any deck."</p> }.into_any()
-                                                    } else {
-                                                        view! { <p>{names.join(", ")}</p> }.into_any()
-                                                    }
-                                                }
-                                                Err(e) => view! { <p>"Error: " {e.to_string()}</p> }.into_any(),
-                                            }
-                                        })
-                                    }}
-                                    </Transition>
-                                </div>
-                            }
+
+                        let preview = view! {
+                            <CardPreviewHeader
+                                image_url=detail.image_url.clone()
+                                audio_url=detail.audio_url.clone()
+                                video_url=detail.video_url.clone()
+                                youtube_url=detail.youtube_url.clone()
+                                target_text=detail.target_text.clone()
+                                tags=detail.tags.clone()
+                                signed_in=signed_in
+                            />
                         };
-                        let page_section = {
-                            let page_ids = page_ids.clone();
-                            view! {
-                                <div class="card-section">
-                                    <p class="card-section-heading">"Grammar pages"</p>
-                                    <Transition fallback=|| view! { <p>"Loading pages…"</p> }>
-                                    {move || {
-                                        let page_ids = page_ids.clone();
-                                        Suspend::new(async move {
-                                            match pages.await {
-                                                Ok(pages) if signed_in => {
-                                                    let mut labeled: Vec<_> = pages
-                                                        .iter()
-                                                        .map(|p| (p.id, page_path_label(&pages, p.id)))
-                                                        .collect();
-                                                    labeled.sort_by(|a, b| a.1.cmp(&b.1));
-                                                    labeled
-                                                        .into_iter()
-                                                        .map(|(page_id, label)| {
-                                                            let on_page = page_ids.contains(&page_id);
-                                                            view! {
-                                                                <label>
-                                                                    <input
-                                                                        type="checkbox"
-                                                                        checked=on_page
-                                                                        on:change=move |ev| {
-                                                                            if event_target_checked(&ev) {
-                                                                                toggle_page.dispatch(AddPageToCard { page_id, card_id: id });
-                                                                            } else {
-                                                                                untoggle_page.dispatch(RemovePageFromCard { page_id, card_id: id });
-                                                                            }
-                                                                        }
-                                                                    />
-                                                                    {label}
-                                                                </label>
-                                                            }
-                                                        })
-                                                        .collect_view()
-                                                        .into_any()
-                                                }
-                                                Ok(pages) => {
-                                                    let labels: Vec<_> = pages
-                                                        .iter()
-                                                        .filter(|p| page_ids.contains(&p.id))
-                                                        .map(|p| page_path_label(&pages, p.id))
-                                                        .collect();
-                                                    if labels.is_empty() {
-                                                        view! { <p>"Not linked to any grammar page."</p> }.into_any()
-                                                    } else {
-                                                        view! { <p>{labels.join(", ")}</p> }.into_any()
-                                                    }
-                                                }
-                                                Err(e) => view! { <p>"Error: " {e.to_string()}</p> }.into_any(),
-                                            }
-                                        })
-                                    }}
-                                    </Transition>
-                                </div>
-                            }
+                        let dictionary_editor = signed_in.then(|| view! {
+                            <CardDictionarySection
+                                target_text_signal=target_text_signal
+                                existing_definition=existing_definition
+                            />
+                        });
+                        let edit_form = signed_in.then(|| view! {
+                            <CardEditForm
+                                id=id
+                                target_text=detail.target_text.clone()
+                                tags=detail.tags.clone()
+                                two_way=detail.two_way
+                                has_image=detail.image_url.is_some()
+                                has_audio=detail.audio_url.is_some()
+                                has_video=detail.video_url.is_some()
+                                has_youtube=detail.youtube_url.is_some()
+                                target_text_signal=target_text_signal
+                                card_refresh=card_refresh
+                            />
+                        });
+                        let deck_section = view! {
+                            <DeckAssignmentSection
+                                card_id=id
+                                deck_ids=deck_ids
+                                signed_in=signed_in
+                                decks=decks
+                                toggle_deck=toggle_deck
+                                untoggle_deck=untoggle_deck
+                            />
                         };
-                        let delete_form = signed_in.then(|| {
-                            let armed = RwSignal::new(false);
-                            view! {
-                                <ActionForm action=delete>
-                                    <input type="hidden" name="card_id" value=id.to_string() />
-                                    {confirm_button("Delete card", armed)}
-                                </ActionForm>
-                                {move || {
-                                    delete.value().get().and_then(Result::err).map(|e| {
-                                        view! { <p>"Error: " {e.to_string()}</p> }
-                                    })
-                                }}
-                            }
+                        let page_section = view! {
+                            <PageAssignmentSection
+                                card_id=id
+                                page_ids=page_ids
+                                signed_in=signed_in
+                                pages=pages
+                                toggle_page=toggle_page
+                                untoggle_page=untoggle_page
+                            />
+                        };
+                        let delete_form = signed_in.then(|| view! {
+                            <DeleteCardSection card_id=id delete=delete />
                         });
                         let sign_in_prompt = (!signed_in).then(|| {
                             view! { <p><A href="/login">"Sign in"</A>" to edit this card."</p> }
                         });
 
                         view! {
-                            <div class="review-card">
-                                {image_view}
-                                {audio_view}
-                                {video_view}
-                                {youtube_view}
-                                {word_preview}
-                            </div>
+                            {preview}
                             {edit_form}
                             {dictionary_editor}
                             {deck_section}
