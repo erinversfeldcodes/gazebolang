@@ -399,8 +399,15 @@ impl VisionEngine {
             .model
             .chat_template(None)
             .map_err(|e| format!("chat_template failed: {e:?}"))?;
-        let mut full_prompt = prompt.to_string();
-        full_prompt.push_str(mtmd_default_marker());
+        // llama.cpp's own reference mtmd-cli tool puts the marker BEFORE
+        // the text ("most models require the marker before each image"),
+        // not after — this previously had it backwards, which plausibly
+        // explains a real run only reading part of a real dictionary photo
+        // (the entire right column of a two-column page went missing)
+        // despite two unrelated fixes (image token budget, prompt wording)
+        // having no effect on that same symptom.
+        let mut full_prompt = mtmd_default_marker().to_string();
+        full_prompt.push_str(prompt);
         let msg =
             LlamaChatMessage::new("user".to_string(), full_prompt).map_err(|e| e.to_string())?;
         let formatted = self
