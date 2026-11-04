@@ -1,0 +1,8 @@
+{
+  "name": "gazebo-scripts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test import-dictionary.test.mjs"
+  }
+}

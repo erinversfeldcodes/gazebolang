@@ -9,6 +9,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  scripts-test:
+    name: scripts unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Only the pure logic (JSON extraction, the mechanical card filters)
+      # — no Ollama, no live app server, so this job needs neither Rust
+      # nor Postgres and runs independently of everything else here. The
+      # parts of scripts/import-dictionary.mjs that DO need a live server
+      # (login, card creation) are covered instead by
+      # e2e/tests/import-dictionary.spec.ts, which runs as part of the
+      # `e2e` job below since it's just another spec in e2e/tests/.
+      - run: node --test scripts/import-dictionary.test.mjs
+
   check:
     name: fmt + clippy
     runs-on: ubuntu-latest
