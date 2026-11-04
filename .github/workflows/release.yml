@@ -1,0 +1,35 @@
+name: Release importer
+
+# Scoped to macOS arm64 only — this tool's realistic audience is friends
+# running it on their own Mac (see the project's own scope), not a
+# general-purpose multi-platform CLI. Trivially extendable with another
+# `runs-on`/build leg later if that stops being true.
+on:
+  push:
+    tags: ["importer-v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: build + publish (macOS arm64)
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p importer
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf dist/gazebo-importer-macos-arm64.tar.gz -C target/release importer
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/gazebo-importer-macos-arm64.tar.gz
+          # Model weights are never bundled here — importer downloads the
+          # GGUF files it needs into a local cache on first run.
+          generate_release_notes: true

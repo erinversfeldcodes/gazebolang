@@ -22,3 +22,4 @@ brew "docker"         # Docker CLI
 brew "docker-compose" # `docker compose` — local Postgres, see docker-compose.yml
 brew "docker-buildx"  # `docker build` — builds the Dockerfile
 brew "node"           # needed for `npx neon@latest` (Neon project/branch setup)
+brew "cmake"          # builds llama.cpp, vendored by crates/importer's llama-cpp-2 dependency

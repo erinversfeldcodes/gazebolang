@@ -6,23 +6,26 @@ import path from "node:path";
 import { Client } from "pg";
 import { RESEND_ALLOWED_EMAIL, TEST_PASSWORD, uniqueWord } from "./helpers";
 
-// Exercises scripts/import-dictionary.mjs's `create` stage end to end
-// against this job's real running app + Postgres — the one part of that
-// script actually feasible to test in CI. `segment`/`decompose` need
-// Ollama plus real local vision/reasoning models (6-20GB each), which CI
-// has neither the GPU/RAM budget nor the minutes for; the pure logic
-// those two stages share with `create` (JSON extraction, the mechanical
-// card filters) is unit-tested directly instead, with no server and no
-// Ollama, in scripts/import-dictionary.test.mjs (run via `node --test`).
+// Exercises crates/importer's `create` stage end to end against this job's
+// real running app + Postgres — the one part of that tool actually
+// feasible to test in CI. `segment`/`decompose` need the embedded
+// inference engine plus real local vision/reasoning models (multi-GB
+// each), which CI has neither the GPU/RAM budget nor the minutes for; the
+// pure logic those two stages share with `create` (JSON extraction, the
+// mechanical card filters) is unit-tested directly instead, with no
+// server and no model, as colocated `#[cfg(test)]` tests inside
+// crates/importer's own modules (run via `cargo nextest`, same as every
+// other crate in this workspace).
 //
-// Deliberately runs the script as a real child process via plain `node`,
-// not by importing its functions — that's the same way a downloaded copy
-// of the script is actually invoked, so this also catches anything an
-// import-level unit test couldn't: wrong CLI arg handling, the real HTTP
-// request/cookie shape, login actually succeeding against a live server.
+// Deliberately runs the compiled binary as a real child process, not by
+// calling its Rust functions directly — that's the same way a downloaded
+// copy of the binary is actually invoked, so this also catches anything a
+// unit test couldn't: wrong CLI arg handling, the real HTTP request/cookie
+// shape, login actually succeeding against a live server.
 //
 // No `page` fixture is used (and so no browser is launched for this
 // test) — this is testing an HTTP+CLI tool, not a page.
+const IMPORTER_BIN = path.join(__dirname, "..", "..", "target", "debug", "importer");
 test("create stage logs in, creates the card, and saves its dictionary details", async () => {
   const targetText = uniqueWord("import-dictionary-it");
   const englishWord = `imported word ${Date.now()}`;
@@ -44,19 +47,15 @@ test("create stage logs in, creates the card, and saves its dictionary details",
     ]),
   );
 
-  execFileSync(
-    "node",
-    [path.join(__dirname, "..", "..", "scripts", "import-dictionary.mjs"), "create", cardsFile],
-    {
-      env: {
-        ...process.env,
-        AUTH_EMAIL: RESEND_ALLOWED_EMAIL,
-        AUTH_PASSWORD: TEST_PASSWORD,
-        BASE_URL: process.env.BASE_URL ?? "http://127.0.0.1:3000",
-      },
-      stdio: "pipe",
+  execFileSync(IMPORTER_BIN, ["create", cardsFile], {
+    env: {
+      ...process.env,
+      AUTH_EMAIL: RESEND_ALLOWED_EMAIL,
+      AUTH_PASSWORD: TEST_PASSWORD,
+      BASE_URL: process.env.BASE_URL ?? "http://127.0.0.1:3000",
     },
-  );
+    stdio: "pipe",
+  });
 
   const client = new Client({ connectionString: process.env.DATABASE_URL });
   await client.connect();
@@ -89,18 +88,14 @@ test("create stage fails clearly when the login credentials are wrong", async ()
   writeFileSync(cardsFile, JSON.stringify([{ english: "x", target_text: "y" }]));
 
   expect(() =>
-    execFileSync(
-      "node",
-      [path.join(__dirname, "..", "..", "scripts", "import-dictionary.mjs"), "create", cardsFile],
-      {
-        env: {
-          ...process.env,
-          AUTH_EMAIL: RESEND_ALLOWED_EMAIL,
-          AUTH_PASSWORD: "definitely-the-wrong-password",
-          BASE_URL: process.env.BASE_URL ?? "http://127.0.0.1:3000",
-        },
-        stdio: "pipe",
+    execFileSync(IMPORTER_BIN, ["create", cardsFile], {
+      env: {
+        ...process.env,
+        AUTH_EMAIL: RESEND_ALLOWED_EMAIL,
+        AUTH_PASSWORD: "definitely-the-wrong-password",
+        BASE_URL: process.env.BASE_URL ?? "http://127.0.0.1:3000",
       },
-    ),
+      stdio: "pipe",
+    }),
   ).toThrow(/login failed/);
 });
