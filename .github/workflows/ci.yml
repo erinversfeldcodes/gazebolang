@@ -182,6 +182,27 @@ jobs:
       # directly — that test only exercises the `create` stage, which
       # needs no model/GPU, so a plain debug build is enough.
       - run: cargo build -p importer
+      # importer's app_client.rs hand-mirrors leptos's server-fn wire
+      # paths as hardcoded constants (see that file's own comment on
+      # why) — these are generated, not written by hand, and nothing
+      # stops them drifting from what a real build actually produces.
+      # Catch that here, with a clear fix-it message, rather than let
+      # it surface downstream as a cryptic 404 in the e2e run below.
+      - name: Verify importer's hardcoded server-fn paths match this build
+        run: |
+          set -euo pipefail
+          actual=$(strings target/site/pkg/web.wasm | grep -o '/api/[a-zA-Z_]*[0-9]\{10,\}' | sort -u)
+          expected=$(grep -oE '"/api/[a-zA-Z_]*[0-9]+"' crates/importer/src/app_client.rs | tr -d '"' | sort -u)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::importer's hardcoded server-fn paths in app_client.rs no longer match this build's real wasm output."
+            echo "Hardcoded in crates/importer/src/app_client.rs:"
+            echo "$expected"
+            echo "Actually produced by this build (target/site/pkg/web.wasm):"
+            echo "$actual"
+            echo "Update LOG_IN_PATH / SAVE_WORD_DEFINITION_PATH in crates/importer/src/app_client.rs to the values above."
+            exit 1
+          fi
+          echo "importer's hardcoded server-fn paths match this build."
       - name: Start the app in the background
         # Redirected to a file so the server's own logs (RUST_LOG above)
         # are actually retrievable afterwards — see the artifact upload
