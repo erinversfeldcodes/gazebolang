@@ -283,14 +283,15 @@ fn append_after_overlap(accumulated: &mut Vec<Entry>, new_entries: Vec<Entry>) {
 }
 
 /// How many of a page's own entries, starting at the match point, get
-/// replaced by the column-boundary crop's own reading of that same
-/// span — a fixed, small window rather than something fancier. The one
-/// real failure this guards against produced exactly two corrupted
-/// entries in a row (an incomplete entry immediately followed by a
-/// bogus one invented for its own continuation); a bounded window is
-/// simpler and more predictable than trying to detect exactly where
-/// the corruption ends.
-const COLUMN_FIX_REPLACE_WINDOW: usize = 2;
+/// replaced *at minimum* by the column-boundary crop's own reading of
+/// that same span, regardless of whether they individually match
+/// anything in the crop's own result — a small unconditional floor,
+/// not a ceiling. Confirmed necessary in a real run: a truncated entry
+/// immediately followed by a bogus one invented for its own
+/// continuation (which the crop correctly merged away and so never
+/// relabels on its own) both need removing, even though the bogus one
+/// has nothing in the crop's result to match against.
+const COLUMN_FIX_MIN_REPLACE_WINDOW: usize = 2;
 
 /// Corrects `page_entries` using `boundary_entries` — the result of
 /// independently re-reading a small crop of just the page's own column
@@ -299,9 +300,19 @@ const COLUMN_FIX_REPLACE_WINDOW: usize = 2;
 /// the page's own single read already covers the whole page in order,
 /// so the crop's job isn't to supply new content but to correct
 /// whatever the page's own read got wrong right at the column break.
-/// Falls back to the same conservative appending `append_after_overlap`
-/// uses when the page's own read doesn't have a matching headword to
-/// correct at all — better a stray duplicate than lost content.
+///
+/// The replaced span always covers at least `COLUMN_FIX_MIN_REPLACE_WINDOW`
+/// entries, but extends further to cover every one of the page's own
+/// entries (even non-contiguous ones, skipping over a stray bogus entry
+/// in between) that the crop's result also independently found —
+/// confirmed necessary in a real run: a crop that legitimately read
+/// seven overlapping entries, not just two, left five stale duplicates
+/// behind when only the first two got replaced. That search is bounded
+/// to a modest multiple of the crop's own result size specifically so
+/// it can't run away and match a headword's *later*, unrelated
+/// recurrence — dictionaries do sometimes repeat a headword for a
+/// distinct sense — which would incorrectly delete real, unrelated
+/// entries in between.
 fn apply_column_boundary_fix(page_entries: Vec<Entry>, boundary_entries: Vec<Entry>) -> Vec<Entry> {
     let Some(first) = boundary_entries.first() else {
         return page_entries;
@@ -319,7 +330,19 @@ fn apply_column_boundary_fix(page_entries: Vec<Entry>, boundary_entries: Vec<Ent
         // rather than pollute it with that.
         return page_entries;
     };
-    let end_idx = (start_idx + COLUMN_FIX_REPLACE_WINDOW).min(page_entries.len());
+    let boundary_headwords: std::collections::HashSet<String> = boundary_entries
+        .iter()
+        .map(|e| e.headword.to_lowercase())
+        .collect();
+    let search_limit = (start_idx + boundary_entries.len() + COLUMN_FIX_MIN_REPLACE_WINDOW)
+        .min(page_entries.len());
+    let matched_end = page_entries[start_idx..search_limit]
+        .iter()
+        .rposition(|e| boundary_headwords.contains(&e.headword.to_lowercase()))
+        .map_or(start_idx, |rel_pos| start_idx + rel_pos + 1);
+    let end_idx = (start_idx + COLUMN_FIX_MIN_REPLACE_WINDOW)
+        .max(matched_end)
+        .min(page_entries.len());
     let mut result = page_entries;
     result.splice(start_idx..end_idx, boundary_entries);
     result
@@ -664,6 +687,60 @@ mod tests {
             fixed[1].raw_entry,
             "(unreasonable) -ngafanele-kanga; (foolish, ridiculous) -nobudenge;"
         );
+    }
+
+    #[test]
+    fn column_boundary_fix_extends_past_the_minimum_window_to_cover_everything_the_crop_also_found()
+    {
+        // Real run: a column-break crop legitimately read seven
+        // overlapping entries, not just two, while the page's own read
+        // had a bogus entry sandwiched in the middle of that same span.
+        // A later, unrelated recurrence of "aboard" (dictionaries do
+        // repeat a headword for a distinct sense) must survive
+        // untouched, not get swept up by an overeager match search.
+        let page_entries = vec![
+            entry("abdomen", "..."),
+            entry("abduct", "..."),
+            entry("aberration", "..."),
+            entry("abet", "..."),
+            entry("(encourage vice, crime)", "garbage"),
+            entry("abeyance", "..."),
+            entry("abhor", "..."),
+            entry("abide", "..."),
+            entry("abject", "real, unrelated"),
+            entry("abjure", "real, unrelated"),
+            entry("aboard", "later distinct sense"),
+        ];
+        let boundary_entries = vec![
+            entry("abduct", "..."),
+            entry("aberration", "..."),
+            entry("abet", "..."),
+            entry("aboard", "correct, early sense"),
+            entry("abeyance", "..."),
+            entry("abhor", "..."),
+            entry("abide", "..."),
+        ];
+        let fixed = apply_column_boundary_fix(page_entries, boundary_entries);
+        assert_eq!(
+            fixed.iter().map(|e| &e.headword).collect::<Vec<_>>(),
+            [
+                "abdomen",
+                "abduct",
+                "aberration",
+                "abet",
+                "aboard",
+                "abeyance",
+                "abhor",
+                "abide",
+                "abject",
+                "abjure",
+                "aboard",
+            ]
+        );
+        assert_eq!(fixed[4].raw_entry, "correct, early sense");
+        assert_eq!(fixed[8].raw_entry, "real, unrelated");
+        assert_eq!(fixed[9].raw_entry, "real, unrelated");
+        assert_eq!(fixed[10].raw_entry, "later distinct sense");
     }
 
     #[test]
