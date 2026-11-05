@@ -1,21 +1,16 @@
-//! Hand-mirrors the two Leptos `#[server]` fns' wire contracts
-//! (`crates/web/src/account.rs`'s `log_in`, `crates/web/src/dictionary.rs`'s
-//! `save_word_definition`) plus the plain `/cards/bulk` form-POST route —
-//! there's no non-wasm-gated, framework-free location these live in today
-//! that a native binary could import directly (see the plan doc), so this
-//! talks to the deployed app exactly the same way a signed-in browser's
-//! `<form>` submission or the leptos server-fn client would.
+//! Talks to the deployed app over plain HTTP. `log_in` and
+//! `save_word_definition` hit dedicated, hand-written routes
+//! (`crates/web/src/main.rs`'s `importer_login`/
+//! `importer_save_word_definition`) built specifically for this binary,
+//! rather than the browser's own Leptos `#[server]` fns — those
+//! auto-generate their wire path at build time, and that path isn't
+//! even stable across build platforms for the same source (confirmed
+//! in a real run: macOS and Linux builds produced different hashes),
+//! making them unusable as a fixed target here. `create_cards` instead
+//! posts straight to `/cards/bulk`, the same plain route the app's own
+//! bulk-add form already submits to.
 use crate::decompose::Card;
 use reqwest::blocking::{Client, multipart};
-
-// Leptos `#[server]` fns' real endpoint paths, baked into the compiled WASM
-// as stable constants — there's no documented stable path for these, so
-// each is re-derivable via `strings` on the compiled wasm if the
-// function's containing source file is ever renamed/moved (what the
-// numeric suffix is actually keyed on, not the function name itself):
-// `strings target/site/pkg/web.wasm | grep -o '/api/[a-zA-Z_]*[0-9]\{10,\}'`
-const LOG_IN_PATH: &str = "/api/log_in6363758671868516822";
-const SAVE_WORD_DEFINITION_PATH: &str = "/api/save_word_definition6677106481201695198";
 
 pub struct AppClient {
     base_url: String,
@@ -36,18 +31,17 @@ impl AppClient {
         })
     }
 
-    /// Same request shape as `save_word_definition` — a bare `#[server]`
-    /// fn's default encoding is a url-encoded POST. A successful call
-    /// sets a `session=<token>` cookie; a failure (wrong password, no
-    /// such user — deliberately indistinguishable, see `auth.rs`) comes
-    /// back as a non-2xx status with "invalid email or password" in the
-    /// body. Logs in fresh every run rather than caching the resulting
-    /// cookie: a stale cached session cookie is exactly what broke a
-    /// `create` run partway through once already.
+    /// A successful call sets a `session=<token>` cookie; a failure
+    /// (wrong password, no such user — deliberately indistinguishable,
+    /// see `auth.rs`) comes back as a non-2xx status with "invalid
+    /// email or password" in the body. Logs in fresh every run rather
+    /// than caching the resulting cookie: a stale cached session cookie
+    /// is exactly what broke a `create` run partway through once
+    /// already.
     pub fn log_in(&mut self, email: &str, password: &str) -> Result<(), String> {
         let res = self
             .http
-            .post(format!("{}{LOG_IN_PATH}", self.base_url))
+            .post(format!("{}/api/importer/login", self.base_url))
             .form(&[("email", email), ("password", password)])
             .send()
             .map_err(|e| e.to_string())?;
@@ -130,7 +124,10 @@ impl AppClient {
         let cookie = self.cookie_header()?;
         let res = self
             .http
-            .post(format!("{}{SAVE_WORD_DEFINITION_PATH}", self.base_url))
+            .post(format!(
+                "{}/api/importer/save-word-definition",
+                self.base_url
+            ))
             .header(reqwest::header::COOKIE, cookie)
             .form(&[
                 ("target_text", card.target_text.as_str()),

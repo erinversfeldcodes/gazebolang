@@ -436,4 +436,48 @@ mod tests {
             Some("english is just a stray function word, not a real card")
         );
     }
+
+    proptest::proptest! {
+        /// Everything `normalize_for_comparison` does — stripping a
+        /// redundant pos-tag parenthetical, dropping parens, collapsing
+        /// whitespace, trimming hyphens, lowercasing — produces a form
+        /// that's already fully normalized: running it again on its
+        /// own output must always be a no-op, for any input whatsoever.
+        #[test]
+        fn normalize_for_comparison_is_idempotent(s in ".*") {
+            let once = normalize_for_comparison(&s);
+            let twice = normalize_for_comparison(&once);
+            proptest::prop_assert_eq!(once, twice);
+        }
+
+        /// This runs on real, possibly-garbled model output — it must
+        /// never panic, no matter how adversarial the input (empty,
+        /// all parens, unmatched parens, arbitrary Unicode).
+        #[test]
+        fn normalize_for_comparison_never_panics(s in ".*") {
+            let _ = normalize_for_comparison(&s);
+        }
+
+        /// The whole point of `seen_card_keys`: once a genuinely new
+        /// card has been accepted, checking the *exact same* card again
+        /// must always report it as a duplicate — never silently
+        /// accepted twice, for any non-degenerate (english, target_text)
+        /// pair.
+        #[test]
+        fn accepting_a_card_then_rechecking_it_always_reports_a_duplicate(
+            english in "[a-zA-Z]{2,10}",
+            target_text in "[a-zA-Z]{2,10}",
+        ) {
+            proptest::prop_assume!(english.to_lowercase() != target_text.to_lowercase());
+            proptest::prop_assume!(!TRIVIAL_FRAGMENT_LABELS.contains(&english.to_lowercase().as_str()));
+            let mut seen = HashSet::new();
+            let first = card(&english, &target_text);
+            proptest::prop_assert_eq!(card_rejection_reason(&first, &mut seen), None);
+            let second = card(&english, &target_text);
+            proptest::prop_assert_eq!(
+                card_rejection_reason(&second, &mut seen),
+                Some("duplicate of an already-created card")
+            );
+        }
+    }
 }

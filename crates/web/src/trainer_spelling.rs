@@ -396,4 +396,27 @@ mod tests {
         let correct_answer = fetch_target_text(&pool, card_id).await.unwrap();
         assert!(spellings_match("  GATO  ", &correct_answer));
     }
+
+    proptest::proptest! {
+        /// Whichever side of the comparison is the learner's answer vs.
+        /// the stored correct text shouldn't matter — the match is a
+        /// pure equality check on normalized form, so it must be
+        /// symmetric for any two strings.
+        #[test]
+        fn spellings_match_is_symmetric(a in ".*", b in ".*") {
+            proptest::prop_assert_eq!(spellings_match(&a, &b), spellings_match(&b, &a));
+        }
+
+        /// Surrounding whitespace and letter case must never change
+        /// whether two spellings are judged to match.
+        #[test]
+        fn spellings_match_ignores_surrounding_whitespace_and_case(
+            s in "[a-zA-Z ]{1,15}",
+            leading in " {0,3}",
+            trailing in " {0,3}",
+        ) {
+            let padded = format!("{leading}{}{trailing}", s.to_uppercase());
+            proptest::prop_assert!(spellings_match(&s, &padded));
+        }
+    }
 }

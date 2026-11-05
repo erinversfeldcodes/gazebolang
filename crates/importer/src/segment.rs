@@ -929,4 +929,203 @@ mod tests {
             ]
         );
     }
+
+    fn entries_from(headwords: &[String]) -> Vec<Entry> {
+        headwords.iter().map(|h| entry(h, "x")).collect()
+    }
+
+    fn headwords_of(entries: &[Entry]) -> Vec<String> {
+        entries.iter().map(|e| e.headword.clone()).collect()
+    }
+
+    proptest::proptest! {
+        /// `append_after_overlap` only ever extends `accumulated` — it
+        /// should never be possible for it to shrink, reorder, or
+        /// modify any entry that was already there, no matter what
+        /// `new_entries` contains.
+        #[test]
+        fn append_after_overlap_never_touches_the_existing_prefix(
+            accumulated_headwords in proptest::collection::vec("[a-z]{1,6}", 0..8),
+            new_headwords in proptest::collection::vec("[a-z]{1,6}", 0..8),
+        ) {
+            let mut accumulated = entries_from(&accumulated_headwords);
+            let original_len = accumulated.len();
+            let new_entries = entries_from(&new_headwords);
+            append_after_overlap(&mut accumulated, new_entries);
+            proptest::prop_assert!(accumulated.len() >= original_len);
+            proptest::prop_assert_eq!(&headwords_of(&accumulated[..original_len]), &accumulated_headwords);
+        }
+
+        /// With nothing accumulated yet, there's nothing to find an
+        /// overlap with — the result must be exactly `new_entries`,
+        /// unchanged and in order.
+        #[test]
+        fn append_after_overlap_with_empty_accumulated_copies_new_entries_verbatim(
+            new_headwords in proptest::collection::vec("[a-z]{1,6}", 0..8),
+        ) {
+            let mut accumulated: Vec<Entry> = Vec::new();
+            let new_entries = entries_from(&new_headwords);
+            append_after_overlap(&mut accumulated, new_entries);
+            proptest::prop_assert_eq!(headwords_of(&accumulated), new_headwords);
+        }
+
+        /// An empty crop result has nothing to correct with — the page
+        /// must come back completely unchanged.
+        #[test]
+        fn column_boundary_fix_is_a_no_op_when_boundary_entries_is_empty(
+            page_headwords in proptest::collection::vec("[a-z]{1,6}", 0..8),
+        ) {
+            let page_entries = entries_from(&page_headwords);
+            let result = apply_column_boundary_fix(page_entries, Vec::new());
+            proptest::prop_assert_eq!(headwords_of(&result), page_headwords);
+        }
+
+        /// If the crop's own first headword doesn't appear anywhere in
+        /// the page's own read, there's nothing to safely correct —
+        /// confirmed necessary in a real run (see this fn's own doc
+        /// comment) that trusting such a crop pollutes a correct page
+        /// with hallucinated content instead.
+        #[test]
+        fn column_boundary_fix_is_a_no_op_when_no_match_is_found(
+            page_headwords in proptest::collection::vec("[a-z]{1,6}", 0..8),
+            boundary_first in "[a-z]{1,6}",
+            boundary_rest in proptest::collection::vec("[a-z]{1,6}", 0..4),
+        ) {
+            proptest::prop_assume!(
+                !page_headwords.iter().any(|h| h.eq_ignore_ascii_case(&boundary_first))
+            );
+            let page_entries = entries_from(&page_headwords);
+            let mut boundary_entries = vec![entry(&boundary_first, "y")];
+            boundary_entries.extend(entries_from(&boundary_rest));
+            let result = apply_column_boundary_fix(page_entries, boundary_entries);
+            proptest::prop_assert_eq!(headwords_of(&result), page_headwords);
+        }
+
+        /// When the crop's first headword *does* match something in the
+        /// page's own read, whatever comes before that match must
+        /// survive untouched — the fix only ever corrects the matched
+        /// span onward, never anything earlier in the page.
+        #[test]
+        fn column_boundary_fix_preserves_everything_before_the_match(
+            before_headwords in proptest::collection::vec("[a-z]{1,6}", 0..4),
+            match_headword in "[a-z]{1,6}",
+            after_headwords in proptest::collection::vec("[a-z]{1,6}", 0..4),
+            boundary_rest in proptest::collection::vec("[a-z]{1,6}", 0..3),
+        ) {
+            proptest::prop_assume!(
+                !before_headwords.iter().any(|h| h.eq_ignore_ascii_case(&match_headword))
+            );
+            let mut page_entries = entries_from(&before_headwords);
+            page_entries.push(entry(&match_headword, "x"));
+            page_entries.extend(entries_from(&after_headwords));
+
+            let mut boundary_entries = vec![entry(&match_headword, "y")];
+            boundary_entries.extend(entries_from(&boundary_rest));
+
+            let before_len = before_headwords.len();
+            let result = apply_column_boundary_fix(page_entries, boundary_entries);
+            proptest::prop_assert!(result.len() >= before_len);
+            proptest::prop_assert_eq!(headwords_of(&result[..before_len]), before_headwords);
+        }
+
+        /// This fix only ever replaces `accumulated`'s own last entry's
+        /// *content* — it never adds or removes entries, so the length
+        /// must always come back exactly unchanged.
+        #[test]
+        fn boundary_fix_to_previous_page_tail_never_changes_length(
+            accumulated_headwords in proptest::collection::vec("[a-z]{1,6}", 0..8),
+            boundary_headwords in proptest::collection::vec("[a-z]{1,6}", 0..8),
+        ) {
+            let accumulated = entries_from(&accumulated_headwords);
+            let original_len = accumulated.len();
+            let boundary_entries = entries_from(&boundary_headwords);
+            let result = apply_boundary_fix_to_previous_page_tail(accumulated, &boundary_entries);
+            proptest::prop_assert_eq!(result.len(), original_len);
+        }
+
+        /// If nothing in the boundary crop matches `accumulated`'s own
+        /// last headword, there's nothing safe to patch with — the
+        /// last entry (and everything before it) must come back
+        /// completely unchanged.
+        #[test]
+        fn boundary_fix_to_previous_page_tail_is_a_no_op_when_no_match_is_found(
+            accumulated_headwords in proptest::collection::vec("[a-z]{1,6}", 1..8),
+            boundary_headwords in proptest::collection::vec("[a-z]{1,6}", 0..8),
+        ) {
+            let last_headword = accumulated_headwords.last().unwrap().clone();
+            proptest::prop_assume!(
+                !boundary_headwords.iter().any(|h| h.eq_ignore_ascii_case(&last_headword))
+            );
+            let accumulated = entries_from(&accumulated_headwords);
+            let boundary_entries = entries_from(&boundary_headwords);
+            let result = apply_boundary_fix_to_previous_page_tail(accumulated, &boundary_entries);
+            proptest::prop_assert_eq!(headwords_of(&result), accumulated_headwords);
+        }
+
+        /// Dropping a leading duplicate can only ever remove at most
+        /// the very first entry — the result is always either the
+        /// whole input or the input with just `entries[0]` gone, never
+        /// anything more, less, or reordered.
+        #[test]
+        fn drop_leading_duplicate_headword_removes_at_most_the_first_entry(
+            headwords in proptest::collection::vec("[a-z]{1,6}", 0..8),
+        ) {
+            let entries = entries_from(&headwords);
+            let original_len = entries.len();
+            let result = drop_leading_duplicate_headword(entries);
+            proptest::prop_assert!(result.len() == original_len || result.len() + 1 == original_len);
+            if result.len() + 1 == original_len {
+                proptest::prop_assert_eq!(headwords_of(&result), &headwords[1..]);
+            } else {
+                proptest::prop_assert_eq!(headwords_of(&result), headwords);
+            }
+        }
+
+        /// Splitting a page into its left/right column must never lose
+        /// or duplicate so much as a pixel of width, and must never
+        /// touch the height at all.
+        #[test]
+        fn crop_column_widths_sum_to_the_original_with_height_unchanged(
+            width in 2u32..500,
+            height in 1u32..500,
+        ) {
+            let img = DynamicImage::new_rgb8(width, height);
+            let left = crop_column(&img, true);
+            let right = crop_column(&img, false);
+            proptest::prop_assert_eq!(left.width() + right.width(), width);
+            proptest::prop_assert_eq!(left.height(), height);
+            proptest::prop_assert_eq!(right.height(), height);
+            proptest::prop_assert!(left.width() >= 1);
+            proptest::prop_assert!(right.width() >= 1);
+        }
+
+        /// Downscaling never collapses a real image to nothing, and
+        /// never *upscales* past the original in either dimension —
+        /// the target scale factor is always < 1 once the image is
+        /// over budget, and rounding a value below `n` to the nearest
+        /// integer can never land above `n` itself. (A tight bound on
+        /// how far the total can land *under* that ceiling isn't
+        /// asserted here: it depends on the original aspect ratio in a
+        /// way that doesn't reduce to a simple constant, and the
+        /// hand-written unit test above already covers one concrete,
+        /// worked example of the budget actually being met.)
+        #[test]
+        fn cap_total_pixels_never_upscales_and_never_collapses_to_zero(
+            width in 1u32..500,
+            height in 1u32..500,
+            max_pixels in 1u64..250_000,
+        ) {
+            let img = DynamicImage::new_rgb8(width, height);
+            let capped = cap_total_pixels(img, max_pixels);
+            proptest::prop_assert!(capped.width() >= 1);
+            proptest::prop_assert!(capped.height() >= 1);
+            let original = u64::from(width) * u64::from(height);
+            if original <= max_pixels {
+                proptest::prop_assert_eq!((capped.width(), capped.height()), (width, height));
+            } else {
+                proptest::prop_assert!(capped.width() <= width);
+                proptest::prop_assert!(capped.height() <= height);
+            }
+        }
+    }
 }
