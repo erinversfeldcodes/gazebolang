@@ -325,18 +325,78 @@ fn apply_column_boundary_fix(page_entries: Vec<Entry>, boundary_entries: Vec<Ent
     result
 }
 
+/// Corrects `accumulated`'s own last entry using a page-to-page
+/// boundary crop — similar in spirit to `apply_column_boundary_fix`,
+/// but for the join between two separate page photos rather than one
+/// page's own two columns. Unlike the in-page case, this crop doesn't
+/// start right at the transition (it also covers whatever's visible
+/// higher up the previous page's own bottom sliver), so the match is
+/// found by searching the *whole* crop for the previous page's own
+/// last headword, not by trusting the crop's own first entry. Nothing
+/// past that match point is used: confirmed in a real run that while
+/// the crop's own independent read of the previous page's truncated
+/// last entry ("abrupt") was the fuller, correct version, the crop's
+/// own read of whatever came right after it ("abscess") was wrong —
+/// and blindly trusting it caused the *next* page's own correct read
+/// of that same headword to be discarded as redundant overlap. The
+/// next page's own full read is more reliable for everything past
+/// this one patched entry, so it's left to the ordinary
+/// `append_after_overlap` merge that already follows this call.
+fn apply_boundary_fix_to_previous_page_tail(
+    mut accumulated: Vec<Entry>,
+    boundary_entries: &[Entry],
+) -> Vec<Entry> {
+    let Some(last) = accumulated.last() else {
+        return accumulated;
+    };
+    let last_headword = last.headword.to_lowercase();
+    if let Some(replacement) = boundary_entries
+        .iter()
+        .find(|e| e.headword.to_lowercase() == last_headword)
+    {
+        let last_idx = accumulated.len() - 1;
+        accumulated[last_idx] = replacement.clone();
+    }
+    accumulated
+}
+
 /// Reads one page, then corrects its own column break using a small
 /// crop of just that break — see `apply_column_boundary_fix`'s doc
 /// comment for why this corrects rather than appends. Used for every
 /// page, whether it's the only image given or one of several, since
 /// the bug this guards against lives within a single page's own two
 /// columns, independent of how many pages there are.
+/// If a page's own read starts with two entries sharing the exact same
+/// headword, the first is overwhelmingly likely to be an orphaned
+/// continuation of whatever entry was still in progress right where
+/// this photo starts, mislabeled under the next real headword reached
+/// rather than recognized as a continuation — the same underlying
+/// failure as the in-page column break, just at the very top of a
+/// photo instead. Confirmed in a real run: a page's own first entry
+/// for "abscess" carried content that was actually the missing tail of
+/// "abrupt"'s entry from the *previous* page, immediately followed by
+/// a second, correctly-labeled "abscess" entry with abscess's own real
+/// content — and left uncorrected, a page-to-page boundary merge can
+/// end up keeping the wrong copy and discarding the correct one,
+/// confirmed in that same run. Applied to every page's own read,
+/// including a lone single-page run, since the risk isn't specific to
+/// multi-page input: whatever a photo's framing happens to catch right
+/// at its own top edge can be an orphaned fragment regardless.
+fn drop_leading_duplicate_headword(mut entries: Vec<Entry>) -> Vec<Entry> {
+    if entries.len() >= 2
+        && entries[0].headword.to_lowercase() == entries[1].headword.to_lowercase()
+    {
+        entries.remove(0);
+    }
+    entries
+}
+
 fn segment_page_with_column_fix(
     engine: &mut VisionEngine,
     image_path: &Path,
     scratch_dir: &Path,
 ) -> Result<Vec<Entry>, String> {
-    let page_entries = segment_page(engine, image_path)?;
+    let page_entries = drop_leading_duplicate_headword(segment_page(engine, image_path)?);
     let crop_name = image_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -419,9 +479,18 @@ fn order_images_by_page_content(
 /// Each page is read independently at full resolution (reliable all
 /// session), and, between each pair, a small crop of just the boundary
 /// between them (`stitch_boundary_crop`) is read too, to catch whatever
-/// straddles the join. `append_after_overlap` merges each page's own
-/// entries with the boundary crop's, then with the next page's own
-/// entries. This replaced an earlier design that stitched each pair's
+/// straddles the join. That crop's own result is used only to patch
+/// the previous page's own last entry if it was truncated
+/// (`apply_boundary_fix_to_previous_page_tail`), not appended wholesale
+/// — confirmed in a real run that the crop's own read past that one
+/// patched entry can be less reliable than the next page's own full
+/// read of the same content, and blindly trusting it caused that
+/// better, later read to be discarded as redundant overlap instead.
+/// `append_after_overlap` (via `segment_page_with_column_fix`'s own
+/// caller, at the top of the next page's turn through this loop) still
+/// handles the ordinary case of a page's own read re-finding a couple
+/// of entries already seen. This replaced an earlier design that
+/// stitched each pair's
 /// *whole* pages into one composite: that composite's extreme aspect
 /// ratio (two tall pages stacked) reproducibly crashed Qwen2.5-VL's
 /// vision path in llama.cpp with "failed to find a memory slot" — a
@@ -462,7 +531,7 @@ fn run_segment_sliding_window_cropped(
                 "  found {} headword(s) in the boundary crop",
                 boundary_found.len()
             );
-            append_after_overlap(&mut all_entries, boundary_found);
+            all_entries = apply_boundary_fix_to_previous_page_tail(all_entries, &boundary_found);
         }
     }
     Ok(all_entries)
@@ -532,6 +601,34 @@ mod tests {
     }
 
     #[test]
+    fn drop_leading_duplicate_headword_drops_only_the_first_of_a_leading_pair() {
+        // Real run: a page's own first entry for "abscess" carried the
+        // missing tail of the previous page's "abrupt" entry, mislabeled,
+        // immediately followed by a correctly-labeled "abscess".
+        let entries = vec![
+            entry("abscess", "ubukrwada; iqubuliso (ili-ama-); ubuqengqelezi."),
+            entry("abscess", "n. ithumba (ili- ama-)."),
+            entry("abscond", "..."),
+        ];
+        let result = drop_leading_duplicate_headword(entries);
+        assert_eq!(
+            result.iter().map(|e| &e.headword).collect::<Vec<_>>(),
+            ["abscess", "abscond"]
+        );
+        assert_eq!(result[0].raw_entry, "n. ithumba (ili- ama-).");
+    }
+
+    #[test]
+    fn drop_leading_duplicate_headword_leaves_a_page_without_a_leading_duplicate_unchanged() {
+        let entries = vec![entry("abode", "..."), entry("abolish", "...")];
+        let result = drop_leading_duplicate_headword(entries);
+        assert_eq!(
+            result.iter().map(|e| &e.headword).collect::<Vec<_>>(),
+            ["abode", "abolish"]
+        );
+    }
+
+    #[test]
     fn crop_column_splits_the_image_in_half_with_no_gap_or_overlap() {
         let img = DynamicImage::new_rgb8(1000, 2000);
         let left = crop_column(&img, true);
@@ -584,6 +681,39 @@ mod tests {
             fixed.iter().map(|e| &e.headword).collect::<Vec<_>>(),
             ["abode"]
         );
+    }
+
+    #[test]
+    fn boundary_fix_to_previous_page_tail_replaces_a_truncated_last_entry() {
+        // Real run: the previous page's own read of "abrupt" was cut
+        // off at the bottom of its photo; the boundary crop's own
+        // independent read of the same headword was the complete one.
+        let accumulated = vec![
+            entry("abroad", "..."),
+            entry("abrupt", "adj. ... ~ness, n."),
+        ];
+        let boundary_entries = vec![
+            entry("about", "..."),
+            entry("abrupt", "adj. ... ~ness, n. ubudenge."),
+        ];
+        let fixed = apply_boundary_fix_to_previous_page_tail(accumulated, &boundary_entries);
+        assert_eq!(
+            fixed.iter().map(|e| &e.headword).collect::<Vec<_>>(),
+            ["abroad", "abrupt"]
+        );
+        assert_eq!(fixed[1].raw_entry, "adj. ... ~ness, n. ubudenge.");
+    }
+
+    #[test]
+    fn boundary_fix_to_previous_page_tail_leaves_it_unchanged_when_no_match_is_found() {
+        let accumulated = vec![entry("abroad", "..."), entry("abrupt", "...")];
+        let boundary_entries = vec![entry("zebra", "...")];
+        let fixed = apply_boundary_fix_to_previous_page_tail(accumulated, &boundary_entries);
+        assert_eq!(
+            fixed.iter().map(|e| &e.headword).collect::<Vec<_>>(),
+            ["abroad", "abrupt"]
+        );
+        assert_eq!(fixed[1].raw_entry, "...");
     }
 
     #[test]
