@@ -34,21 +34,90 @@ pub struct Card {
     pub image_url: Option<String>,
 }
 
+/// A bare part-of-speech tag in parentheses (e.g. `"abhor (verb)"`) adds
+/// no sense-distinguishing information — the card already has its own
+/// `part_of_speech` field — so it's dropped entirely before comparison,
+/// unlike a real qualifying parenthetical (`"ablaze (excited)"`,
+/// `"ablaze (with)"`) which genuinely marks a distinct sense and must be
+/// kept. Confirmed necessary in a real run: `"abhor (verb)"`/`"thiya"`
+/// slipped past the duplicate check against an already-created
+/// `"abhor"`/`"-thiya"` card, differing only by this redundant tag.
+const POS_TAG_WORDS: &[&str] = &[
+    "n",
+    "v",
+    "vt",
+    "vi",
+    "adj",
+    "adjective",
+    "adv",
+    "adverb",
+    "noun",
+    "verb",
+    "prep",
+    "preposition",
+    "pron",
+    "pronoun",
+    "conj",
+    "conjunction",
+    "interj",
+    "interjection",
+];
+
+fn strip_redundant_pos_parenthetical(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut depth = 0u32;
+    let mut paren_content = String::new();
+    for c in s.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                paren_content.clear();
+            }
+            ')' if depth > 0 => {
+                depth -= 1;
+                let tag = paren_content.trim().trim_end_matches('.').to_lowercase();
+                if !POS_TAG_WORDS.contains(&tag.as_str()) {
+                    result.push('(');
+                    result.push_str(&paren_content);
+                    result.push(')');
+                }
+            }
+            _ if depth > 0 => paren_content.push(c),
+            _ => result.push(c),
+        }
+    }
+    result
+}
+
+/// A handful of common English function words that are never themselves a
+/// real, standalone flashcard concept in this pipeline — every real card's
+/// `english` is a dictionary headword, sense, or phrase, never a bare
+/// preposition/article/conjunction on its own. Confirmed necessary in a
+/// real run: enumerate split `"ablaze (with)"` into two items, one
+/// correctly labeled and one reduced to just `"with"`, which fill then
+/// happily gave a real-looking card — a duplicate in substance, but not
+/// in form, since "with" naturally doesn't equal "ablaze with".
+const TRIVIAL_FRAGMENT_LABELS: &[&str] = &[
+    "with", "the", "a", "an", "of", "in", "on", "by", "to", "and", "or", "but", "for", "at",
+];
+
 /// Returns a short, human-readable reason to reject a drafted card, or
 /// `None` if it should be kept. Not fully pure — a kept card's key is
 /// recorded into `seen_card_keys` so a later duplicate of it is caught too
 /// — but synchronous and needs no model/network call, so it's unit-tested
 /// on its own rather than only indirectly through a full decompose run.
 /// Strips cosmetic differences that don't change a card's real identity
-/// — a leading/trailing "-" marking a Xhosa bound stem, and parentheses
-/// around a qualifying word — before two cards are compared. Confirmed
-/// necessary in a real run against the production model:
-/// `"ablaze with"`/`"khazimla"` slipped past the duplicate check against
-/// an already-created `"ablaze (with)"`/`"-khazimla"` card, and
-/// `"the nqa"`/`"-the nqa"` slipped past the self-referential check,
-/// both differing only by this kind of formatting, not by content.
+/// — a leading/trailing "-" marking a Xhosa bound stem, a redundant
+/// part-of-speech tag, and parentheses around a qualifying word — before
+/// two cards are compared. Confirmed necessary in a real run against the
+/// production model: `"ablaze with"`/`"khazimla"` slipped past the
+/// duplicate check against an already-created `"ablaze (with)"`/
+/// `"-khazimla"` card, and `"the nqa"`/`"-the nqa"` slipped past the
+/// self-referential check, both differing only by this kind of
+/// formatting, not by content.
 fn normalize_for_comparison(s: &str) -> String {
-    s.chars()
+    strip_redundant_pos_parenthetical(s)
+        .chars()
         .filter(|c| *c != '(' && *c != ')')
         .collect::<String>()
         .split_whitespace()
@@ -74,6 +143,9 @@ pub fn card_rejection_reason(
     let normalized_target = normalize_for_comparison(target_text);
     if normalized_english == normalized_target {
         return Some("empty or self-referential");
+    }
+    if TRIVIAL_FRAGMENT_LABELS.contains(&normalized_english.as_str()) {
+        return Some("english is just a stray function word, not a real card");
     }
     // Keyed on the pair actually shown to the learner (english +
     // target_text), not the enumerated item's label — two different
@@ -327,6 +399,41 @@ mod tests {
         assert_eq!(
             card_rejection_reason(&card("ablaze with", "khazimla"), &mut seen),
             Some("duplicate of an already-created card")
+        );
+    }
+
+    #[test]
+    fn rejects_a_duplicate_hidden_behind_a_redundant_pos_tag() {
+        let mut seen = HashSet::new();
+        assert_eq!(
+            card_rejection_reason(&card("abhor", "-thiya"), &mut seen),
+            None
+        );
+        assert_eq!(
+            card_rejection_reason(&card("abhor (verb)", "thiya"), &mut seen),
+            Some("duplicate of an already-created card")
+        );
+    }
+
+    #[test]
+    fn keeps_a_real_qualifying_parenthetical_distinct_from_the_pos_tag_case() {
+        let mut seen = HashSet::new();
+        assert_eq!(
+            card_rejection_reason(&card("ablaze", "-vutha"), &mut seen),
+            None
+        );
+        assert_eq!(
+            card_rejection_reason(&card("ablaze (excited)", "-vutha"), &mut seen),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_a_card_whose_english_is_just_a_stray_function_word() {
+        let mut seen = HashSet::new();
+        assert_eq!(
+            card_rejection_reason(&card("with", "khazimla"), &mut seen),
+            Some("english is just a stray function word, not a real card")
         );
     }
 }

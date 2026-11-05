@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4.6.7", features = ["derive", "env"] }
 directories = "6.0.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 indicatif = "0.18.6"
 llama-cpp-2 = { version = "0.1.161", features = ["mtmd", "common"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "blocking", "rustls", "form", "multipart"] }

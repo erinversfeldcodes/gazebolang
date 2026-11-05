@@ -4,9 +4,40 @@
 use crate::engine::VisionEngine;
 use crate::json_extract::extract_json_array;
 use crate::schema::segment_schema;
+use image::{DynamicImage, imageops::FilterType};
 use std::path::{Path, PathBuf};
 
 const SUPPORTED_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
+
+/// A single real dictionary page photo (confirmed working reliably all
+/// session) is around 4.5-4.8 megapixels; the known-bad two-page
+/// composite that crashed was ~10 megapixels. This sits meaningfully
+/// below the failure point while still giving each stitched page more
+/// detail than it would get if the whole composite were squeezed down to
+/// one page's own budget.
+const MAX_COMPOSITE_PIXELS: u64 = 6_000_000;
+
+/// Downscales `img` (preserving aspect ratio) so its total pixel count
+/// is at most `max_pixels`, or returns it unchanged if already under the
+/// budget.
+fn cap_total_pixels(img: DynamicImage, max_pixels: u64) -> DynamicImage {
+    let (width, height) = (u64::from(img.width()), u64::from(img.height()));
+    let total = width * height;
+    if total <= max_pixels || total == 0 {
+        return img;
+    }
+    // Image dimensions never come close to f64's 52-bit mantissa limit,
+    // so these u64->f64 casts lose no real precision.
+    #[allow(clippy::cast_precision_loss)]
+    let (width_f, height_f, max_pixels_f, total_f) =
+        (width as f64, height as f64, max_pixels as f64, total as f64);
+    let scale = (max_pixels_f / total_f).sqrt();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let new_width = ((width_f * scale).round() as u64).clamp(1, u64::from(u32::MAX)) as u32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let new_height = ((height_f * scale).round() as u64).clamp(1, u64::from(u32::MAX)) as u32;
+    img.resize_exact(new_width, new_height, FilterType::Lanczos3)
+}
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Entry {
@@ -22,7 +53,15 @@ next bold headword, transcribed exactly as printed, verbatim — do not \
 summarize, reorder, or drop anything>\"}. Transcribe every headword on the \
 page, even ones you're only partly confident about — getting the \
 segmentation boundaries right matters more than getting every character \
-perfect.";
+perfect.\n\n\
+Two things about how pages like this are printed: a page often prints a \
+guide word in each top corner (showing the first and/or last headword on \
+that page, for navigation) — these are not real entries, so never create \
+one for a guide word. And an entry can run on from the bottom of one \
+column straight into the top of the next column, sometimes splitting a \
+single word across a line-end hyphen right at that break — keep reading \
+it as the one entry it is, rather than starting a new one at the column \
+break.";
 
 pub fn segment_page(engine: &mut VisionEngine, image_path: &Path) -> Result<Vec<Entry>, String> {
     let ext = image_path
@@ -48,6 +87,387 @@ pub fn segment_page(engine: &mut VisionEngine, image_path: &Path) -> Result<Vec<
         .collect())
 }
 
+/// The shared compositing core behind `stitch_boundary_crop` — scales
+/// every image to a shared width, stacks them top to bottom, caps the
+/// result's total pixel count, and saves it.
+fn compose_vertical_stack(images: Vec<DynamicImage>, out_path: &Path) -> Result<PathBuf, String> {
+    let target_width = images
+        .iter()
+        .map(DynamicImage::width)
+        .max()
+        .ok_or("no images to stitch")?;
+
+    let resized: Vec<DynamicImage> = images
+        .into_iter()
+        .map(|img| {
+            if img.width() == target_width {
+                img
+            } else {
+                // Scale to a shared width (preserving each photo's own
+                // aspect ratio) so the composite isn't jagged — these are
+                // independent phone photos, not scans, so their widths
+                // rarely match exactly even for the same physical page
+                // size.
+                let new_height_u64 =
+                    u64::from(img.height()) * u64::from(target_width) / u64::from(img.width());
+                let new_height = u32::try_from(new_height_u64).unwrap_or(u32::MAX).max(1);
+                img.resize_exact(target_width, new_height, FilterType::Lanczos3)
+            }
+        })
+        .collect();
+
+    let total_height: u32 = resized.iter().map(DynamicImage::height).sum();
+    let mut composite = DynamicImage::new_rgb8(target_width, total_height);
+    let mut y_offset: i64 = 0;
+    for img in &resized {
+        image::imageops::overlay(&mut composite, img, 0, y_offset);
+        y_offset += i64::from(img.height());
+    }
+
+    // A ~10-megapixel composite (two real pages stacked) reproducibly
+    // crashed Qwen2.5-VL's vision path in llama.cpp with
+    // "failed to find a memory slot" — a known, documented upstream
+    // difficulty specific to this model family and large images (the
+    // maintainers' own fix caps Qwen2VL/Pixtral inputs for exactly this
+    // reason). Downscaling the composite as a whole, not per-source-page,
+    // is deliberate: it keeps every page in the stitch proportionally
+    // represented rather than privileging whichever one got processed
+    // first.
+    let composite = cap_total_pixels(composite, MAX_COMPOSITE_PIXELS);
+
+    // PNG (lossless), not re-encoding to JPEG: these photos are already
+    // JPEG-compressed once; compressing the composite a second time would
+    // compound artifacts right where legibility matters most.
+    composite.save(out_path).map_err(|e| {
+        format!(
+            "failed to save stitched image to {}: {e}",
+            out_path.display()
+        )
+    })?;
+    Ok(out_path.to_path_buf())
+}
+
+/// How much of each page's height to include in a boundary crop — enough
+/// to comfortably contain whatever entry straddles the join (dictionary
+/// entries are rarely more than a few lines), while staying small enough
+/// to never approach the large-image failure `MAX_COMPOSITE_PIXELS`
+/// works around in `stitch_images` — this crop is meant to avoid that
+/// problem by construction instead, by never getting large in the first
+/// place.
+const BOUNDARY_CROP_FRACTION: f64 = 0.2;
+
+#[allow(clippy::cast_precision_loss)]
+fn crop_bottom_fraction(img: &DynamicImage, fraction: f64) -> DynamicImage {
+    let height = img.height();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let crop_height = ((f64::from(height) * fraction).round() as u32).max(1);
+    let y = height.saturating_sub(crop_height);
+    img.crop_imm(0, y, img.width(), crop_height)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn crop_top_fraction(img: &DynamicImage, fraction: f64) -> DynamicImage {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let crop_height = ((f64::from(img.height()) * fraction).round() as u32).max(1);
+    img.crop_imm(0, 0, img.width(), crop_height)
+}
+
+/// Alternative to stitching whole pages: crops just the bottom sliver of
+/// `top_image` and the top sliver of `bottom_image` and stitches only
+/// those together — small enough by construction to never approach the
+/// large-image failure a full two-page composite can hit, while still
+/// giving the model both sides of the join to read together.
+fn stitch_boundary_crop(
+    top_image: &Path,
+    bottom_image: &Path,
+    out_path: &Path,
+) -> Result<PathBuf, String> {
+    let top = image::open(top_image)
+        .map_err(|e| format!("failed to open image {}: {e}", top_image.display()))?;
+    let bottom = image::open(bottom_image)
+        .map_err(|e| format!("failed to open image {}: {e}", bottom_image.display()))?;
+    let slices = vec![
+        crop_bottom_fraction(&top, BOUNDARY_CROP_FRACTION),
+        crop_top_fraction(&bottom, BOUNDARY_CROP_FRACTION),
+    ];
+    compose_vertical_stack(slices, out_path)
+}
+
+/// Where a page's two columns split, as a fraction of its total width —
+/// a fixed 50/50 default rather than a detected whitespace gutter: this
+/// book's photos all split into two roughly-equal columns, and a
+/// deterministic constant is simpler and more predictable than a
+/// gutter-detection heuristic that could misfire on an unseen photo's
+/// particular skew or margins. Adjust this (or detect it properly) if a
+/// future book's layout genuinely isn't close to 50/50.
+const COLUMN_SPLIT_FRACTION: f64 = 0.5;
+
+#[allow(clippy::cast_precision_loss)]
+fn crop_column(img: &DynamicImage, left_half: bool) -> DynamicImage {
+    let width = img.width();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let split_x = ((f64::from(width) * COLUMN_SPLIT_FRACTION).round() as u32)
+        .clamp(1, width.saturating_sub(1).max(1));
+    if left_half {
+        img.crop_imm(0, 0, split_x, img.height())
+    } else {
+        img.crop_imm(split_x, 0, width - split_x, img.height())
+    }
+}
+
+/// Like `stitch_boundary_crop`, but for the boundary a single page's own
+/// two columns share, rather than between two separate page photos:
+/// crops a sliver of the bottom of the left column and the top of the
+/// right column from the *same* image and stitches just those together.
+/// This is what actually fixes the column-break mis-segmentation that
+/// the `SEGMENT_PROMPT` instruction alone couldn't: whether the first
+/// word at the top of a column is a genuine new (bold) headword or a
+/// plain-type continuation of the entry that was in progress at the
+/// bottom of the previous column is a font-weight judgment call —
+/// confirmed, independently of this project's own testing, to be a
+/// near-chance-accuracy weakness of this model family at this size, not
+/// a prompt-wording gap. Column position, unlike font weight, is a
+/// structural fact this pipeline can compute directly, so this crop
+/// replaces that unreliable visual judgment with one the model doesn't
+/// have to make at all: it only ever sees a small, focused sliver with
+/// no "new column" framing to get confused by.
+fn stitch_in_page_column_boundary_crop(
+    image_path: &Path,
+    out_path: &Path,
+) -> Result<PathBuf, String> {
+    let img = image::open(image_path)
+        .map_err(|e| format!("failed to open image {}: {e}", image_path.display()))?;
+    let slices = vec![
+        crop_bottom_fraction(&crop_column(&img, true), BOUNDARY_CROP_FRACTION),
+        crop_top_fraction(&crop_column(&img, false), BOUNDARY_CROP_FRACTION),
+    ];
+    compose_vertical_stack(slices, out_path)
+}
+
+/// How many of `new_entries`' leading items to search for the overlap
+/// boundary — deliberately not the whole list. A genuine overlap is
+/// `new_entries` re-transcribing content physically adjacent to the
+/// join, so it only ever shows up right at the front; a handful of
+/// slots of headroom covers the original full-page-pair design
+/// re-finding a couple of leading entries before reaching new content.
+/// A match found deeper than that is coincidence or a hallucinated
+/// duplicate, not real overlap — confirmed in a real run: a boundary
+/// crop's own last headword happened to also appear at position 12 of
+/// the next page's independent 21-entry read, and trusting that one
+/// silently discarded the 12 genuine entries before it.
+const OVERLAP_SEARCH_WINDOW: usize = 5;
+
+/// Appends `new_entries` onto `accumulated`, skipping whatever prefix of
+/// `new_entries` duplicates the tail already in `accumulated` — found by
+/// matching headwords (case-insensitive) within `OVERLAP_SEARCH_WINDOW`
+/// of the front, not by asking the model to judge anything, since
+/// that's already been confirmed unreliable for this kind of call.
+/// Falls back to appending everything if no match is found within that
+/// window: better to risk a few duplicate cards downstream (which
+/// `decompose`'s own dedup logic already catches) than to silently drop
+/// real content.
+fn append_after_overlap(accumulated: &mut Vec<Entry>, new_entries: Vec<Entry>) {
+    let Some(last) = accumulated.last() else {
+        accumulated.extend(new_entries);
+        return;
+    };
+    let last_headword = last.headword.to_lowercase();
+    let overlap_pos = new_entries
+        .iter()
+        .take(OVERLAP_SEARCH_WINDOW)
+        .position(|e| e.headword.to_lowercase() == last_headword);
+    match overlap_pos {
+        Some(pos) => accumulated.extend(new_entries.into_iter().skip(pos + 1)),
+        None => accumulated.extend(new_entries),
+    }
+}
+
+/// How many of a page's own entries, starting at the match point, get
+/// replaced by the column-boundary crop's own reading of that same
+/// span — a fixed, small window rather than something fancier. The one
+/// real failure this guards against produced exactly two corrupted
+/// entries in a row (an incomplete entry immediately followed by a
+/// bogus one invented for its own continuation); a bounded window is
+/// simpler and more predictable than trying to detect exactly where
+/// the corruption ends.
+const COLUMN_FIX_REPLACE_WINDOW: usize = 2;
+
+/// Corrects `page_entries` using `boundary_entries` — the result of
+/// independently re-reading a small crop of just the page's own column
+/// break (`stitch_in_page_column_boundary_crop`). Unlike
+/// `append_after_overlap`, this *replaces* rather than only appends:
+/// the page's own single read already covers the whole page in order,
+/// so the crop's job isn't to supply new content but to correct
+/// whatever the page's own read got wrong right at the column break.
+/// Falls back to the same conservative appending `append_after_overlap`
+/// uses when the page's own read doesn't have a matching headword to
+/// correct at all — better a stray duplicate than lost content.
+fn apply_column_boundary_fix(page_entries: Vec<Entry>, boundary_entries: Vec<Entry>) -> Vec<Entry> {
+    let Some(first) = boundary_entries.first() else {
+        return page_entries;
+    };
+    let first_headword = first.headword.to_lowercase();
+    let Some(start_idx) = page_entries
+        .iter()
+        .position(|e| e.headword.to_lowercase() == first_headword)
+    else {
+        // The crop's own result has no connection at all to anything
+        // the page's own read already found — confirmed in a real run
+        // to mean the crop (a tiny, information-poor sliver) simply
+        // hallucinated unrelated content, not that it found something
+        // real the page's own read missed. Leave page_entries alone
+        // rather than pollute it with that.
+        return page_entries;
+    };
+    let end_idx = (start_idx + COLUMN_FIX_REPLACE_WINDOW).min(page_entries.len());
+    let mut result = page_entries;
+    result.splice(start_idx..end_idx, boundary_entries);
+    result
+}
+
+/// Reads one page, then corrects its own column break using a small
+/// crop of just that break — see `apply_column_boundary_fix`'s doc
+/// comment for why this corrects rather than appends. Used for every
+/// page, whether it's the only image given or one of several, since
+/// the bug this guards against lives within a single page's own two
+/// columns, independent of how many pages there are.
+fn segment_page_with_column_fix(
+    engine: &mut VisionEngine,
+    image_path: &Path,
+    scratch_dir: &Path,
+) -> Result<Vec<Entry>, String> {
+    let page_entries = segment_page(engine, image_path)?;
+    let crop_name = image_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("page");
+    let crop_path = scratch_dir.join(format!("column-boundary-crop-{crop_name}.png"));
+    let crop = stitch_in_page_column_boundary_crop(image_path, &crop_path)?;
+    let boundary_entries = segment_page(engine, &crop)?;
+    println!(
+        "  found {} headword(s) in this page's own column-break crop",
+        boundary_entries.len()
+    );
+    Ok(apply_column_boundary_fix(page_entries, boundary_entries))
+}
+
+/// A page's rough position in the dictionary's own alphabetic order,
+/// derived from its own already-transcribed entries — not a literal
+/// printed page number, which a real phone photo won't always show
+/// legibly, and which would be redundant anyway: a dictionary is
+/// alphabetically ordered by definition, so this is a complete,
+/// sufficient ordering signal entirely on its own.
+///
+/// Prefers the *second* entry over the first: if a page starts mid-entry
+/// (continuation runover from the previous page, with no bold headword
+/// of its own), that first transcribed "entry" is exactly the kind of
+/// mislabeled fragment already confirmed to appear at page/column
+/// boundaries — the second entry is reliably a genuine, fully-visible
+/// headword instead, and close enough alphabetically either way.
+fn page_sort_key(entries: &[Entry]) -> Option<String> {
+    entries
+        .get(1)
+        .or_else(|| entries.first())
+        .map(|e| e.headword.to_lowercase())
+}
+
+/// Lets the caller supply photographed pages in any order — phone photos
+/// are often named by capture time, not page sequence — by reading each
+/// one independently first and sorting by its own rough alphabetic
+/// position (`page_sort_key`).
+///
+/// This does mean every page gets read twice in total (once here, once
+/// more as part of a pair in `run_segment_sliding_window`) — a deliberate
+/// cost, not an oversight: determining order from content needs the same
+/// kind of read the boundary-correctness pass does, and reusing the
+/// already-proven segment prompt for it is safer than inventing a new,
+/// lighter-weight one — this project has already confirmed more than
+/// once that small prompt variations can make this model behave
+/// unpredictably.
+fn order_images_by_page_content(
+    engine: &mut VisionEngine,
+    image_paths: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
+    let mut keyed = Vec::with_capacity(image_paths.len());
+    for image_path in image_paths {
+        println!(
+            "skimming {} to determine its page order...",
+            image_path.display()
+        );
+        let entries = segment_page(engine, image_path)?;
+        let key = page_sort_key(&entries);
+        println!(
+            "  sorts near \"{}\"",
+            key.as_deref().unwrap_or("(unknown — no entries found)")
+        );
+        keyed.push((image_path.clone(), key));
+    }
+    keyed.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(keyed.into_iter().map(|(path, _)| path).collect())
+}
+
+/// Processes N pages as N-1 *overlapping* pairs — (page 1, page 2), (page
+/// 2, page 3), ... — rather than stitching all N into one ever-growing
+/// composite. A single mega-composite doesn't scale: fed a real
+/// thousand-page document, its own visual footprint (and the output
+/// needed to transcribe all of it) would blow well past any practical
+/// context window long before reaching the end. A pair call only ever
+/// costs as much as two pages, no matter how many pages the whole
+/// document has. `image_paths` must already be in page order — see
+/// `order_images_by_page_content`.
+///
+/// Each page is read independently at full resolution (reliable all
+/// session), and, between each pair, a small crop of just the boundary
+/// between them (`stitch_boundary_crop`) is read too, to catch whatever
+/// straddles the join. `append_after_overlap` merges each page's own
+/// entries with the boundary crop's, then with the next page's own
+/// entries. This replaced an earlier design that stitched each pair's
+/// *whole* pages into one composite: that composite's extreme aspect
+/// ratio (two tall pages stacked) reproducibly crashed Qwen2.5-VL's
+/// vision path in llama.cpp with "failed to find a memory slot" — a
+/// known, documented upstream difficulty with this model family's
+/// tiling (the maintainers' own fix caps Qwen2VL/Pixtral inputs for
+/// exactly this reason) — confirmed to be about the composite's shape,
+/// not raw image size: downscaling it changed nothing, while ordinary
+/// single-page photos and small boundary crops, at a similar or even
+/// higher token count, never hit it.
+fn run_segment_sliding_window_cropped(
+    engine: &mut VisionEngine,
+    image_paths: &[PathBuf],
+    entries_out_file: &Path,
+) -> Result<Vec<Entry>, String> {
+    let scratch_dir = entries_out_file.parent().unwrap_or_else(|| Path::new("."));
+    let mut all_entries: Vec<Entry> = Vec::new();
+    for (i, image_path) in image_paths.iter().enumerate() {
+        println!(
+            "reading page {} ({}/{})...",
+            i + 1,
+            i + 1,
+            image_paths.len()
+        );
+        let found = segment_page_with_column_fix(engine, image_path, scratch_dir)?;
+        println!("  found {} headword(s)", found.len());
+        append_after_overlap(&mut all_entries, found);
+
+        if let Some(next_image_path) = image_paths.get(i + 1) {
+            println!(
+                "reading the boundary between pages {} and {}...",
+                i + 1,
+                i + 2
+            );
+            let crop_path = scratch_dir.join(format!("boundary-crop-{}-{}.png", i + 1, i + 2));
+            let crop = stitch_boundary_crop(image_path, next_image_path, &crop_path)?;
+            let boundary_found = segment_page(engine, &crop)?;
+            println!(
+                "  found {} headword(s) in the boundary crop",
+                boundary_found.len()
+            );
+            append_after_overlap(&mut all_entries, boundary_found);
+        }
+    }
+    Ok(all_entries)
+}
+
 pub fn run_segment(
     model_path: &Path,
     mmproj_path: &Path,
@@ -57,16 +477,22 @@ pub fn run_segment(
     println!("loading segment model from {} ...", model_path.display());
     let mut engine = VisionEngine::load(model_path, mmproj_path)?;
 
-    let mut entries = Vec::new();
-    for image_path in image_paths {
-        println!("reading {} ...", image_path.display());
-        let found = segment_page(&mut engine, image_path)?;
-        println!("  found {} headword(s)", found.len());
-        entries.extend(found);
-    }
     if let Some(parent) = entries_out_file.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+
+    let entries = if image_paths.len() > 1 {
+        let ordered = order_images_by_page_content(&mut engine, image_paths)?;
+        run_segment_sliding_window_cropped(&mut engine, &ordered, entries_out_file)?
+    } else {
+        let first_image = image_paths.first().ok_or("no images given")?;
+        println!("reading {} ...", first_image.display());
+        let scratch_dir = entries_out_file.parent().unwrap_or_else(|| Path::new("."));
+        let found = segment_page_with_column_fix(&mut engine, first_image, scratch_dir)?;
+        println!("  found {} headword(s)", found.len());
+        found
+    };
+
     let json = serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())?;
     std::fs::write(entries_out_file, json).map_err(|e| e.to_string())?;
     println!(
@@ -75,4 +501,225 @@ pub fn run_segment(
         entries_out_file.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(headword: &str, raw_entry: &str) -> Entry {
+        Entry {
+            headword: headword.to_string(),
+            raw_entry: raw_entry.to_string(),
+        }
+    }
+
+    #[test]
+    fn cap_total_pixels_leaves_a_small_image_unchanged() {
+        let img = DynamicImage::new_rgb8(100, 200);
+        let capped = cap_total_pixels(img, 1_000_000);
+        assert_eq!((capped.width(), capped.height()), (100, 200));
+    }
+
+    #[test]
+    fn cap_total_pixels_downscales_an_oversized_image_preserving_aspect_ratio() {
+        let img = DynamicImage::new_rgb8(2000, 4000); // 8,000,000 px, 1:2 ratio
+        let capped = cap_total_pixels(img, 2_000_000);
+        let total = u64::from(capped.width()) * u64::from(capped.height());
+        assert!(total <= 2_000_000, "capped total was {total}");
+        // Aspect ratio preserved (within integer rounding).
+        assert!((f64::from(capped.height()) / f64::from(capped.width()) - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn crop_column_splits_the_image_in_half_with_no_gap_or_overlap() {
+        let img = DynamicImage::new_rgb8(1000, 2000);
+        let left = crop_column(&img, true);
+        let right = crop_column(&img, false);
+        assert_eq!(left.height(), 2000);
+        assert_eq!(right.height(), 2000);
+        assert_eq!(left.width() + right.width(), 1000);
+        assert_eq!(left.width(), 500);
+    }
+
+    #[test]
+    fn column_boundary_fix_replaces_a_corrupted_pair_with_the_crops_own_reading() {
+        // Real failure: the page's own read produced a truncated "absurd"
+        // immediately followed by a bogus "kanga" entry invented for its
+        // own continuation, while the column-boundary crop correctly
+        // read the same span as one complete "absurd" entry.
+        let page_entries = vec![
+            entry("abstruse", "..."),
+            entry("absurd", "(unreasonable) -ngafanele-"),
+            entry("kanga", "(foolish, ridiculous) -nobudenge;"),
+            entry("abundant", "..."),
+        ];
+        let boundary_entries = vec![entry(
+            "absurd",
+            "(unreasonable) -ngafanele-kanga; (foolish, ridiculous) -nobudenge;",
+        )];
+        let fixed = apply_column_boundary_fix(page_entries, boundary_entries);
+        assert_eq!(
+            fixed.iter().map(|e| &e.headword).collect::<Vec<_>>(),
+            ["abstruse", "absurd", "abundant"]
+        );
+        assert_eq!(
+            fixed[1].raw_entry,
+            "(unreasonable) -ngafanele-kanga; (foolish, ridiculous) -nobudenge;"
+        );
+    }
+
+    #[test]
+    fn column_boundary_fix_leaves_page_entries_untouched_when_the_crop_found_nothing_matching() {
+        // A real run: a column-break crop with little real content to
+        // work with hallucinated headwords unrelated to anything on the
+        // page — trusting them polluted an otherwise-correct page with
+        // garbage. None of the crop's own entries matching anything the
+        // page's own read already has is the cheap, confirmed-necessary
+        // signal for that, so the page is left alone instead.
+        let page_entries = vec![entry("abode", "...")];
+        let boundary_entries = vec![entry("zebra", "...")];
+        let fixed = apply_column_boundary_fix(page_entries, boundary_entries);
+        assert_eq!(
+            fixed.iter().map(|e| &e.headword).collect::<Vec<_>>(),
+            ["abode"]
+        );
+    }
+
+    #[test]
+    fn column_boundary_fix_is_a_no_op_when_the_crop_found_nothing() {
+        let page_entries = vec![entry("abode", "...")];
+        let fixed = apply_column_boundary_fix(page_entries, Vec::new());
+        assert_eq!(
+            fixed.iter().map(|e| &e.headword).collect::<Vec<_>>(),
+            ["abode"]
+        );
+    }
+
+    #[test]
+    fn page_sort_key_prefers_the_second_entry_over_a_runover_first_entry() {
+        let entries = vec![
+            entry("(encourage vice, crime)", "orphaned continuation text"),
+            entry("abeyance", "..."),
+            entry("abhor", "..."),
+        ];
+        assert_eq!(page_sort_key(&entries).as_deref(), Some("abeyance"));
+    }
+
+    #[test]
+    fn page_sort_key_falls_back_to_the_first_entry_when_theres_only_one() {
+        let entries = vec![entry("abode", "...")];
+        assert_eq!(page_sort_key(&entries).as_deref(), Some("abode"));
+    }
+
+    #[test]
+    fn page_sort_key_is_none_for_a_page_with_no_entries() {
+        assert_eq!(page_sort_key(&[]), None);
+    }
+
+    #[test]
+    fn appends_everything_when_accumulated_is_empty() {
+        let mut accumulated = Vec::new();
+        append_after_overlap(
+            &mut accumulated,
+            vec![entry("abode", "..."), entry("abolish", "...")],
+        );
+        assert_eq!(
+            accumulated.iter().map(|e| &e.headword).collect::<Vec<_>>(),
+            ["abode", "abolish"]
+        );
+    }
+
+    #[test]
+    fn skips_the_redundant_overlap_and_appends_only_whats_new() {
+        // Pair (P1, P2) found: abode, abolish, abominate.
+        let mut accumulated = vec![
+            entry("abode", "..."),
+            entry("abolish", "..."),
+            entry("abominate", "..."),
+        ];
+        // Pair (P2, P3) redundantly re-finds abominate (the last page-2
+        // entry, now with both its neighbors in view) before continuing
+        // into page 3's own entries.
+        append_after_overlap(
+            &mut accumulated,
+            vec![
+                entry("abominate", "..."),
+                entry("aboriginal", "..."),
+                entry("aborigines", "..."),
+            ],
+        );
+        assert_eq!(
+            accumulated.iter().map(|e| &e.headword).collect::<Vec<_>>(),
+            ["abode", "abolish", "abominate", "aboriginal", "aborigines"]
+        );
+    }
+
+    #[test]
+    fn matches_headwords_case_insensitively() {
+        let mut accumulated = vec![entry("Abode", "...")];
+        append_after_overlap(
+            &mut accumulated,
+            vec![entry("abode", "..."), entry("abolish", "...")],
+        );
+        assert_eq!(
+            accumulated.iter().map(|e| &e.headword).collect::<Vec<_>>(),
+            ["Abode", "abolish"]
+        );
+    }
+
+    #[test]
+    fn appends_everything_rather_than_drop_content_when_no_overlap_is_found() {
+        let mut accumulated = vec![entry("abode", "...")];
+        append_after_overlap(&mut accumulated, vec![entry("zebra", "...")]);
+        assert_eq!(
+            accumulated.iter().map(|e| &e.headword).collect::<Vec<_>>(),
+            ["abode", "zebra"]
+        );
+    }
+
+    #[test]
+    fn ignores_a_distant_coincidental_match_instead_of_dropping_everything_before_it() {
+        // A real run: the boundary crop's last headword ("absurd") also
+        // happened to appear, as a hallucinated duplicate, at position 12
+        // of the next page's own independent 21-entry read — far past
+        // OVERLAP_SEARCH_WINDOW. Trusting that match would have skipped
+        // the 12 genuine entries before it.
+        let mut accumulated = vec![entry("absurd", "...")];
+        append_after_overlap(
+            &mut accumulated,
+            vec![
+                entry("abscess", "..."),
+                entry("abscond", "..."),
+                entry("absent", "..."),
+                entry("absinthe", "..."),
+                entry("absolute", "..."),
+                entry("absolve", "..."),
+                entry("abstain", "..."),
+                entry("abstemious", "..."),
+                entry("abstract", "..."),
+                entry("abstruse", "..."),
+                entry("absurd", "..."),
+                entry("accelerate", "..."),
+            ],
+        );
+        assert_eq!(
+            accumulated.iter().map(|e| &e.headword).collect::<Vec<_>>(),
+            [
+                "absurd",
+                "abscess",
+                "abscond",
+                "absent",
+                "absinthe",
+                "absolute",
+                "absolve",
+                "abstain",
+                "abstemious",
+                "abstract",
+                "abstruse",
+                "absurd",
+                "accelerate",
+            ]
+        );
+    }
 }

@@ -59,6 +59,48 @@ fn n_threads() -> i32 {
     std::thread::available_parallelism().map_or(4, |n| i32::try_from(n.get()).unwrap_or(4))
 }
 
+/// `n_batch` (the max tokens a single prefill `decode()` call may submit
+/// at once) defaults to a value smaller than `n_ctx` and is a *separate*
+/// setting from it — confirmed by a real crash
+/// (`GGML_ASSERT(n_tokens_all <= cparams.n_batch)`) once a prompt long
+/// enough to exceed that default (two dense dictionary entries, for the
+/// boundary-continuation check) was decoded in one prefill. Matching it to
+/// `n_ctx` removes this as a limit anywhere a long prompt gets prefilled
+/// in one shot.
+///
+/// `n_ubatch` (the physical micro-batch size the KV cache allocator
+/// actually uses for `memory->init_batch`, per llama.cpp's own
+/// `llama-context.cpp`) is yet another separate setting, defaulting far
+/// smaller still — confirmed by a real run: even after fixing `n_batch`
+/// and a real `eval_chunks` call correctly submitting a large image as
+/// one batch, generation still failed with "failed to find a memory slot"
+/// immediately afterward, every time, at the same token count regardless
+/// of how large `n_ctx` was set.
+///
+/// Deliberately NOT matched to `n_ctx` the way `n_batch` is: setting it
+/// that large (confirmed in a real run) makes llama.cpp pre-allocate a
+/// Metal compute buffer sized for an `n_ubatch`-token batch *regardless
+/// of how many tokens a given call actually uses* — at `n_ctx` = 16384
+/// that was ~10.9GB, which genuinely ran the GPU out of memory, and even
+/// 8192 still needed ~5.4GB (confirmed identical whether the real image
+/// batch was 3996 or 4050 tokens — the buffer size tracks `n_ubatch`
+/// itself, not actual content size). `n_ubatch` only needs to cover the
+/// single largest batch this module ever actually submits in one
+/// `decode()` call, which is a `VisionEngine` image prefill — real runs
+/// this session needed 3996-4050 tokens for both a single page and a
+/// two-page composite (this model's image-token count doesn't scale
+/// with input resolution the way raw pixel area might suggest) — not
+/// tied to `n_ctx` at all, and sized with real but modest headroom over
+/// that, not an excessive multiple of it.
+const N_UBATCH: u32 = 4608;
+
+fn ctx_params_for(n_ctx: NonZeroU32) -> LlamaContextParams {
+    LlamaContextParams::default()
+        .with_n_ctx(Some(n_ctx))
+        .with_n_batch(n_ctx.get())
+        .with_n_ubatch(N_UBATCH)
+}
+
 /// `gpt-oss` (the decompose model) uses `OpenAI`'s "harmony" response
 /// format: it always reasons in an `analysis` channel before answering in
 /// a `final` channel, and — confirmed in a real run against the full-size
@@ -239,6 +281,60 @@ fn generate_with_lazy_grammar(
     }
 }
 
+/// Tokenizes `prompt` via the model's own chat template (no image) and
+/// runs the eager (schema-from-token-1) generation loop. Used by
+/// `TextEngine::generate`'s no-schema path — not used for `gpt-oss`'s
+/// schema-constrained path, which needs the lazy-trigger workaround in
+/// `generate_with_lazy_grammar` instead. (A pure-text, no-image path on
+/// `VisionEngine` was tried too, for a boundary-continuation judgment in
+/// `segment.rs` — confirmed unreliable for that model in a real run, so
+/// that call now goes through `VisionEngine::generate`'s image+text path
+/// instead, and this helper is `TextEngine`-only again.)
+fn generate_text_eager(
+    model: &LlamaModel,
+    backend: &LlamaBackend,
+    n_ctx: NonZeroU32,
+    prompt: &str,
+    schema: Option<&Value>,
+) -> Result<String, String> {
+    let ctx_params = ctx_params_for(n_ctx);
+    let mut ctx = model
+        .new_context(backend, ctx_params)
+        .map_err(|e| format!("failed to create context: {e}"))?;
+
+    let chat_template = model
+        .chat_template(None)
+        .map_err(|e| format!("chat_template failed: {e:?}"))?;
+    let msg =
+        LlamaChatMessage::new("user".to_string(), prompt.to_string()).map_err(|e| e.to_string())?;
+    let formatted = model
+        .apply_chat_template(&chat_template, &[msg], true)
+        .map_err(|e| format!("apply_chat_template failed: {e:?}"))?;
+
+    let n_ctx_i32 = i32::try_from(n_ctx.get()).map_err(|e| e.to_string())?;
+    let tokens = model.vocab().tokenize(formatted.as_bytes(), true, true);
+    let token_count =
+        i32::try_from(tokens.len()).map_err(|_| "prompt is absurdly long".to_string())?;
+    if token_count >= n_ctx_i32 {
+        return Err(format!(
+            "prompt has {token_count} tokens, which doesn't fit in the {n_ctx}-token context (set IMPORTER_NUM_CTX higher)"
+        ));
+    }
+    let mut batch = LlamaBatch::new(n_ctx.get() as usize, 1);
+    let last_index = token_count - 1;
+    for (i, token) in (0_i32..).zip(tokens) {
+        batch
+            .add(token, i, &[0], i == last_index)
+            .map_err(|e| e.to_string())?;
+    }
+    ctx.decode(&mut batch)
+        .map_err(|e| format!("llama_decode failed on the prompt: {e}"))?;
+
+    let mut sampler = build_sampler(model, schema)?;
+    let n_past = batch.n_tokens();
+    generate_with_workaround(model, &mut ctx, &mut batch, &mut sampler, n_past, n_ctx_i32)
+}
+
 /// A loaded text model, reused across many `generate()` calls within one
 /// pipeline stage — loading a multi-GB GGUF file is far too slow to repeat
 /// per call, so `decompose.rs` loads this once and calls `generate()` once
@@ -263,20 +359,24 @@ impl TextEngine {
     }
 
     pub fn generate(&self, prompt: &str, schema: Option<&Value>) -> Result<String, String> {
-        let ctx_params = LlamaContextParams::default().with_n_ctx(Some(self.n_ctx));
+        // Without the chat template, an instruct-tuned model sees a raw
+        // completion prompt rather than its own chat format, isn't in
+        // "answer this" mode, and under grammar-constrained greedy
+        // decoding takes the path of least resistance — closing a JSON
+        // array immediately as `[]`. Confirmed this was silently
+        // happening (misdiagnosed at the time as a tiny-model capability
+        // limit) until a real end-to-end run against the full-size
+        // production model reproduced the exact same empty-array output.
+        let Some(schema) = schema else {
+            return generate_text_eager(&self.model, &self.backend, self.n_ctx, prompt, None);
+        };
+
+        let ctx_params = ctx_params_for(self.n_ctx);
         let mut ctx = self
             .model
             .new_context(&self.backend, ctx_params)
             .map_err(|e| format!("failed to create context: {e}"))?;
 
-        // Without this, an instruct-tuned model sees a raw completion
-        // prompt rather than its own chat format, isn't in "answer this"
-        // mode, and under grammar-constrained greedy decoding takes the
-        // path of least resistance — closing a JSON array immediately as
-        // `[]`. Confirmed this was silently happening (misdiagnosed at the
-        // time as a tiny-model capability limit) until a real end-to-end
-        // run against the full-size production model reproduced the exact
-        // same empty-array output.
         let chat_template = self
             .model
             .chat_template(None)
@@ -312,30 +412,18 @@ impl TextEngine {
             .map_err(|e| format!("llama_decode failed on the prompt: {e}"))?;
 
         let n_past = batch.n_tokens();
-        if let Some(schema) = schema {
-            let schema_str = serde_json::to_string(schema).map_err(|e| e.to_string())?;
-            let grammar_str = llama_cpp_2::json_schema_to_grammar(&schema_str)
-                .map_err(|e| format!("json_schema_to_grammar failed: {e}"))?;
-            generate_with_lazy_grammar(
-                &self.model,
-                &mut ctx,
-                &mut batch,
-                n_past,
-                n_ctx_i32,
-                &grammar_str,
-                GPT_OSS_FINAL_CHANNEL_TRIGGER,
-            )
-        } else {
-            let mut sampler = build_sampler(&self.model, None)?;
-            generate_with_workaround(
-                &self.model,
-                &mut ctx,
-                &mut batch,
-                &mut sampler,
-                n_past,
-                n_ctx_i32,
-            )
-        }
+        let schema_str = serde_json::to_string(schema).map_err(|e| e.to_string())?;
+        let grammar_str = llama_cpp_2::json_schema_to_grammar(&schema_str)
+            .map_err(|e| format!("json_schema_to_grammar failed: {e}"))?;
+        generate_with_lazy_grammar(
+            &self.model,
+            &mut ctx,
+            &mut batch,
+            n_past,
+            n_ctx_i32,
+            &grammar_str,
+            GPT_OSS_FINAL_CHANNEL_TRIGGER,
+        )
     }
 }
 
@@ -383,7 +471,7 @@ impl VisionEngine {
         image_path: &Path,
         schema: Option<&Value>,
     ) -> Result<String, String> {
-        let ctx_params = LlamaContextParams::default().with_n_ctx(Some(self.n_ctx));
+        let ctx_params = ctx_params_for(self.n_ctx);
         let mut ctx = self
             .model
             .new_context(&self.backend, ctx_params)
@@ -425,11 +513,18 @@ impl VisionEngine {
             .tokenize(input_text, &[&bitmap])
             .map_err(|e| format!("mtmd tokenize failed: {e:?}"))?;
 
-        let n_past = chunks
-            .eval_chunks(&mut self.mtmd_ctx, &mut ctx, 0, 0, 1, true)
-            .map_err(|e| format!("mtmd eval_chunks failed: {e:?}"))?;
-
         let n_ctx_i32 = i32::try_from(self.n_ctx.get()).map_err(|e| e.to_string())?;
+        // The reference mtmd-cli tool passes its own configured n_batch
+        // here, never a literal 1 — confirmed in a real run that a
+        // hardcoded n_batch=1 processes the image one token at a time
+        // (every logged chunk showed "n_tokens_batch = 1") and, on a
+        // large composite image, eventually fails with "failed to find a
+        // memory slot" even at a generously large n_ctx — not a capacity
+        // problem, a fragmentation problem from thousands of sequential
+        // single-token commits instead of real batches.
+        let n_past = chunks
+            .eval_chunks(&mut self.mtmd_ctx, &mut ctx, 0, 0, n_ctx_i32, true)
+            .map_err(|e| format!("mtmd eval_chunks failed: {e:?}"))?;
         let mut sampler = build_sampler(&self.model, schema)?;
         let mut batch = LlamaBatch::new(self.n_ctx.get() as usize, 1);
         generate_with_workaround(
