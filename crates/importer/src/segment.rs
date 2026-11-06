@@ -39,7 +39,7 @@ fn cap_total_pixels(img: DynamicImage, max_pixels: u64) -> DynamicImage {
     img.resize_exact(new_width, new_height, FilterType::Lanczos3)
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Entry {
     pub headword: String,
     pub raw_entry: String,
@@ -153,7 +153,14 @@ fn compose_vertical_stack(images: Vec<DynamicImage>, out_path: &Path) -> Result<
 /// to never approach the large-image failure `MAX_COMPOSITE_PIXELS`
 /// works around in `stitch_images` — this crop is meant to avoid that
 /// problem by construction instead, by never getting large in the first
-/// place.
+/// place. Tried raising this to 0.35 to fully cover one real, unusually
+/// long entry ("about, prep.") that 0.2 cuts off partway through — made
+/// things worse, not better: a real run on the larger crop sent this
+/// model into a repetition/garbling failure mode (a looped, corrupted
+/// entry, with both "about" and "above" lost entirely) rather than
+/// just reading further. Left at 0.2; a long entry getting cut off at
+/// the crop's edge is a known, accepted limitation, not a bug to chase
+/// by enlarging the image further.
 const BOUNDARY_CROP_FRACTION: f64 = 0.2;
 
 #[allow(clippy::cast_precision_loss)]
@@ -244,6 +251,165 @@ fn stitch_in_page_column_boundary_crop(
     compose_vertical_stack(slices, out_path)
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn crop_band_fraction(img: &DynamicImage, start_fraction: f64, end_fraction: f64) -> DynamicImage {
+    let height = img.height();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let start_y = ((f64::from(height) * start_fraction).round() as u32).min(height);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let end_y = ((f64::from(height) * end_fraction).round() as u32).clamp(start_y, height);
+    img.crop_imm(0, start_y, img.width(), (end_y - start_y).max(1))
+}
+
+/// Where each continuation crop (see `extend_truncated_boundary_entry`)
+/// looks, as fractions of the right column's own height from its top —
+/// a short, fixed list of bands rather than one bigger crop or a
+/// computed stride. Each band is the same modest size already proven
+/// safe for `stitch_in_page_column_boundary_crop` (enlarging a single
+/// crop to reach further down the column, confirmed in a real run, sent
+/// this model into a repetition/garbling failure instead of just
+/// reading more — see `BOUNDARY_CROP_FRACTION`'s own doc comment), just
+/// moved further down the column instead of grown; each one overlaps
+/// the end of the previous band slightly, so there's always a bit of
+/// shared text for continuity rather than a hard seam. Two bands is
+/// already enough to fully cover the one real case this targets
+/// ("about, prep.", which only needed to reach roughly a third of the
+/// way down the next column).
+const CONTINUATION_CROP_BANDS: &[(f64, f64)] = &[(0.15, 0.45), (0.40, 0.70)];
+
+/// Like `stitch_in_page_column_boundary_crop`, but reads further down
+/// the same (right) column instead of the column break itself — see
+/// `extend_truncated_boundary_entry`.
+fn stitch_in_page_continuation_crop(
+    image_path: &Path,
+    out_path: &Path,
+    band: (f64, f64),
+) -> Result<PathBuf, String> {
+    let img = image::open(image_path)
+        .map_err(|e| format!("failed to open image {}: {e}", image_path.display()))?;
+    let slice = crop_band_fraction(&crop_column(&img, false), band.0, band.1);
+    compose_vertical_stack(vec![slice], out_path)
+}
+
+/// If `boundary_entries`' own last entry still looks cut off (per
+/// `ends_with_terminal_punctuation`, checked *after* folding away any
+/// unanchored trailing fragments the same way `apply_column_boundary_fix`
+/// itself will — otherwise a fragment like "apha" that happens to end in
+/// real punctuation of its own would hide that the entry it actually
+/// belongs to, "about, prep.", is still incomplete), reads one or two
+/// further bands down the same column (`CONTINUATION_CROP_BANDS`) and
+/// appends each one's own text onto `boundary_entries`' real last
+/// element — not a temporary folded copy — so `apply_column_boundary_fix`'s
+/// own fold step still sees, and correctly merges, the extended text
+/// exactly as it would have if the first crop had simply read further.
+///
+/// Stops as soon as a continuation crop's first entry is a *different*,
+/// genuinely anchored headword (found elsewhere in `page_entries`):
+/// that means this band has moved past the entry being extended into
+/// whatever comes next for real, not that there's more of it to read.
+/// An unanchored pseudo-headword, or a repeat of the very entry being
+/// extended, both mean "keep going" — the continuation crop starts
+/// mid-sentence just like the first one does, so the same hallucinated-
+/// headword risk applies and is handled the same way.
+///
+/// Confirmed in a real run on "about, prep." to genuinely reach the
+/// entry's true end, which a single enlarged crop couldn't do without
+/// degrading — but not cleanly: each band deliberately overlaps the
+/// previous one for context, and the two independent reads of that
+/// shared sliver came back with slightly different punctuation (a
+/// colon one time, a semicolon the next), so the text itself ends up
+/// with a duplicated clause that a plain substring check can't catch
+/// and trim. The two reads can also skip different amounts of a dense
+/// passage, leaving a gap between what one band's own read stopped at
+/// and where the next one happened to pick back up. Left as-is: a
+/// stray duplicate clause is the same category of harmless redundancy
+/// `decompose`'s own dedup logic already absorbs downstream, and a
+/// dropped middle clause is the same already-accepted content-skipping
+/// limitation this model has on any sufficiently dense entry, not
+/// something this mechanism makes worse.
+fn extend_truncated_boundary_entry(
+    engine: &mut VisionEngine,
+    image_path: &Path,
+    page_entries: &[Entry],
+    scratch_dir: &Path,
+    crop_name: &str,
+    mut boundary_entries: Vec<Entry>,
+) -> Result<Vec<Entry>, String> {
+    for (attempt, band) in CONTINUATION_CROP_BANDS.iter().enumerate() {
+        let folded_preview =
+            fold_unanchored_boundary_entries(page_entries, boundary_entries.clone());
+        let Some(target) = folded_preview.last() else {
+            break;
+        };
+        // Real case ("about, prep."): the crop's own generation ran out
+        // mid-prose, but happened to land right after a semicolon
+        // separating two of the entry's sub-senses — a locally
+        // legitimate-looking clause boundary indistinguishable from a
+        // real full stop by punctuation alone. Only on the very first
+        // attempt, also treat the crop's own *raw*, pre-fold last entry
+        // being unanchored as a sign of exactly that: a real crop ends
+        // on a genuine next headword, not an orphaned fragment folded
+        // away by `fold_unanchored_boundary_entries`. Limited to the
+        // first attempt so a later, genuinely complete continuation
+        // crop can still end the loop on its own punctuation alone,
+        // rather than this older signal forcing another fetch anyway.
+        let crop_itself_looks_cut_off =
+            attempt == 0 && raw_last_entry_is_unanchored(page_entries, &boundary_entries);
+        if ends_with_terminal_punctuation(&target.raw_entry) && !crop_itself_looks_cut_off {
+            break;
+        }
+        let target_headword = target.headword.to_lowercase();
+        let crop_path = scratch_dir.join(format!("continuation-crop-{attempt}-{crop_name}.png"));
+        let crop = stitch_in_page_continuation_crop(image_path, &crop_path, *band)?;
+        let continuation_entries = segment_page(engine, &crop)?;
+        println!(
+            "  found {} headword(s) in continuation crop {attempt} for \"{target_headword}\"",
+            continuation_entries.len()
+        );
+        let Some(first) = continuation_entries.first() else {
+            break;
+        };
+        if continuation_crop_moved_past_target(page_entries, &target_headword, &first.headword) {
+            break;
+        }
+        if let Some(last) = boundary_entries.last_mut() {
+            last.raw_entry = format!("{} {}", last.raw_entry.trim_end(), first.raw_entry.trim());
+        }
+    }
+    Ok(boundary_entries)
+}
+
+/// A continuation crop's first entry means "keep going, this is still
+/// the entry being extended" unless it's a *different*, genuinely
+/// anchored headword — see `extend_truncated_boundary_entry`'s own doc
+/// comment for why an unanchored pseudo-headword, or a repeat of the
+/// target entry's own headword, don't count as moving past it.
+fn continuation_crop_moved_past_target(
+    page_entries: &[Entry],
+    target_headword: &str,
+    first_continuation_headword: &str,
+) -> bool {
+    let first_continuation_headword = first_continuation_headword.to_lowercase();
+    first_continuation_headword != target_headword
+        && page_entries
+            .iter()
+            .any(|e| e.headword.to_lowercase() == first_continuation_headword)
+}
+
+/// A real, complete column-boundary crop ends on a genuine next
+/// headword the page's own read also found — one `fold_unanchored_boundary_entries`
+/// leaves standing on its own, rather than folding away. If the crop's
+/// own *raw*, pre-fold last entry is unanchored instead, its generation
+/// was still describing an ongoing, unfinished entry when the crop
+/// ran out, whatever punctuation character it happened to stop on.
+fn raw_last_entry_is_unanchored(page_entries: &[Entry], boundary_entries: &[Entry]) -> bool {
+    boundary_entries.last().is_some_and(|last| {
+        !page_entries
+            .iter()
+            .any(|e| e.headword.to_lowercase() == last.headword.to_lowercase())
+    })
+}
+
 /// How many of `new_entries`' leading items to search for the overlap
 /// boundary — deliberately not the whole list. A genuine overlap is
 /// `new_entries` re-transcribing content physically adjacent to the
@@ -313,36 +479,111 @@ const COLUMN_FIX_MIN_REPLACE_WINDOW: usize = 2;
 /// recurrence — dictionaries do sometimes repeat a headword for a
 /// distinct sense — which would incorrectly delete real, unrelated
 /// entries in between.
-fn apply_column_boundary_fix(page_entries: Vec<Entry>, boundary_entries: Vec<Entry>) -> Vec<Entry> {
-    let Some(first) = boundary_entries.first() else {
+/// A hallucinated pseudo-headword (see `apply_column_boundary_fix` below)
+/// isn't only possible as the crop's very first entry — a real run
+/// produced one mid-sequence too ("apha", lifted from the Xhosa gloss
+/// text of the entry right before it, not an actual headword). Fold any
+/// boundary entry that doesn't correspond to a real headword found
+/// elsewhere on the page back into whichever entry precedes it, rather
+/// than let it stand as its own wrongly-headworded entry.
+fn fold_unanchored_boundary_entries(
+    page_entries: &[Entry],
+    boundary_entries: Vec<Entry>,
+) -> Vec<Entry> {
+    let mut result: Vec<Entry> = Vec::with_capacity(boundary_entries.len());
+    for entry in boundary_entries {
+        let is_anchored = page_entries
+            .iter()
+            .any(|e| e.headword.to_lowercase() == entry.headword.to_lowercase());
+        if !is_anchored && let Some(previous) = result.last_mut() {
+            previous.raw_entry = format!(
+                "{} {}",
+                previous.raw_entry.trim_end(),
+                entry.raw_entry.trim()
+            );
+            continue;
+        }
+        result.push(entry);
+    }
+    result
+}
+
+fn apply_column_boundary_fix(page_entries: Vec<Entry>, boundary_entries: &[Entry]) -> Vec<Entry> {
+    // The crop sometimes starts mid-sentence with no real bold headword
+    // to anchor it, and the model invents a pseudo-headword from
+    // whatever word it saw first — confirmed in a real run ("ezininzi",
+    // lifted mid-word from an unrelated continuation). Skip any of the
+    // crop's own leading entries that don't match anything the page's
+    // own read already found, rather than giving up entirely just
+    // because the very first one doesn't match.
+    let Some(first_matched_idx) = boundary_entries.iter().position(|b| {
+        let bh = b.headword.to_lowercase();
+        page_entries.iter().any(|e| e.headword.to_lowercase() == bh)
+    }) else {
+        // None of the crop's entries connect to anything the page's own
+        // read already found — confirmed in a real run to mean the crop
+        // (a tiny, information-poor sliver) simply hallucinated unrelated
+        // content, not that it found something real the page's own read
+        // missed. Leave page_entries alone rather than pollute it with
+        // that.
         return page_entries;
     };
-    let first_headword = first.headword.to_lowercase();
+    let trimmed_boundary_entries = boundary_entries[first_matched_idx..].to_vec();
+    // Take the count *before* folding away unanchored fragments below —
+    // a real run showed this collapsing two raw crop entries ("about"
+    // plus a trailing hallucinated "apha") down to one, which must not
+    // be confused with the single-entry-crop case the floor just below
+    // exists for (where the crop only ever had the one entry to begin
+    // with).
+    let raw_boundary_entry_count = trimmed_boundary_entries.len();
+    let boundary_entries =
+        fold_unanchored_boundary_entries(&page_entries, trimmed_boundary_entries);
+    let first_headword = boundary_entries[0].headword.to_lowercase();
+    // A dictionary does sometimes repeat a headword for a distinct,
+    // unrelated sense elsewhere on the page — confirmed in a real run
+    // ("about" appearing three times) that the *last* occurrence, not
+    // the first, is the one actually adjacent to the column break this
+    // crop is reading: the crop is always anchored at the tail end of
+    // the page's own entries, so an earlier, unrelated recurrence of
+    // the same headword is never the right anchor.
     let Some(start_idx) = page_entries
         .iter()
-        .position(|e| e.headword.to_lowercase() == first_headword)
+        .rposition(|e| e.headword.to_lowercase() == first_headword)
     else {
-        // The crop's own result has no connection at all to anything
-        // the page's own read already found — confirmed in a real run
-        // to mean the crop (a tiny, information-poor sliver) simply
-        // hallucinated unrelated content, not that it found something
-        // real the page's own read missed. Leave page_entries alone
-        // rather than pollute it with that.
         return page_entries;
     };
     let boundary_headwords: std::collections::HashSet<String> = boundary_entries
         .iter()
         .map(|e| e.headword.to_lowercase())
         .collect();
-    let search_limit = (start_idx + boundary_entries.len() + COLUMN_FIX_MIN_REPLACE_WINDOW)
+    let search_limit = (start_idx + raw_boundary_entry_count + COLUMN_FIX_MIN_REPLACE_WINDOW)
         .min(page_entries.len());
     let matched_end = page_entries[start_idx..search_limit]
         .iter()
         .rposition(|e| boundary_headwords.contains(&e.headword.to_lowercase()))
         .map_or(start_idx, |rel_pos| start_idx + rel_pos + 1);
-    let end_idx = (start_idx + COLUMN_FIX_MIN_REPLACE_WINDOW)
-        .max(matched_end)
-        .min(page_entries.len());
+    // The minimum-window floor exists for the single-entry crop case:
+    // confirmed in a real run that the crop can collapse a page's own
+    // truncated entry plus the bogus continuation entry it spawned
+    // (unrelated headword, not found by `matched_end`'s own search)
+    // into one correct entry, so a floor past `matched_end` is needed
+    // to sweep that bogus entry up too. With more than one boundary
+    // entry, `matched_end` already has multiple real headwords to
+    // search for and is a reliable, tighter bound on its own —
+    // confirmed in another real run that applying the floor
+    // unconditionally here swallows the next, perfectly legitimate
+    // entry when it happens to immediately follow the match. This must
+    // key off the *raw*, pre-fold count — confirmed in yet another real
+    // run ("about" plus a trailing hallucinated "apha" folding down to
+    // one entry) that keying it off the post-fold count wrongly treats
+    // that case as the single-entry-crop one and swallows the next
+    // legitimate entry anyway.
+    let end_idx = if raw_boundary_entry_count == 1 {
+        (start_idx + COLUMN_FIX_MIN_REPLACE_WINDOW).max(matched_end)
+    } else {
+        matched_end
+    }
+    .min(page_entries.len());
     let mut result = page_entries;
     result.splice(start_idx..end_idx, boundary_entries);
     result
@@ -431,7 +672,15 @@ fn segment_page_with_column_fix(
         "  found {} headword(s) in this page's own column-break crop",
         boundary_entries.len()
     );
-    Ok(apply_column_boundary_fix(page_entries, boundary_entries))
+    let boundary_entries = extend_truncated_boundary_entry(
+        engine,
+        image_path,
+        &page_entries,
+        scratch_dir,
+        crop_name,
+        boundary_entries,
+    )?;
+    Ok(apply_column_boundary_fix(page_entries, &boundary_entries))
 }
 
 /// A page's rough position in the dictionary's own alphabetic order,
@@ -560,6 +809,164 @@ fn run_segment_sliding_window_cropped(
     Ok(all_entries)
 }
 
+/// A real run surfaced an entry whose `raw_entry` began with an open
+/// paren — a dangling sense continuation (e.g. "(encourage vice,
+/// crime) ...") that a column-boundary crop had split off into its
+/// own, wrongly-headworded entry ("aboard") instead of recognising it
+/// as the rest of whatever entry ("abet") was still open when the
+/// column broke. Confirmed across a real 68-entry corpus: every other
+/// entry's `raw_entry` begins with either its own headword or a
+/// part-of-speech abbreviation, never a bare '(' — so this is a safe,
+/// unambiguous signal to fold the fragment back into the entry
+/// immediately before it, rather than leave it standalone under a
+/// headword it doesn't belong to.
+fn merge_leading_parenthetical_continuations(entries: Vec<Entry>) -> Vec<Entry> {
+    let mut result: Vec<Entry> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.raw_entry.trim_start().starts_with('(')
+            && let Some(previous) = result.last_mut()
+        {
+            previous.raw_entry = format!(
+                "{} {}",
+                previous.raw_entry.trim_end(),
+                entry.raw_entry.trim()
+            );
+            continue;
+        }
+        result.push(entry);
+    }
+    result
+}
+
+/// A real run surfaced an entry ("absurd") whose `raw_entry` was cut off
+/// mid-word, with no terminal punctuation at all — the page's own read
+/// then invented a new headword from whatever word came next for what
+/// is really just the rest of that same truncated entry (observed as
+/// "kanga" in one run and, confirmed in a *different* run of the same
+/// photo, "accelerate" — a real headword that also exists correctly
+/// elsewhere on the same page, so a real-headword check alone can't
+/// catch this). Checked against the real 67/68-entry corpus across four
+/// separate runs: every single other entry's `raw_entry` ends in '.',
+/// ';', ',' or ')' — so the absence of one of those is a safe signal
+/// that an entry was cut short and the entry right after it is really
+/// its own continuation, whatever headword that entry claims.
+fn ends_with_terminal_punctuation(raw_entry: &str) -> bool {
+    raw_entry.trim_end().ends_with(['.', ';', ',', ')'])
+}
+
+fn merge_entries_with_no_terminal_punctuation(entries: Vec<Entry>) -> Vec<Entry> {
+    let mut result: Vec<Entry> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let is_continuation = result
+            .last()
+            .is_some_and(|previous: &Entry| !ends_with_terminal_punctuation(&previous.raw_entry));
+        if is_continuation {
+            let previous = result.last_mut().expect("checked by is_continuation above");
+            previous.raw_entry = format!(
+                "{} {}",
+                previous.raw_entry.trim_end(),
+                entry.raw_entry.trim()
+            );
+            continue;
+        }
+        result.push(entry);
+    }
+    result
+}
+
+/// Any entry still failing `ends_with_terminal_punctuation` after
+/// `merge_entries_with_no_terminal_punctuation` has already folded in
+/// everything foldable genuinely has nothing left to merge with — a
+/// real case of this ("about, prep.", "abrupt") is a page- or
+/// crop-edge cutting the entry off mid-sentence with no more of the
+/// dictionary available to read, not a mislabeling bug a merge could
+/// fix. Surfacing these for a human to glance at, instead of letting
+/// them ship silently indistinguishable from a complete entry, is the
+/// whole point — this never tries to fix them itself.
+fn truncated_entry_indices(entries: &[Entry]) -> Vec<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !ends_with_terminal_punctuation(&e.raw_entry))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Strips the Latin accent marks a dictionary headword occasionally
+/// carries on a loanword (e.g. "abbé") down to their plain base letter.
+/// Deliberately a small hand-written table rather than pulling in a
+/// general Unicode-normalization dependency: this book's headwords are
+/// English (plus the odd accented loanword), not a script with
+/// independent collation rules of its own, so this narrow table covers
+/// the real case without the extra weight. Matters for
+/// `headword_order_anomalies`: comparing raw codepoints instead would
+/// wrongly flag "abbé" as sorting *after* "abbess" (since 'é' has a
+/// higher codepoint than any plain ASCII letter), a real false positive
+/// confirmed while investigating this session's "accelerate" case.
+fn strip_latin_accents(c: char) -> char {
+    match c {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',
+        'è' | 'é' | 'ê' | 'ë' => 'e',
+        'ì' | 'í' | 'î' | 'ï' => 'i',
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' => 'o',
+        'ù' | 'ú' | 'û' | 'ü' => 'u',
+        'ý' | 'ÿ' => 'y',
+        'ñ' => 'n',
+        'ç' => 'c',
+        other => other,
+    }
+}
+
+fn diacritic_insensitive_lowercase(s: &str) -> String {
+    s.to_lowercase().chars().map(strip_latin_accents).collect()
+}
+
+/// A dictionary's entries are, structurally, one long alphabetically
+/// non-decreasing sequence — the same headword repeated for a distinct
+/// sense is fine (not a decrease), but a *different* headword sorting
+/// before the one right before it isn't. This is exactly the signal
+/// that caught this session's real "accelerate" bug by hand: it sorted
+/// in between "absurd" and "abundant", where it has no business being.
+/// Returns the index of every entry whose headword sorts strictly
+/// before the entry immediately before it, for a human to take a
+/// second look at — this never auto-fixes anything itself, since (as
+/// that same case showed) figuring out *which* of the two entries is
+/// actually the wrong one needs real investigation, not just the fact
+/// that the order broke.
+fn headword_order_anomalies(entries: &[Entry]) -> Vec<usize> {
+    let mut anomalies = Vec::new();
+    for i in 1..entries.len() {
+        let previous = diacritic_insensitive_lowercase(&entries[i - 1].headword);
+        let current = diacritic_insensitive_lowercase(&entries[i].headword);
+        if current < previous {
+            anomalies.push(i);
+        }
+    }
+    anomalies
+}
+
+#[derive(serde::Serialize)]
+struct ReviewNote<'a> {
+    headword: &'a str,
+    raw_entry: &'a str,
+    reason: &'static str,
+}
+
+/// The sidecar path a run's review notes (if any) are written to —
+/// alongside `entries_out_file`, not inside it: the two are different
+/// shapes serving different readers (every entry, for the app, vs.
+/// just the suspect ones, for a human), and mixing them would force
+/// every downstream reader of the main file to filter out review-only
+/// noise.
+fn needs_review_path(entries_out_file: &Path) -> PathBuf {
+    let stem = entries_out_file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("entries");
+    let dir = entries_out_file.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!("{stem}.needs-review.json"))
+}
+
 pub fn run_segment(
     model_path: &Path,
     mmproj_path: &Path,
@@ -584,6 +991,47 @@ pub fn run_segment(
         println!("  found {} headword(s)", found.len());
         found
     };
+    let entries = merge_leading_parenthetical_continuations(entries);
+    let entries = merge_entries_with_no_terminal_punctuation(entries);
+
+    let mut review_notes = Vec::new();
+    for idx in truncated_entry_indices(&entries) {
+        let e = &entries[idx];
+        println!(
+            "  WARNING: \"{}\" (entry {}) has no terminal punctuation — looks truncated, worth a manual look",
+            e.headword,
+            idx + 1
+        );
+        review_notes.push(ReviewNote {
+            headword: &e.headword,
+            raw_entry: &e.raw_entry,
+            reason: "entry ends without terminal punctuation — likely cut off by a page or crop edge",
+        });
+    }
+    for idx in headword_order_anomalies(&entries) {
+        println!(
+            "  WARNING: \"{}\" (entry {}) sorts before the preceding entry \"{}\" — possible segmentation bug, worth a manual look",
+            entries[idx].headword,
+            idx + 1,
+            entries[idx - 1].headword
+        );
+        review_notes.push(ReviewNote {
+            headword: &entries[idx].headword,
+            raw_entry: &entries[idx].raw_entry,
+            reason: "headword sorts out of alphabetical order relative to the preceding entry",
+        });
+    }
+    if !review_notes.is_empty() {
+        let review_path = needs_review_path(entries_out_file);
+        let review_json = serde_json::to_string_pretty(&review_notes).map_err(|e| e.to_string())?;
+        std::fs::write(&review_path, review_json).map_err(|e| e.to_string())?;
+        println!(
+            "wrote {} entr{} needing review to {}",
+            review_notes.len(),
+            if review_notes.len() == 1 { "y" } else { "ies" },
+            review_path.display()
+        );
+    }
 
     let json = serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())?;
     std::fs::write(entries_out_file, json).map_err(|e| e.to_string())?;
@@ -652,6 +1100,160 @@ mod tests {
     }
 
     #[test]
+    fn merge_leading_parenthetical_continuations_folds_a_dangling_fragment_into_the_previous_entry()
+    {
+        // Real run: the column-boundary crop split "(encourage vice,
+        // crime) -khuthaza/-thele-kisa okungendawo." off into its own
+        // entry headworded "aboard", when it's really the rest of
+        // "abet"'s second sense, cut off by the column break.
+        let entries = vec![
+            entry(
+                "abet",
+                "vt. (legal: help somebody in doing wrong) -ncedisa ekwenzeni ububi;",
+            ),
+            entry(
+                "aboard",
+                "(encourage vice, crime) -khuthaza/-thele-kisa okungendawo.",
+            ),
+            entry("abeyance", "n. ukumiswa, ukuxhonywa."),
+        ];
+        let result = merge_leading_parenthetical_continuations(entries);
+        assert_eq!(
+            result.iter().map(|e| &e.headword).collect::<Vec<_>>(),
+            ["abet", "abeyance"]
+        );
+        assert_eq!(
+            result[0].raw_entry,
+            "vt. (legal: help somebody in doing wrong) -ncedisa ekwenzeni ububi; \
+             (encourage vice, crime) -khuthaza/-thele-kisa okungendawo."
+        );
+    }
+
+    #[test]
+    fn merge_leading_parenthetical_continuations_leaves_ordinary_entries_unchanged() {
+        let entries = vec![
+            entry("abode", "n. ikhaya."),
+            entry("abolish", "vt. -bhangisa."),
+        ];
+        let result = merge_leading_parenthetical_continuations(entries.clone());
+        assert_eq!(result, entries);
+    }
+
+    #[test]
+    fn merge_leading_parenthetical_continuations_leaves_a_leading_fragment_with_nothing_before_it_alone()
+     {
+        let entries = vec![
+            entry("aboard", "(stray fragment)"),
+            entry("abode", "n. ikhaya."),
+        ];
+        let result = merge_leading_parenthetical_continuations(entries.clone());
+        assert_eq!(result, entries);
+    }
+
+    #[test]
+    fn merge_entries_with_no_terminal_punctuation_folds_a_cut_off_entry_into_the_next_one() {
+        // Real run: the page's own read cut "absurd" off mid-word with
+        // no closing punctuation, then invented a new headword
+        // ("accelerate" — a real headword that also exists correctly
+        // elsewhere on the same page) for the rest of that same entry.
+        let entries = vec![
+            entry("abstruse", "..."),
+            entry("absurd", "adj. (unreasonable) -ngafanele"),
+            entry(
+                "accelerate",
+                "kanga; (foolish, ridiculous) -nobudenge; ~-ity, n. ubudenge.",
+            ),
+            entry("abundant", "..."),
+        ];
+        let result = merge_entries_with_no_terminal_punctuation(entries);
+        assert_eq!(
+            result.iter().map(|e| &e.headword).collect::<Vec<_>>(),
+            ["abstruse", "absurd", "abundant"]
+        );
+        assert_eq!(
+            result[1].raw_entry,
+            "adj. (unreasonable) -ngafanele kanga; (foolish, ridiculous) -nobudenge; \
+             ~-ity, n. ubudenge."
+        );
+    }
+
+    #[test]
+    fn merge_entries_with_no_terminal_punctuation_leaves_ordinary_entries_unchanged() {
+        let entries = vec![
+            entry("abode", "n. ikhaya."),
+            entry("abolish", "vt. -bhangisa."),
+        ];
+        let result = merge_entries_with_no_terminal_punctuation(entries.clone());
+        assert_eq!(result, entries);
+    }
+
+    #[test]
+    fn merge_entries_with_no_terminal_punctuation_leaves_a_dangling_last_entry_alone() {
+        // There's nothing after the last entry to fold into it, even
+        // when it has no terminal punctuation of its own — this just
+        // means the photos ran out mid-entry, not a mislabeling bug.
+        let entries = vec![
+            entry("abode", "n. ikhaya."),
+            entry("abolish", "vt. -bhangisa, -shenx"),
+        ];
+        let result = merge_entries_with_no_terminal_punctuation(entries.clone());
+        assert_eq!(result, entries);
+    }
+
+    #[test]
+    fn truncated_entry_indices_finds_entries_with_nothing_left_to_merge() {
+        let entries = vec![
+            entry("abode", "n. ikhaya."),
+            entry("abolish", "vt. -bhangisa, -shenx"),
+            entry("abominate", "vt. -cekisa"),
+        ];
+        assert_eq!(truncated_entry_indices(&entries), vec![1, 2]);
+    }
+
+    #[test]
+    fn truncated_entry_indices_is_empty_when_every_entry_is_complete() {
+        let entries = vec![entry("abode", "n. ikhaya."), entry("abolish", "vt.;")];
+        assert_eq!(truncated_entry_indices(&entries), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn headword_order_anomalies_flags_the_real_accelerate_case() {
+        // Real run: "accelerate" sorted in between "absurd" and
+        // "abundant", where it has no business being — the actual bug
+        // was a mislabeled continuation (see
+        // `merge_entries_with_no_terminal_punctuation`'s own real-run
+        // comment), but the order violation alone is what a human
+        // would notice first.
+        let entries = vec![
+            entry("absurd", "..."),
+            entry("accelerate", "..."),
+            entry("abundant", "..."),
+        ];
+        assert_eq!(headword_order_anomalies(&entries), vec![2]);
+    }
+
+    #[test]
+    fn headword_order_anomalies_allows_a_headword_repeated_for_a_distinct_sense() {
+        let entries = vec![
+            entry("about", "first sense"),
+            entry("about", "second sense"),
+            entry("about", "third sense"),
+            entry("above", "..."),
+        ];
+        assert_eq!(headword_order_anomalies(&entries), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn headword_order_anomalies_is_diacritic_insensitive() {
+        // Real false-positive risk this check must avoid: naive
+        // codepoint comparison sorts "abbé" *after* "abbess" (since
+        // 'é' has a higher codepoint than any plain ASCII letter),
+        // even though a real dictionary correctly sorts it before.
+        let entries = vec![entry("abbé", "..."), entry("abbess", "...")];
+        assert_eq!(headword_order_anomalies(&entries), Vec::<usize>::new());
+    }
+
+    #[test]
     fn crop_column_splits_the_image_in_half_with_no_gap_or_overlap() {
         let img = DynamicImage::new_rgb8(1000, 2000);
         let left = crop_column(&img, true);
@@ -660,6 +1262,95 @@ mod tests {
         assert_eq!(right.height(), 2000);
         assert_eq!(left.width() + right.width(), 1000);
         assert_eq!(left.width(), 500);
+    }
+
+    #[test]
+    fn crop_band_fraction_extracts_the_requested_slice_of_the_height() {
+        let img = DynamicImage::new_rgb8(100, 1000);
+        let band = crop_band_fraction(&img, 0.15, 0.45);
+        assert_eq!(band.height(), 300);
+        assert_eq!(band.width(), 100);
+    }
+
+    #[test]
+    fn crop_band_fraction_never_panics_when_fractions_are_reversed() {
+        let img = DynamicImage::new_rgb8(100, 1000);
+        let band = crop_band_fraction(&img, 0.9, 0.1);
+        assert!(band.height() >= 1);
+    }
+
+    #[test]
+    fn continuation_crop_stops_at_a_different_real_headword() {
+        // Real shape this guards against: a continuation crop that's
+        // moved far enough down the column to reach the *next* real
+        // entry shouldn't have that entry's text appended onto the one
+        // being extended.
+        let page_entries = vec![
+            entry("about", "..."),
+            entry("above", "adv. (at a higher point...)"),
+        ];
+        assert!(continuation_crop_moved_past_target(
+            &page_entries,
+            "about",
+            "above"
+        ));
+    }
+
+    #[test]
+    fn continuation_crop_keeps_going_on_an_unanchored_pseudo_headword() {
+        // Real shape: the continuation crop starts mid-sentence too,
+        // with no bold heading of its own, so it can hallucinate a
+        // pseudo-headword from body text just like the first crop did
+        // — that's still the same ongoing entry, not a new one.
+        let page_entries = vec![entry("about", "...")];
+        assert!(!continuation_crop_moved_past_target(
+            &page_entries,
+            "about",
+            "apha"
+        ));
+    }
+
+    #[test]
+    fn continuation_crop_keeps_going_when_it_repeats_the_target_headword() {
+        let page_entries = vec![entry("about", "...")];
+        assert!(!continuation_crop_moved_past_target(
+            &page_entries,
+            "about",
+            "About"
+        ));
+    }
+
+    #[test]
+    fn raw_last_entry_is_unanchored_detects_the_real_about_prep_case() {
+        // Real case: the crop's own raw read ended "...about", "apha" —
+        // "apha" is an unanchored pseudo-headword, even though the
+        // merged text it's folded into happens to end in a semicolon
+        // that looks like a valid stopping point on its own.
+        let page_entries = vec![entry("about", "..."), entry("above", "...")];
+        let boundary_entries = vec![
+            entry("about", "..."),
+            entry("apha", "naphaya egumbini lakhe;"),
+        ];
+        assert!(raw_last_entry_is_unanchored(
+            &page_entries,
+            &boundary_entries
+        ));
+    }
+
+    #[test]
+    fn raw_last_entry_is_unanchored_is_false_when_the_crop_ends_on_a_real_headword() {
+        let page_entries = vec![entry("about", "..."), entry("above", "...")];
+        let boundary_entries = vec![entry("about", "..."), entry("above", "...")];
+        assert!(!raw_last_entry_is_unanchored(
+            &page_entries,
+            &boundary_entries
+        ));
+    }
+
+    #[test]
+    fn raw_last_entry_is_unanchored_is_false_when_boundary_entries_is_empty() {
+        let page_entries = vec![entry("about", "...")];
+        assert!(!raw_last_entry_is_unanchored(&page_entries, &[]));
     }
 
     #[test]
@@ -678,7 +1369,7 @@ mod tests {
             "absurd",
             "(unreasonable) -ngafanele-kanga; (foolish, ridiculous) -nobudenge;",
         )];
-        let fixed = apply_column_boundary_fix(page_entries, boundary_entries);
+        let fixed = apply_column_boundary_fix(page_entries, &boundary_entries);
         assert_eq!(
             fixed.iter().map(|e| &e.headword).collect::<Vec<_>>(),
             ["abstruse", "absurd", "abundant"]
@@ -720,7 +1411,7 @@ mod tests {
             entry("abhor", "..."),
             entry("abide", "..."),
         ];
-        let fixed = apply_column_boundary_fix(page_entries, boundary_entries);
+        let fixed = apply_column_boundary_fix(page_entries, &boundary_entries);
         assert_eq!(
             fixed.iter().map(|e| &e.headword).collect::<Vec<_>>(),
             [
@@ -744,6 +1435,65 @@ mod tests {
     }
 
     #[test]
+    fn column_boundary_fix_skips_a_hallucinated_leading_pseudo_headword_in_the_crop() {
+        // Real run: the crop's own view started mid-sentence, with no
+        // real bold headword to anchor it, so the model invented
+        // "ezininzi" from the first word of an unrelated continuation —
+        // immediately followed by a genuinely useful "about" entry, then
+        // another hallucinated pseudo-headword ("apha", actually just a
+        // Xhosa word — "here" — from partway through that same entry's
+        // own gloss text) for the tail continuation that also has no
+        // bold headword introducing it.
+        let page_entries = vec![
+            entry("about", "earlier, unrelated sense"),
+            entry("about", "(with verbs of movement) ... ~·face, vi. -jika."),
+            entry("about", "prep. (with verbs of movement) ... kukho iincwadi"),
+            entry("above", "adv. (at a higher point...)"),
+        ];
+        let boundary_entries = vec![
+            entry("ezininzi", "stray continuation of the previous entry"),
+            entry("about", "prep. (with verbs of movement) ... kukho iincwadi"),
+            entry("apha", "naphaya egumbini lakhe; (near to) kufuphi na-;"),
+        ];
+        let fixed = apply_column_boundary_fix(page_entries, &boundary_entries);
+        assert_eq!(
+            fixed.iter().map(|e| &e.headword).collect::<Vec<_>>(),
+            ["about", "about", "about", "above"]
+        );
+        assert_eq!(
+            fixed[2].raw_entry,
+            "prep. (with verbs of movement) ... kukho iincwadi naphaya egumbini lakhe; (near to) kufuphi na-;"
+        );
+    }
+
+    #[test]
+    fn column_boundary_fix_matches_the_last_occurrence_of_a_repeated_headword_not_the_first() {
+        // "about" legitimately appears more than once on a real page for
+        // distinct senses — the crop is always anchored at the tail end
+        // of the page's own entries, so it's the *last* occurrence that
+        // the column break actually sits next to.
+        let page_entries = vec![
+            entry("about", "first, unrelated sense"),
+            entry("about", "second, unrelated sense"),
+            entry("about", "truncated at the column break"),
+            entry("above", "..."),
+        ];
+        let boundary_entries = vec![
+            entry("about", "complete, from the crop"),
+            entry("above", "also confirmed by the crop"),
+        ];
+        let fixed = apply_column_boundary_fix(page_entries, &boundary_entries);
+        assert_eq!(
+            fixed.iter().map(|e| &e.headword).collect::<Vec<_>>(),
+            ["about", "about", "about", "above"]
+        );
+        assert_eq!(fixed[0].raw_entry, "first, unrelated sense");
+        assert_eq!(fixed[1].raw_entry, "second, unrelated sense");
+        assert_eq!(fixed[2].raw_entry, "complete, from the crop");
+        assert_eq!(fixed[3].raw_entry, "also confirmed by the crop");
+    }
+
+    #[test]
     fn column_boundary_fix_leaves_page_entries_untouched_when_the_crop_found_nothing_matching() {
         // A real run: a column-break crop with little real content to
         // work with hallucinated headwords unrelated to anything on the
@@ -753,7 +1503,7 @@ mod tests {
         // signal for that, so the page is left alone instead.
         let page_entries = vec![entry("abode", "...")];
         let boundary_entries = vec![entry("zebra", "...")];
-        let fixed = apply_column_boundary_fix(page_entries, boundary_entries);
+        let fixed = apply_column_boundary_fix(page_entries, &boundary_entries);
         assert_eq!(
             fixed.iter().map(|e| &e.headword).collect::<Vec<_>>(),
             ["abode"]
@@ -796,7 +1546,7 @@ mod tests {
     #[test]
     fn column_boundary_fix_is_a_no_op_when_the_crop_found_nothing() {
         let page_entries = vec![entry("abode", "...")];
-        let fixed = apply_column_boundary_fix(page_entries, Vec::new());
+        let fixed = apply_column_boundary_fix(page_entries, &[]);
         assert_eq!(
             fixed.iter().map(|e| &e.headword).collect::<Vec<_>>(),
             ["abode"]
@@ -976,28 +1726,28 @@ mod tests {
             page_headwords in proptest::collection::vec("[a-z]{1,6}", 0..8),
         ) {
             let page_entries = entries_from(&page_headwords);
-            let result = apply_column_boundary_fix(page_entries, Vec::new());
+            let result = apply_column_boundary_fix(page_entries, &[]);
             proptest::prop_assert_eq!(headwords_of(&result), page_headwords);
         }
 
-        /// If the crop's own first headword doesn't appear anywhere in
-        /// the page's own read, there's nothing to safely correct —
+        /// If none of the crop's own entries appear anywhere in the
+        /// page's own read, there's nothing to safely correct —
         /// confirmed necessary in a real run (see this fn's own doc
         /// comment) that trusting such a crop pollutes a correct page
         /// with hallucinated content instead.
         #[test]
         fn column_boundary_fix_is_a_no_op_when_no_match_is_found(
             page_headwords in proptest::collection::vec("[a-z]{1,6}", 0..8),
-            boundary_first in "[a-z]{1,6}",
-            boundary_rest in proptest::collection::vec("[a-z]{1,6}", 0..4),
+            boundary_headwords in proptest::collection::vec("[a-z]{1,6}", 1..5),
         ) {
             proptest::prop_assume!(
-                !page_headwords.iter().any(|h| h.eq_ignore_ascii_case(&boundary_first))
+                !boundary_headwords.iter().any(|b|
+                    page_headwords.iter().any(|h| h.eq_ignore_ascii_case(b))
+                )
             );
             let page_entries = entries_from(&page_headwords);
-            let mut boundary_entries = vec![entry(&boundary_first, "y")];
-            boundary_entries.extend(entries_from(&boundary_rest));
-            let result = apply_column_boundary_fix(page_entries, boundary_entries);
+            let boundary_entries = entries_from(&boundary_headwords);
+            let result = apply_column_boundary_fix(page_entries, &boundary_entries);
             proptest::prop_assert_eq!(headwords_of(&result), page_headwords);
         }
 
@@ -1023,7 +1773,7 @@ mod tests {
             boundary_entries.extend(entries_from(&boundary_rest));
 
             let before_len = before_headwords.len();
-            let result = apply_column_boundary_fix(page_entries, boundary_entries);
+            let result = apply_column_boundary_fix(page_entries, &boundary_entries);
             proptest::prop_assert!(result.len() >= before_len);
             proptest::prop_assert_eq!(headwords_of(&result[..before_len]), before_headwords);
         }

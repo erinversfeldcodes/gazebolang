@@ -108,6 +108,48 @@ fn ctx_params_for(n_ctx: NonZeroU32) -> LlamaContextParams {
 /// This literal text is what marks the start of the real answer.
 const GPT_OSS_FINAL_CHANNEL_TRIGGER: &str = "<|channel|>final<|message|>";
 
+/// This task is a few bounded fields pulled from one short excerpt —
+/// it never needs the model's deepest reasoning tier, and a real run
+/// against the production model showed the cost of not pinning this
+/// explicitly: with no reasoning effort set at all (see
+/// `gpt_oss_system_message`'s own doc comment for why it's otherwise
+/// unset here), it sometimes reasoned for thousands of tokens and
+/// never reached `GPT_OSS_FINAL_CHANNEL_TRIGGER` before running out of
+/// context. "low" targets that failure directly, rather than just
+/// giving it more context to maybe still run out of.
+const GPT_OSS_REASONING_EFFORT: &str = "low";
+
+/// Reconstructs, by hand, the exact system message `gpt-oss`'s own
+/// GGUF `chat_template` would build from its `reasoning_effort` kwarg —
+/// confirmed by reading that template's "System Message Construction"
+/// macro directly (identity line, knowledge cutoff, current date, a
+/// "Reasoning: <effort>" line, then the channel-validity note). This
+/// step is necessary only because of a real gap in the binding this
+/// project uses: `apply_chat_template` calls `llama_chat_apply_template`,
+/// which renders `gpt-oss`'s Harmony format via a hardcoded C++
+/// shortcut (matched by template name, not by executing the model's
+/// actual Jinja template) that passes a system message's content
+/// through completely verbatim and has no concept of `reasoning_effort`
+/// at all — confirmed by reading that C++ implementation directly.
+/// Passing no system message, as this project did until a real run
+/// surfaced the stuck-reasoning failure above, silently leaves the
+/// model defaulting to "medium" effort with none of the rest of this
+/// text either, which is a stranger, less-trained-on input shape than
+/// either a real system message or none at all.
+fn gpt_oss_system_message(reasoning_effort: &str) -> String {
+    let today = time::OffsetDateTime::now_utc().date();
+    format!(
+        "You are ChatGPT, a large language model trained by OpenAI.\n\
+         Knowledge cutoff: 2024-06\n\
+         Current date: {:04}-{:02}-{:02}\n\n\
+         Reasoning: {reasoning_effort}\n\n\
+         # Valid channels: analysis, commentary, final. Channel must be included for every message.",
+        today.year(),
+        u8::from(today.month()),
+        today.day()
+    )
+}
+
 fn penalty_sampler(model: &LlamaModel) -> LlamaSampler {
     // Without this, greedy decoding has no defense against repetition
     // loops — confirmed in a real run against the production decompose
@@ -305,10 +347,15 @@ fn generate_text_eager(
     let chat_template = model
         .chat_template(None)
         .map_err(|e| format!("chat_template failed: {e:?}"))?;
+    let system_msg = LlamaChatMessage::new(
+        "system".to_string(),
+        gpt_oss_system_message(GPT_OSS_REASONING_EFFORT),
+    )
+    .map_err(|e| e.to_string())?;
     let msg =
         LlamaChatMessage::new("user".to_string(), prompt.to_string()).map_err(|e| e.to_string())?;
     let formatted = model
-        .apply_chat_template(&chat_template, &[msg], true)
+        .apply_chat_template(&chat_template, &[system_msg, msg], true)
         .map_err(|e| format!("apply_chat_template failed: {e:?}"))?;
 
     let n_ctx_i32 = i32::try_from(n_ctx.get()).map_err(|e| e.to_string())?;
@@ -381,11 +428,16 @@ impl TextEngine {
             .model
             .chat_template(None)
             .map_err(|e| format!("chat_template failed: {e:?}"))?;
+        let system_msg = LlamaChatMessage::new(
+            "system".to_string(),
+            gpt_oss_system_message(GPT_OSS_REASONING_EFFORT),
+        )
+        .map_err(|e| e.to_string())?;
         let msg = LlamaChatMessage::new("user".to_string(), prompt.to_string())
             .map_err(|e| e.to_string())?;
         let formatted = self
             .model
-            .apply_chat_template(&chat_template, &[msg], true)
+            .apply_chat_template(&chat_template, &[system_msg, msg], true)
             .map_err(|e| format!("apply_chat_template failed: {e:?}"))?;
 
         let n_ctx_i32 = i32::try_from(self.n_ctx.get()).map_err(|e| e.to_string())?;
@@ -535,5 +587,26 @@ impl VisionEngine {
             n_past,
             n_ctx_i32,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpt_oss_system_message_sets_the_requested_reasoning_effort() {
+        let msg = gpt_oss_system_message("low");
+        assert!(msg.contains("Reasoning: low"));
+    }
+
+    #[test]
+    fn gpt_oss_system_message_keeps_the_channel_validity_note() {
+        // The hardcoded template shortcut this works around (see this
+        // function's own doc comment) passes a system message through
+        // completely verbatim — if this note is missing, `gpt-oss`
+        // never learns it must tag every message with a channel at all.
+        let msg = gpt_oss_system_message("low");
+        assert!(msg.contains("# Valid channels: analysis, commentary, final."));
     }
 }
