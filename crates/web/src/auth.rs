@@ -328,6 +328,130 @@ pub async fn confirm_password_reset(
     Ok(())
 }
 
+/// How long a minted invite stays redeemable. More generous than
+/// `confirm_password_reset`'s 24-hour window — this isn't rotating a
+/// compromised credential, just getting a friend through signup whenever
+/// they get around to it.
+const INVITE_EXPIRY_HOURS: i64 = 24 * 7;
+
+/// Mints an invite for `email` from `inviter_id` — any signed-in user may
+/// invite, matching this app's small-trusted-group model (no admin/role
+/// concept exists, or is needed). Re-checks the same email-uniqueness and
+/// `MAX_USERS` conditions [`sign_up`] used to check at its own signup
+/// time, since that open path no longer exists — an invite is now the
+/// only way a new account gets created. [`sign_up_via_invite`] re-checks
+/// `MAX_USERS` again at redemption time, since several outstanding
+/// invites could otherwise overrun the cap between mint and redeem — the
+/// same check-then-act race [`sign_up`]'s own cap check already accepted
+/// as fine for 4 trusted users.
+pub async fn create_invite(pool: &PgPool, inviter_id: Uuid, email: &str) -> Result<String, String> {
+    let email = email.trim().to_lowercase();
+    validate_email(&email)?;
+
+    let existing: Option<Uuid> = sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    if existing.is_some() {
+        return Err("an account with that email already exists".to_string());
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    if count >= MAX_USERS {
+        return Err("This app is limited to 4 users and is already full.".to_string());
+    }
+
+    let token = generate_token();
+    let expires_at = OffsetDateTime::now_utc() + Duration::hours(INVITE_EXPIRY_HOURS);
+    sqlx::query(
+        "INSERT INTO invites (token, email, invited_by, expires_at) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(&token)
+    .bind(&email)
+    .bind(inviter_id)
+    .bind(expires_at)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(token)
+}
+
+/// Creates a new account by redeeming an invite token and signs it in.
+/// Binds the new account to the invite's own stored email — never an
+/// arbitrary form field, since the whole point of an invite is that the
+/// email is already decided — otherwise does exactly what the old open
+/// [`sign_up`] did: validate the name/password, hash the password, insert
+/// the user, start a session.
+pub async fn sign_up_via_invite(
+    pool: &PgPool,
+    token: &str,
+    name: &str,
+    password: &str,
+) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("please enter a name".to_string());
+    }
+    validate_password(password)?;
+
+    let row: Option<(String, OffsetDateTime, Option<OffsetDateTime>)> =
+        sqlx::query_as("SELECT email, expires_at, used_at FROM invites WHERE token = $1")
+            .bind(token)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+    let Some((email, expires_at, used_at)) = row else {
+        return Err("this invite link is invalid".to_string());
+    };
+    if used_at.is_some() {
+        return Err("this invite link has already been used".to_string());
+    }
+    if expires_at < OffsetDateTime::now_utc() {
+        return Err("this invite link has expired".to_string());
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    if count >= MAX_USERS {
+        return Err("This app is limited to 4 users and is already full.".to_string());
+    }
+
+    let password_hash = hash_password(password)?;
+
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    let user_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO users (email, name, password_hash) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(&email)
+    .bind(name)
+    .bind(&password_hash)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| {
+        if is_unique_violation(&e) {
+            "an account with that email already exists".to_string()
+        } else {
+            e.to_string()
+        }
+    })?;
+    sqlx::query("UPDATE invites SET used_at = now() WHERE token = $1")
+        .bind(token)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    start_session(pool, user_id).await
+}
+
 /// Checks `password` against the signed-in user's actual password hash,
 /// falling back to [`dummy_password_hash`] when there isn't one yet (the
 /// pre-reset state of a migrated magic-link account) — same timing-safe
@@ -777,6 +901,133 @@ mod tests {
             user_for_session(&pool, &session_token).await.is_none(),
             "the old session should be revoked by the reset"
         );
+    }
+
+    async fn invite_token_for(pool: &PgPool, email: &str) -> String {
+        sqlx::query_scalar(
+            "SELECT token FROM invites WHERE email = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(email)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_invite_mints_a_token_for_a_new_email(pool: PgPool) {
+        let inviter = sign_up(&pool, "inviter@example.com", "Inviter", "correct-horse")
+            .await
+            .unwrap();
+        let inviter_id = user_for_session(&pool, &inviter).await.unwrap().id;
+
+        create_invite(&pool, inviter_id, "Friend@Example.com")
+            .await
+            .unwrap();
+
+        let token = invite_token_for(&pool, "friend@example.com").await;
+        assert_eq!(token.len(), 64, "generate_token() produces 32 hex bytes");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_invite_rejects_an_email_that_already_has_an_account(pool: PgPool) {
+        let inviter = sign_up(&pool, "inviter2@example.com", "Inviter", "correct-horse")
+            .await
+            .unwrap();
+        let inviter_id = user_for_session(&pool, &inviter).await.unwrap().id;
+        sign_up(&pool, "existing@example.com", "Existing", "correct-horse")
+            .await
+            .unwrap();
+
+        let result = create_invite(&pool, inviter_id, "existing@example.com").await;
+        assert!(result.is_err());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_invite_is_rejected_once_at_the_cap(pool: PgPool) {
+        let mut inviter_id = Uuid::nil();
+        for i in 0..MAX_USERS {
+            let email = format!("capuser{i}@example.com");
+            let session = sign_up(&pool, &email, "User", "correct-horse-battery")
+                .await
+                .unwrap_or_else(|e| panic!("user {i} should be allowed to sign up: {e}"));
+            inviter_id = user_for_session(&pool, &session).await.unwrap().id;
+        }
+
+        let result = create_invite(&pool, inviter_id, "onemore@example.com").await;
+        assert!(result.is_err());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn sign_up_via_invite_creates_user_bound_to_the_invites_email(pool: PgPool) {
+        let inviter = sign_up(&pool, "inviter3@example.com", "Inviter", "correct-horse")
+            .await
+            .unwrap();
+        let inviter_id = user_for_session(&pool, &inviter).await.unwrap().id;
+        create_invite(&pool, inviter_id, "newfriend@example.com")
+            .await
+            .unwrap();
+        let token = invite_token_for(&pool, "newfriend@example.com").await;
+
+        let session_token =
+            sign_up_via_invite(&pool, &token, "New Friend", "correct-horse-battery")
+                .await
+                .unwrap();
+
+        let user = user_for_session(&pool, &session_token).await.unwrap();
+        assert_eq!(user.email, "newfriend@example.com");
+        assert_eq!(user.name, "New Friend");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn sign_up_via_invite_rejects_an_unknown_token(pool: PgPool) {
+        let result = sign_up_via_invite(&pool, "never-issued", "Someone", "correct-horse").await;
+        assert!(result.is_err());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn sign_up_via_invite_rejects_an_already_used_token(pool: PgPool) {
+        let inviter = sign_up(&pool, "inviter4@example.com", "Inviter", "correct-horse")
+            .await
+            .unwrap();
+        let inviter_id = user_for_session(&pool, &inviter).await.unwrap().id;
+        create_invite(&pool, inviter_id, "reused@example.com")
+            .await
+            .unwrap();
+        let token = invite_token_for(&pool, "reused@example.com").await;
+
+        sign_up_via_invite(&pool, &token, "First", "correct-horse-battery")
+            .await
+            .unwrap();
+        let second_attempt =
+            sign_up_via_invite(&pool, &token, "Second", "correct-horse-battery").await;
+        assert!(second_attempt.is_err());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn sign_up_via_invite_rejects_an_expired_token(pool: PgPool) {
+        let inviter = sign_up(&pool, "inviter5@example.com", "Inviter", "correct-horse")
+            .await
+            .unwrap();
+        let inviter_id = user_for_session(&pool, &inviter).await.unwrap().id;
+        sqlx::query(
+            "INSERT INTO invites (token, email, invited_by, expires_at) \
+             VALUES ($1, $2, $3, now() - interval '1 hour')",
+        )
+        .bind("already-expired-invite")
+        .bind("expired-invitee@example.com")
+        .bind(inviter_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = sign_up_via_invite(
+            &pool,
+            "already-expired-invite",
+            "Someone",
+            "correct-horse-battery",
+        )
+        .await;
+        assert!(result.is_err());
     }
 
     #[sqlx::test(migrations = "../../migrations")]

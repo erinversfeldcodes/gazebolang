@@ -17,6 +17,7 @@ pub mod state;
 pub mod storage;
 pub mod trainer_back_chain;
 pub mod trainer_minimal_pairs;
+pub mod trainer_sound_spelling;
 pub mod trainer_spelling;
 pub mod wiki;
 pub mod wiki_editor;

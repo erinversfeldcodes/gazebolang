@@ -270,7 +270,7 @@ mod tests {
     ) -> Uuid {
         sqlx::query_scalar(
             "INSERT INTO cards (card_type, audio_url, target_text, created_by) \
-             VALUES ('basic', $1, $2, $3) RETURNING id",
+             VALUES ('image_to_target', $1, $2, $3) RETURNING id",
         )
         .bind(audio_url)
         .bind(target_text)
