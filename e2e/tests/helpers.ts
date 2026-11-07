@@ -1,4 +1,6 @@
 import { Page, expect } from "@playwright/test";
+import { Client } from "pg";
+import * as crypto from "crypto";
 
 // Every environment that actually sends mail (preview, and prod) uses
 // Resend's sandbox sender (onboarding@resend.dev) rather than a verified
@@ -122,4 +124,75 @@ export async function reviewOwnCard(page: Page, deckName: string, word: string):
   await expect(page.getByText(word, { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Good" }).click();
   await page.waitForLoadState("networkidle");
+}
+
+// Account used only as the `invited_by` of invites this helper mints — a
+// stand-in for whatever real user would normally click "Send invite" in
+// the app. Since signup is now invite-only, there's no open path left to
+// create the very *first* account on a fresh database at all, so this
+// bootstrap account has to be written straight into Postgres (password_hash
+// left NULL — the same "account with no password set yet" shape the
+// magic-link-era rows in auth.rs's own tests use) rather than created
+// through any UI.
+const BOOTSTRAP_INVITER_EMAIL = "e2e-bootstrap-inviter@example.com";
+
+async function ensureBootstrapInviter(client: Client): Promise<string> {
+  const existing = await client.query("SELECT id FROM users WHERE email = $1", [
+    BOOTSTRAP_INVITER_EMAIL,
+  ]);
+  if (existing.rows.length > 0) {
+    return existing.rows[0].id as string;
+  }
+  const inserted = await client.query(
+    "INSERT INTO users (email, name) VALUES ($1, $2) RETURNING id",
+    [BOOTSTRAP_INVITER_EMAIL, "E2E Bootstrap"],
+  );
+  return inserted.rows[0].id as string;
+}
+
+// Mints a usable invite token for `email` by writing straight into the
+// `invites` table, the same precedent auth.setup.ts's old magic-link
+// version and auth.spec.ts's password-reset test already set for reading
+// an auth token straight out of Postgres rather than out of a real inbox.
+// Unlike those two, this doesn't even start from a real email send: the
+// app's own `create_invite` server fn is exercised directly by
+// invite.spec.ts instead, so this helper only needs to produce a redeemable
+// token, not prove delivery.
+export async function createInviteToken(email: string): Promise<string> {
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    const inviterId = await ensureBootstrapInviter(client);
+    const token = crypto.randomBytes(32).toString("hex");
+    await client.query(
+      "INSERT INTO invites (token, email, invited_by, expires_at) " +
+        "VALUES ($1, $2, $3, now() + interval '7 days')",
+      [token, email.toLowerCase(), inviterId],
+    );
+    return token;
+  } finally {
+    await client.end();
+  }
+}
+
+// Deletes an account created via sign_up_via_invite, and everything that
+// references it, so a spec that creates a throwaway account doesn't
+// permanently eat one of MAX_USERS's 4 slots in the shared preview
+// database (which, unlike a fresh local db-up, is reused across every push
+// to a PR rather than reset) — see auth.spec.ts's deleteTestUser for the
+// same concern against the same cap.
+export async function deleteInvitedTestUser(email: string): Promise<void> {
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    const lowered = email.toLowerCase();
+    await client.query(
+      "DELETE FROM sessions WHERE user_id = (SELECT id FROM users WHERE email = $1)",
+      [lowered],
+    );
+    await client.query("DELETE FROM invites WHERE email = $1", [lowered]);
+    await client.query("DELETE FROM users WHERE email = $1", [lowered]);
+  } finally {
+    await client.end();
+  }
 }
