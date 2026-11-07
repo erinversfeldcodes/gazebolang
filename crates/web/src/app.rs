@@ -3,13 +3,14 @@
 #![allow(clippy::must_use_candidate)]
 
 use crate::account::{
-    ChangePassword, ConfirmPasswordReset, LogIn, RequestPasswordReset, SetDailyNewCardLimit,
-    SignUp, UpdateEmail, UpdateName, current_profile, current_user_name, user_stats,
+    ChangePassword, ConfirmPasswordReset, CreateInvite, LogIn, RequestPasswordReset,
+    SetDailyNewCardLimit, SignUpViaInvite, UpdateEmail, UpdateName, current_profile,
+    current_user_name, user_stats,
 };
 use crate::cards::{
-    AddCardLink, CardLink, DeleteCard, DirectionInput, GradeCard, GradeInput, ImageSearchResult,
-    ImportCardImage, LINK_TYPES, RemoveCardLink, ReviewOrderInput, SearchCardImages, get_card,
-    list_tags, review_queue, search_cards,
+    AddCardLink, CARD_TYPES, CardLink, DeleteCard, DirectionInput, GradeCard, GradeInput,
+    ImageSearchResult, ImportCardImage, LINK_TYPES, RemoveCardLink, ReviewOrderInput,
+    SearchCardImages, get_card, list_tags, review_queue, search_cards,
 };
 use crate::decks::{
     AddCardToDeck, CreateDeck, Deck, DeleteDeck, RemoveCardFromDeck, RenameDeck, list_decks,
@@ -19,6 +20,7 @@ use crate::dictionary_ui::{ClickableWord, DictionaryDetailsEditor};
 use crate::media_recorder::RecordButton;
 use crate::trainer_back_chain::BackChainGamePage;
 use crate::trainer_minimal_pairs::MinimalPairTrainerPage;
+use crate::trainer_sound_spelling::SoundSpellingTrainerPage;
 use crate::trainer_spelling::SpellingTestPage;
 use crate::wiki::{
     AddPageToCard, CreatePage, DeletePage, MovePage, PageRevisionSummary, PageTreeNode,
@@ -224,6 +226,10 @@ fn MediaAttachmentFields(
     #[prop(default = false)] has_audio: bool,
     #[prop(default = false)] has_video: bool,
     #[prop(default = false)] has_youtube: bool,
+    // `sound_to_written` cards are audio-only — nothing stops the image/
+    // video/YouTube inputs from also submitting a value, but there's no
+    // reason to show fields that type doesn't use.
+    #[prop(default = false)] audio_only: bool,
 ) -> impl IntoView {
     let image_label = if editing {
         "Replace image (optional)"
@@ -246,6 +252,21 @@ fn MediaAttachmentFields(
         "Or link a YouTube video"
     };
 
+    let audio_fields = view! {
+        <label>
+            {audio_label}
+            <input type="file" name="audio" accept="audio/*" node_ref=audio_input />
+        </label>
+        <RecordButton kind="audio" target_input=audio_input />
+        {has_audio.then(|| view! {
+            <label><input type="checkbox" name="remove_audio" />"Remove audio"</label>
+        })}
+    };
+
+    if audio_only {
+        return audio_fields.into_any();
+    }
+
     view! {
         <label>{image_label} <input type="file" name="image" accept="image/*" /></label>
         <ImageSearchPicker chosen_image_url=chosen_image_url />
@@ -257,14 +278,7 @@ fn MediaAttachmentFields(
         {has_image.then(|| view! {
             <label><input type="checkbox" name="remove_image" />"Remove image"</label>
         })}
-        <label>
-            {audio_label}
-            <input type="file" name="audio" accept="audio/*" node_ref=audio_input />
-        </label>
-        <RecordButton kind="audio" target_input=audio_input />
-        {has_audio.then(|| view! {
-            <label><input type="checkbox" name="remove_audio" />"Remove audio"</label>
-        })}
+        {audio_fields}
         <label>
             {video_label}
             <input type="file" name="video" accept="video/*" node_ref=video_input />
@@ -281,6 +295,7 @@ fn MediaAttachmentFields(
             <label><input type="checkbox" name="remove_youtube" />"Remove YouTube link"</label>
         })}
     }
+    .into_any()
 }
 
 pub fn shell(options: LeptosOptions) -> impl IntoView {
@@ -390,6 +405,7 @@ pub fn App() -> impl IntoView {
                                     <div class="nav-menu-items">
                                         <A href="/train/minimal-pairs">"Minimal pairs"</A>
                                         <A href="/train/spelling">"Spelling test"</A>
+                                        <A href="/train/sound-spelling">"Sound-spelling"</A>
                                     </div>
                                 </div>
                                 " · "
@@ -458,6 +474,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/train/minimal-pairs") view=MinimalPairTrainerPage/>
                     <Route path=path!("/train/back-chain") view=BackChainGamePage/>
                     <Route path=path!("/train/spelling") view=SpellingTestPage/>
+                    <Route path=path!("/train/sound-spelling") view=SoundSpellingTrainerPage/>
                     <Route path=StaticSegment("stats") view=StatsPage/>
                     <Route path=StaticSegment("settings") view=SettingsPage/>
                     <Route path=StaticSegment("account") view=AccountPage/>
@@ -509,14 +526,19 @@ fn LoginPage() -> impl IntoView {
                 view! { <p>"Error: " {e.to_string()}</p> }
             })
         }}
-        <p><A href="/signup">"Need an account? Sign up"</A></p>
         <p><A href="/forgot-password">"Forgot your password?"</A></p>
     }
 }
 
+/// Reachable only via an invite link (`?token=...`) — open self-serve
+/// signup doesn't exist any more, see `account::sign_up_via_invite`'s doc
+/// comment. Same `use_query_map()`-seeded-token shape as
+/// `ResetPasswordPage`.
 #[component]
 fn SignupPage() -> impl IntoView {
-    let sign_up = ServerAction::<SignUp>::new();
+    let sign_up = ServerAction::<SignUpViaInvite>::new();
+    let query = use_query_map();
+    let token = move || query.read().get("token").unwrap_or_default();
 
     Effect::new(move |_| {
         if matches!(sign_up.value().get(), Some(Ok(()))) {
@@ -526,9 +548,14 @@ fn SignupPage() -> impl IntoView {
 
     view! {
         <h1>"Sign up"</h1>
+        {move || {
+            token().is_empty().then(|| view! {
+                <p>"This signup link is invalid — ask whoever invited you for a fresh one."</p>
+            })
+        }}
         <ActionForm action=sign_up>
+            <input type="hidden" name="token" value=token() />
             <label>"Name" <input type="text" name="name" /></label>
-            <label>"Email" <input type="email" name="email" /></label>
             <label>"Password" <input type="password" name="password" /></label>
             <label>"Confirm password" <input type="password" name="confirm_password" /></label>
             <button type="submit">"Sign up"</button>
@@ -689,6 +716,7 @@ fn CardListPage() -> impl IntoView {
                                     let edit_href = format!("/cards/{}", card.id);
                                     view! {
                                         <li>
+                                            {card.source_text.map(|text| view! { <p>{text}</p> })}
                                             {card
                                                 .image_url
                                                 .map(|url| view! { <img src=url alt="" /> })}
@@ -700,8 +728,9 @@ fn CardListPage() -> impl IntoView {
                                                 .map(|url| view! { <video controls src=url></video> })}
                                             {card.youtube_url.map(youtube_embed)}
                                             // The grid is a browsing/self-test view — only the
-                                            // prompt (media, if any) shows up front, same as
-                                            // ReviewPage and EditCardPage's signed-out view.
+                                            // prompt (media, if any — or source_text for a
+                                            // sentence_translation card) shows up front, same
+                                            // as ReviewPage and EditCardPage's signed-out view.
                                             // target_text is the answer, behind Reveal.
                                             <details>
                                                 <summary>"Reveal"</summary>
@@ -734,6 +763,7 @@ fn NewCardPage() -> impl IntoView {
     let video_input: NodeRef<html::Input> = NodeRef::new();
     let chosen_image_url: RwSignal<Option<String>> = RwSignal::new(None);
     let target_text_signal: RwSignal<String> = RwSignal::new(String::new());
+    let card_type = RwSignal::new("image_to_target".to_string());
 
     view! {
         <h1>"Add a card"</h1>
@@ -746,7 +776,11 @@ fn NewCardPage() -> impl IntoView {
                 view! {
                     <Form method="post" action="/cards/new" enctype="multipart/form-data".to_string()>
                         <label>
-                            "Target-language word/phrase"
+                            {move || if card_type.get() == "sentence_translation" {
+                                "Target-language sentence"
+                            } else {
+                                "Target-language word/phrase"
+                            }}
                             <input
                                 type="text"
                                 name="target_text"
@@ -754,11 +788,39 @@ fn NewCardPage() -> impl IntoView {
                             />
                         </label>
                         <label>"Tags (comma separated)" <input type="text" name="tags" /></label>
-                        <MediaAttachmentFields
-                            chosen_image_url=chosen_image_url
-                            audio_input=audio_input
-                            video_input=video_input
-                        />
+                        <label>
+                            "Card type "
+                            <select
+                                name="card_type"
+                                prop:value=move || card_type.get()
+                                on:change=move |ev| card_type.set(event_target_value(&ev))
+                            >
+                                {CARD_TYPES.iter().map(|(value, label)| {
+                                    view! { <option value=*value>{*label}</option> }
+                                }).collect_view()}
+                            </select>
+                        </label>
+                        {move || {
+                            if card_type.get() == "sentence_translation" {
+                                view! {
+                                    <label>
+                                        "Known-language sentence"
+                                        <input type="text" name="source_text" />
+                                    </label>
+                                }
+                                .into_any()
+                            } else {
+                                view! {
+                                    <MediaAttachmentFields
+                                        chosen_image_url=chosen_image_url
+                                        audio_input=audio_input
+                                        video_input=video_input
+                                        audio_only=card_type.get() == "sound_to_written"
+                                    />
+                                }
+                                .into_any()
+                            }
+                        }}
                         <label>
                             <input type="checkbox" name="two_way" />
                             "Two-way: also review back → front, scheduled independently"
@@ -968,6 +1030,9 @@ fn CardPreviewHeader(
     video_url: Option<String>,
     youtube_url: Option<String>,
     target_text: String,
+    // `sentence_translation` cards only — fills the same "prompt" role a
+    // media_view would for every other card type.
+    source_text: Option<String>,
     tags: Vec<String>,
     signed_in: bool,
 ) -> impl IntoView {
@@ -975,6 +1040,7 @@ fn CardPreviewHeader(
     let audio_view = audio_url.map(|url| view! { <audio controls src=url></audio> });
     let video_view = video_url.map(|url| view! { <video controls src=url></video> });
     let youtube_view = youtube_url.map(youtube_embed);
+    let source_view = source_text.map(|text| view! { <p>{text}</p> });
     let tags_display = tags.join(", ");
     let info = view! {
         <div class="word-display"><ClickableWord text=target_text /></div>
@@ -1005,6 +1071,7 @@ fn CardPreviewHeader(
             {audio_view}
             {video_view}
             {youtube_view}
+            {source_view}
             {word_preview}
         </div>
     }
@@ -1079,7 +1146,9 @@ fn CardDictionarySection(
 fn CardEditForm(
     id: Uuid,
     target_text: String,
+    source_text: Option<String>,
     tags: Vec<String>,
+    card_type: String,
     two_way: bool,
     has_image: bool,
     has_audio: bool,
@@ -1093,6 +1162,8 @@ fn CardEditForm(
     let chosen_image_url: RwSignal<Option<String>> = RwSignal::new(None);
     let action = format!("/cards/{id}");
     let tags_value = tags.join(", ");
+    let card_type_signal = RwSignal::new(card_type);
+    let source_text_value = source_text.unwrap_or_default();
     view! {
         <Form
             method="post"
@@ -1101,7 +1172,11 @@ fn CardEditForm(
             version=card_refresh
         >
             <label>
-                "Target-language word/phrase"
+                {move || if card_type_signal.get() == "sentence_translation" {
+                    "Target-language sentence"
+                } else {
+                    "Target-language word/phrase"
+                }}
                 <input
                     type="text"
                     name="target_text"
@@ -1110,16 +1185,44 @@ fn CardEditForm(
                 />
             </label>
             <label>"Tags (comma separated)" <input type="text" name="tags" value=tags_value /></label>
-            <MediaAttachmentFields
-                editing=true
-                chosen_image_url=chosen_image_url
-                audio_input=audio_input
-                video_input=video_input
-                has_image=has_image
-                has_audio=has_audio
-                has_video=has_video
-                has_youtube=has_youtube
-            />
+            <label>
+                "Card type "
+                <select
+                    name="card_type"
+                    prop:value=move || card_type_signal.get()
+                    on:change=move |ev| card_type_signal.set(event_target_value(&ev))
+                >
+                    {CARD_TYPES.iter().map(|(value, label)| {
+                        view! { <option value=*value>{*label}</option> }
+                    }).collect_view()}
+                </select>
+            </label>
+            {move || {
+                if card_type_signal.get() == "sentence_translation" {
+                    view! {
+                        <label>
+                            "Known-language sentence"
+                            <input type="text" name="source_text" value=source_text_value.clone() />
+                        </label>
+                    }
+                    .into_any()
+                } else {
+                    view! {
+                        <MediaAttachmentFields
+                            editing=true
+                            chosen_image_url=chosen_image_url
+                            audio_input=audio_input
+                            video_input=video_input
+                            has_image=has_image
+                            has_audio=has_audio
+                            has_video=has_video
+                            has_youtube=has_youtube
+                            audio_only=card_type_signal.get() == "sound_to_written"
+                        />
+                    }
+                    .into_any()
+                }
+            }}
             <label>
                 <input type="checkbox" name="two_way" checked=two_way />
                 "Two-way: also review back → front, scheduled independently"
@@ -1574,6 +1677,7 @@ fn EditCardPage() -> impl IntoView {
                                 video_url=detail.video_url.clone()
                                 youtube_url=detail.youtube_url.clone()
                                 target_text=detail.target_text.clone()
+                                source_text=detail.source_text.clone()
                                 tags=detail.tags.clone()
                                 signed_in=signed_in
                             />
@@ -1593,7 +1697,9 @@ fn EditCardPage() -> impl IntoView {
                                 <CardEditForm
                                     id=id
                                     target_text=detail.target_text.clone()
+                                    source_text=detail.source_text.clone()
                                     tags=detail.tags.clone()
+                                    card_type=detail.card_type.clone()
                                     two_way=detail.two_way
                                     has_image=detail.image_url.is_some()
                                     has_audio=detail.audio_url.is_some()
@@ -2932,12 +3038,21 @@ fn ReviewPage() -> impl IntoView {
     let auth = Resource::new(|| (), |()| current_user_name());
     let order = RwSignal::new(ReviewOrderInput::DueDate);
     let deck_filter = RwSignal::new(None::<Uuid>);
+    let tag_filter = RwSignal::new(None::<String>);
     let decks = Resource::new(|| (), |()| list_decks());
+    let tags = Resource::new(|| (), |()| list_tags());
     let grade = ServerAction::<GradeCard>::new();
 
     let queue = Resource::new(
-        move || (deck_filter.get(), order.get(), grade.version().get()),
-        |(deck_id, order, _)| review_queue(deck_id, order),
+        move || {
+            (
+                deck_filter.get(),
+                tag_filter.get(),
+                order.get(),
+                grade.version().get(),
+            )
+        },
+        |(deck_id, tag, order, _)| review_queue(deck_id, tag, order),
     );
 
     view! {
@@ -2954,6 +3069,23 @@ fn ReviewPage() -> impl IntoView {
                         {move || Suspend::new(async move {
                             decks.await.unwrap_or_default().into_iter().map(|deck| {
                                 view! { <option value=deck.id.to_string()>{deck.name}</option> }
+                            }).collect_view()
+                        })}
+                    </Transition>
+                </select>
+            </label>
+            " "
+            <label>
+                "Filter by tag "
+                <select on:change=move |ev| {
+                    let value = event_target_value(&ev);
+                    tag_filter.set(if value.is_empty() { None } else { Some(value) });
+                }>
+                    <option value="">"All tags"</option>
+                    <Transition fallback=|| ()>
+                        {move || Suspend::new(async move {
+                            tags.await.unwrap_or_default().into_iter().map(|tag| {
+                                view! { <option value=tag.clone()>{tag.clone()}</option> }
                             }).collect_view()
                         })}
                     </Transition>
@@ -2993,13 +3125,21 @@ fn ReviewPage() -> impl IntoView {
                             Some(card) => {
                                 let card_id = card.id;
                                 let direction = card.direction;
-                                let media_view = view! {
-                                    {card.image_url.map(|url| view! { <img src=url alt="" /> })}
-                                    {card.audio_url.map(|url| view! { <audio controls src=url></audio> })}
-                                    {card.video_url.map(|url| view! { <video controls src=url></video> })}
-                                    {card.youtube_url.map(youtube_embed)}
-                                }
-                                .into_any();
+                                // `sentence_translation` cards have no media at
+                                // all — the known-language sentence fills the
+                                // same prompt/answer slot a media_view would.
+                                let media_view = if card.card_type == "sentence_translation" {
+                                    view! { <p>{card.source_text.unwrap_or_default()}</p> }
+                                        .into_any()
+                                } else {
+                                    view! {
+                                        {card.image_url.map(|url| view! { <img src=url alt="" /> })}
+                                        {card.audio_url.map(|url| view! { <audio controls src=url></audio> })}
+                                        {card.video_url.map(|url| view! { <video controls src=url></video> })}
+                                        {card.youtube_url.map(youtube_embed)}
+                                    }
+                                    .into_any()
+                                };
                                 // Forward: media is the prompt, target_text the
                                 // answer. Reverse (two-way cards only): the same
                                 // card, but target_text is the prompt and media
@@ -3156,6 +3296,7 @@ fn AccountPage() -> impl IntoView {
     let update_name = ServerAction::<UpdateName>::new();
     let update_email = ServerAction::<UpdateEmail>::new();
     let change_password = ServerAction::<ChangePassword>::new();
+    let create_invite = ServerAction::<CreateInvite>::new();
     // Re-fetched after either name or email actually saves, so the forms
     // below reflect the new value rather than the stale one they were
     // first loaded with.
@@ -3233,6 +3374,22 @@ fn AccountPage() -> impl IntoView {
                     {move || {
                         change_password.value().get().and_then(Result::err).map(|e| {
                             view! { <p>"Error: " {e.to_string()}</p> }
+                        })
+                    }}
+
+                    <h2>"Invite a friend"</h2>
+                    <p>
+                        "Signup is invite-only. Any signed-in user can send an invite — "
+                        "it emails them a signup link that expires in 7 days."
+                    </p>
+                    <ActionForm action=create_invite>
+                        <label>"Their email" <input type="email" name="email" /></label>
+                        <button type="submit">"Send invite"</button>
+                    </ActionForm>
+                    {move || {
+                        create_invite.value().get().map(|result| match result {
+                            Ok(()) => view! { <p>"Invite sent."</p> }.into_any(),
+                            Err(e) => view! { <p>"Error: " {e.to_string()}</p> }.into_any(),
                         })
                     }}
                 }

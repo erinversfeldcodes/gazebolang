@@ -5,28 +5,45 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Card {
     pub id: Uuid,
+    pub card_type: String,
     pub image_url: Option<String>,
     pub audio_url: Option<String>,
     pub video_url: Option<String>,
     pub youtube_url: Option<String>,
     pub target_text: String,
+    /// The known-language sentence, `sentence_translation` cards only —
+    /// `None` for every other card type.
+    pub source_text: Option<String>,
     pub two_way: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CardDetail {
     pub id: Uuid,
+    pub card_type: String,
     pub image_url: Option<String>,
     pub audio_url: Option<String>,
     pub video_url: Option<String>,
     pub youtube_url: Option<String>,
     pub target_text: String,
+    pub source_text: Option<String>,
     pub two_way: bool,
     pub tags: Vec<String>,
     pub deck_ids: Vec<Uuid>,
     pub page_ids: Vec<Uuid>,
     pub linked_cards: Vec<CardLink>,
 }
+
+/// The known card types: (value stored in the DB, UI label). Same
+/// "flat TEXT, validated against one shared list" convention as
+/// `LINK_TYPES` just below — a card type doesn't need its own Rust enum
+/// any more than a link type does, since nothing branches on it in SQL,
+/// only in which form fields are shown and how review renders a card.
+pub const CARD_TYPES: &[(&str, &str)] = &[
+    ("image_to_target", "Image → written"),
+    ("sound_to_written", "Audio → written"),
+    ("sentence_translation", "Sentence translation"),
+];
 
 /// A typed relationship to another card (minimal pair, back-chain step,
 /// sound-spelling correspondence — see `LINK_TYPES`). `is_source` is only
@@ -82,11 +99,13 @@ impl From<DirectionInput> for crate::db::Direction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewCard {
     pub id: Uuid,
+    pub card_type: String,
     pub image_url: Option<String>,
     pub audio_url: Option<String>,
     pub video_url: Option<String>,
     pub youtube_url: Option<String>,
     pub target_text: String,
+    pub source_text: Option<String>,
     pub direction: DirectionInput,
 }
 
@@ -160,11 +179,13 @@ pub async fn list_cards(
         .into_iter()
         .map(|r| Card {
             id: r.id,
+            card_type: r.card_type,
             image_url: r.image_url,
             audio_url: r.audio_url,
             video_url: r.video_url,
             youtube_url: r.youtube_url,
             target_text: r.target_text,
+            source_text: r.source_text,
             two_way: r.two_way,
         })
         .collect())
@@ -212,6 +233,8 @@ pub async fn get_card(card_id: Uuid) -> Result<Option<CardDetail>, ServerFnError
         .collect();
     Ok(Some(CardDetail {
         id: card.id,
+        card_type: card.card_type,
+        source_text: card.source_text,
         image_url: card.image_url,
         audio_url: card.audio_url,
         video_url: card.video_url,
@@ -272,11 +295,13 @@ pub async fn search_cards(
         .into_iter()
         .map(|r| Card {
             id: r.id,
+            card_type: r.card_type,
             image_url: r.image_url,
             audio_url: r.audio_url,
             video_url: r.video_url,
             youtube_url: r.youtube_url,
             target_text: r.target_text,
+            source_text: r.source_text,
             two_way: r.two_way,
         })
         .collect())
@@ -360,19 +385,28 @@ pub async fn delete_card(card_id: Uuid) -> Result<(), ServerFnError> {
 #[server]
 pub async fn review_queue(
     deck_id: Option<Uuid>,
+    tag: Option<String>,
     order: ReviewOrderInput,
 ) -> Result<ReviewQueueView, ServerFnError> {
     let user = require_user().await?;
     let state = expect_context::<crate::state::AppState>();
-    let queue = crate::db::review_queue(&state.db_pool, user.id, deck_id, order.into())
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let queue = crate::db::review_queue(
+        &state.db_pool,
+        user.id,
+        deck_id,
+        tag.as_deref(),
+        order.into(),
+    )
+    .await
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
     Ok(ReviewQueueView {
         cards: queue
             .cards
             .into_iter()
             .map(|r| ReviewCard {
                 id: r.id,
+                card_type: r.card_type,
+                source_text: r.source_text,
                 image_url: r.image_url,
                 audio_url: r.audio_url,
                 video_url: r.video_url,

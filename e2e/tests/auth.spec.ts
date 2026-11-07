@@ -1,6 +1,6 @@
 import { test, expect } from "./fixtures";
 import { Client } from "pg";
-import { RESEND_ALLOWED_EMAIL, uniqueWord } from "./helpers";
+import { RESEND_ALLOWED_EMAIL, uniqueWord, createInviteToken } from "./helpers";
 
 // Runs signed out, deliberately ignoring the project's saved auth state.
 test.use({ storageState: { cookies: [], origins: [] } });
@@ -59,14 +59,14 @@ test("requesting a password reset for an unknown email shows the same confirmati
 test("signing up with a too-short password shows an error, not a silent login", async ({
   page,
 }) => {
-  await page.goto("/signup");
+  const token = await createInviteToken(`${uniqueWord("shorty")}@example.com`);
+  await page.goto(`/signup?token=${token}`);
   await page.getByLabel("Name").fill("Shorty");
-  await page.getByLabel("Email").fill(`${uniqueWord("shorty")}@example.com`);
   await page.getByLabel("Password", { exact: true }).fill("short1");
   await page.getByLabel("Confirm password").fill("short1");
   await page.getByRole("button", { name: "Sign up" }).click();
   await expect(page.getByText(/at least 8 characters/i)).toBeVisible();
-  await expect(page).toHaveURL("/signup");
+  await expect(page).toHaveURL(/\/signup/);
 });
 
 // Full round trip against a fresh account created just for this test —
@@ -91,9 +91,9 @@ test("a full password reset lets you log in with the new password", async ({ pag
   const originalPassword = "the-original-password";
   const newPassword = "a-brand-new-password";
 
-  await page.goto("/signup");
+  const token = await createInviteToken(email);
+  await page.goto(`/signup?token=${token}`);
   await page.getByLabel("Name").fill("Reset Flow");
-  await page.getByLabel("Email").fill(email);
   await page.getByLabel("Password", { exact: true }).fill(originalPassword);
   await page.getByLabel("Confirm password").fill(originalPassword);
   await page.getByRole("button", { name: "Sign up" }).click();
@@ -142,6 +142,7 @@ async function deleteTestUser(email: string): Promise<void> {
       "DELETE FROM password_reset_tokens WHERE user_id = (SELECT id FROM users WHERE email = $1)",
       [lowered],
     );
+    await client.query("DELETE FROM invites WHERE email = $1", [lowered]);
     await client.query("DELETE FROM users WHERE email = $1", [lowered]);
   } finally {
     await client.end();

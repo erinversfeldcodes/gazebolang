@@ -1,0 +1,6 @@
+---
+source: crates/web/src/email.rs
+assertion_line: 148
+expression: "invite_html(\"https://gazebo.fly.dev/signup?token=abc123\")"
+---
+<p>You've been invited to Gazebo. Click to sign up:</p><p><a href="https://gazebo.fly.dev/signup?token=abc123">https://gazebo.fly.dev/signup?token=abc123</a></p><p>This link expires in 7 days.</p>

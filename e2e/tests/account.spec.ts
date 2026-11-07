@@ -1,6 +1,6 @@
 import { test, expect } from "./fixtures";
 import { Client } from "pg";
-import { uniqueWord, withServerResponse } from "./helpers";
+import { uniqueWord, withServerResponse, createInviteToken, RESEND_ALLOWED_EMAIL } from "./helpers";
 
 // Every test here signs up its own throwaway account rather than using
 // auth.setup.ts's shared storageState — changing the shared account's
@@ -32,9 +32,9 @@ async function signUpFreshAccount(
   password = "correct-horse-battery",
 ): Promise<{ email: string }> {
   const email = `${uniqueWord(prefix)}@example.com`;
-  await page.goto("/signup");
+  const token = await createInviteToken(email);
+  await page.goto(`/signup?token=${token}`);
   await page.getByLabel("Name").fill("Account Spec");
-  await page.getByLabel("Email").fill(email);
   await page.getByLabel("Password", { exact: true }).fill(password);
   await page.getByLabel("Confirm password").fill(password);
   await page.getByRole("button", { name: "Sign up" }).click();
@@ -61,6 +61,7 @@ async function deleteTestUser(email: string): Promise<void> {
       "DELETE FROM password_reset_tokens WHERE user_id = (SELECT id FROM users WHERE email = $1)",
       [lowered],
     );
+    await client.query("DELETE FROM invites WHERE email = $1", [lowered]);
     await client.query("DELETE FROM users WHERE email = $1", [lowered]);
   } finally {
     await client.end();
@@ -143,21 +144,23 @@ test("changing your email with the right password updates it and future logins",
 });
 
 test("changing your email to one already in use is rejected", async ({ page }) => {
-  // Signing up again overwrites the session cookie, so this leaves the
-  // page acting as the *second* account — exactly the one attempting the
-  // conflicting change below.
-  const { email: takenEmail } = await signUpFreshAccount(page, "account-email-taken");
+  // RESEND_ALLOWED_EMAIL (auth.setup.ts's shared account) is already
+  // guaranteed to exist for the whole suite's run, so reusing it as "an
+  // email already in use" needs only this one throwaway account instead
+  // of two live at once — keeping this test's own peak usage at the same
+  // one-temp-account budget every other test here holds to, which is what
+  // keeps the whole suite under MAX_USERS = 4 when files run concurrently
+  // (see the file-level comment above).
   const { email: dupEmail } = await signUpFreshAccount(page, "account-email-dup");
   try {
     await page.goto("/account");
 
-    await page.getByLabel("New email").fill(takenEmail);
+    await page.getByLabel("New email").fill(RESEND_ALLOWED_EMAIL);
     await page.getByLabel("Current password").first().fill("correct-horse-battery");
     // Error response again — see the note in the wrong-password test above.
     await page.getByRole("button", { name: "Save" }).nth(1).click();
     await expect(page.getByText(/already exists/i)).toBeVisible();
   } finally {
-    await deleteTestUser(takenEmail);
     await deleteTestUser(dupEmail);
   }
 });
