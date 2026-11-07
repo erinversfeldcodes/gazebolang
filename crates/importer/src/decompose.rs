@@ -186,6 +186,26 @@ fn merge_qualifier_into_notes(card: &mut Card, qualifier: &str) {
     }
 }
 
+/// Two (already-normalized) translations are "the same, modulo a
+/// likely transcription variant" when one is fully contained in the
+/// other — as a prefix, suffix, or substring — and they're not
+/// wildly different in length. Confirmed necessary in a real run:
+/// chunking a long entry into two overlapping halves and enumerating
+/// each independently produced the identical underlying translation
+/// twice with a one-character spelling difference picked up across
+/// the seam ("khupha isisu" vs "ukhupha isisu", a Xhosa noun-class
+/// prefix letter) — an exact-match dedup key can't catch that on its
+/// own. The length-difference cap keeps this from firing on a short
+/// translation that's simply, legitimately, a substring of an
+/// unrelated longer phrase elsewhere in the same entry.
+fn target_text_is_a_near_duplicate(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (shorter, longer) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    !shorter.is_empty() && longer.contains(shorter) && longer.len() - shorter.len() <= 3
+}
+
 /// `card` is mutated in place when kept: a qualifying parenthetical (see
 /// `split_trailing_parenthetical`) is moved out of `english` and into
 /// `notes`, whether this is the first card to carry that qualifier or a
@@ -201,7 +221,13 @@ fn merge_qualifier_into_notes(card: &mut Card, qualifier: &str) {
 /// real run: these are the same card, with a qualifier that's a
 /// usage-context note rather than a distinct sense, and keeping both
 /// as separate cards is pure redundancy, not two different things to
-/// learn).
+/// learn). When neither exact key matches, a slower fallback scan
+/// additionally catches a same-English card whose `target_text` is only
+/// a near-duplicate (see `target_text_is_a_near_duplicate`) rather
+/// than identical — deliberately gated on the English side matching
+/// first, so two genuinely different cards that happen to share a
+/// short, legitimately-reused Xhosa stem are never merged just because
+/// their translations overlap.
 pub fn card_rejection_reason(
     card: &mut Card,
     cards: &mut [Card],
@@ -237,7 +263,19 @@ pub fn card_rejection_reason(
     let existing_idx = seen_card_keys
         .get(&full_key)
         .or_else(|| seen_card_keys.get(&base_key))
-        .copied();
+        .copied()
+        .or_else(|| {
+            cards.iter().position(|existing| {
+                let existing_full = normalize_for_comparison(&existing.english);
+                let (existing_base_str, _) = split_trailing_parenthetical(&existing.english);
+                let existing_base = normalize_for_comparison(existing_base_str);
+                (existing_full == normalized_full || existing_base == normalized_base)
+                    && target_text_is_a_near_duplicate(
+                        &normalize_for_comparison(&existing.target_text),
+                        &normalized_target,
+                    )
+            })
+        });
     if let Some(existing_idx) = existing_idx {
         if let Some(q) = qualifier {
             merge_qualifier_into_notes(&mut cards[existing_idx], q);
@@ -260,9 +298,106 @@ pub struct Item {
     pub source_excerpt: String,
 }
 
+/// Entries at or below this length are processed as a single
+/// enumerate call, exactly as always — chunking only kicks in for the
+/// genuinely long outliers this session's research found evidence for
+/// (chunk-and-merge was the one technique in that research with
+/// direct, large, measured completeness gains). Measured against this
+/// real corpus: median entry length is 95 characters, mean 140 — this
+/// threshold only affects a handful of the longest entries (e.g.
+/// "about, prep.", one of the longest in this dictionary at 562
+/// characters), not the great majority of ordinary short entries,
+/// which have no documented enumeration problem to fix.
+const CHUNK_THRESHOLD_CHARS: usize = 300;
+
+/// How far back from the split point the second chunk's own start
+/// reaches — enough that a sense or worked example straddling the
+/// midpoint stays fully visible to at least one of the two chunks,
+/// rather than being sliced in half by the split itself. Any item
+/// found independently in both chunks' overlap is a real, expected
+/// duplicate, left for this module's own existing fill-stage
+/// deduplication (`card_rejection_reason`,
+/// `target_text_reused_from_a_different_sense`) to remove — the same
+/// "completeness first, precision as a separate later stage" split
+/// this session's research found working well elsewhere, not a new
+/// mechanism built just for this.
+const CHUNK_OVERLAP_CHARS: usize = 80;
+
+/// Splits `raw_entry` into two overlapping halves at the semicolon
+/// closest to its own midpoint, or returns `None` if the entry is
+/// short enough that a single, un-chunked enumerate call already
+/// works fine. Unlike this session's earlier, reverted mechanical
+/// pre-segmentation attempt, this never tells the model what to do
+/// with the text it's given — each half still gets the exact same
+/// free-form "list every item" prompt an un-chunked entry would, just
+/// with less text to search per call, which is the one part of that
+/// reverted attempt's premise (a smaller context gets searched more
+/// completely) this session's research found direct, strong evidence
+/// for, separately from the part that actually failed (restricting
+/// what the model could do with each piece).
+fn split_into_overlapping_chunks(raw_entry: &str) -> Option<(String, String)> {
+    if raw_entry.len() <= CHUNK_THRESHOLD_CHARS {
+        return None;
+    }
+    let mut midpoint = raw_entry.len() / 2;
+    while !raw_entry.is_char_boundary(midpoint) {
+        midpoint += 1;
+    }
+    let split_at = raw_entry[..midpoint]
+        .rfind(';')
+        .or_else(|| raw_entry.find(';'))?;
+    let first_half = raw_entry[..=split_at].trim().to_string();
+    let mut overlap_start = split_at.saturating_sub(CHUNK_OVERLAP_CHARS);
+    while !raw_entry.is_char_boundary(overlap_start) {
+        overlap_start += 1;
+    }
+    let second_half = raw_entry[overlap_start..].trim().to_string();
+    Some((first_half, second_half))
+}
+
 /// Pass 2a — enumerate one already-correctly-read entry's distinct
 /// learnable units (not their fields yet, just what they are).
+/// Chunks a genuinely long entry into two overlapping halves (see
+/// `split_into_overlapping_chunks`) and enumerates each independently,
+/// union-merging the results — short entries (the great majority) are
+/// completely unaffected, going through `enumerate_items_single_call`
+/// exactly once just as before.
+///
+/// Tried replacing the single-call approach entirely with a mechanical
+/// pre-segmentation (split on semicolons, let the model only
+/// classify/merge each span) per this session's own research —
+/// reverted after a real run showed it backfired badly: enumeration
+/// dropped from 268 to 168 items across the real 66-entry corpus
+/// (37%), for two compounding reasons. First, a comma-separated list
+/// isn't reliably "alternative translations of one sense" the way
+/// "-yeka, -lahla, -ncama" is — "abode"'s "ikhaya (ili-ama-), umzi,
+/// indlu (in- izin-)" lists three genuinely distinct Xhosa words that
+/// this model's own free-form judgment correctly separates into 5
+/// items, but a splitter that only ever breaks at semicolons (never
+/// commas) can't recover that distinction once collapsed to one span
+/// — there's no later step that can re-split what the mechanical pass
+/// already merged. Second, even where the mechanical split was
+/// reasonable, framing the model's job as a binary "merge with
+/// previous, yes or no" per span made it *more* eager to merge than
+/// free-form generation was, compounding the loss rather than just
+/// capping it. Kept as a cautionary real finding, not reattempted
+/// without addressing both failure modes, not just the first.
 pub fn enumerate_items(
+    engine: &TextEngine,
+    headword: &str,
+    raw_entry: &str,
+) -> Result<Vec<Item>, String> {
+    match split_into_overlapping_chunks(raw_entry) {
+        None => enumerate_items_single_call(engine, headword, raw_entry),
+        Some((first_half, second_half)) => {
+            let mut items = enumerate_items_single_call(engine, headword, &first_half)?;
+            items.extend(enumerate_items_single_call(engine, headword, &second_half)?);
+            Ok(items)
+        }
+    }
+}
+
+fn enumerate_items_single_call(
     engine: &TextEngine,
     headword: &str,
     raw_entry: &str,
@@ -661,6 +796,57 @@ mod tests {
     }
 
     #[test]
+    fn target_text_is_a_near_duplicate_catches_a_one_character_prefix_variant() {
+        // Real case: chunking split "abort" into two overlapping
+        // halves, each independently enumerating the same translation
+        // with a one-letter spelling difference across the seam.
+        assert!(target_text_is_a_near_duplicate(
+            "khupha isisu",
+            "ukhupha isisu"
+        ));
+    }
+
+    #[test]
+    fn target_text_is_a_near_duplicate_rejects_a_short_stem_inside_an_unrelated_longer_phrase() {
+        // The length-difference cap exists specifically so a short,
+        // legitimately-reused Xhosa stem elsewhere in the same entry
+        // isn't treated as "the same card" just because one string
+        // contains the other.
+        assert!(!target_text_is_a_near_duplicate(
+            "kho",
+            "kukho iinyoka ezininzi"
+        ));
+    }
+
+    #[test]
+    fn rejects_a_near_duplicate_target_text_under_the_same_english() {
+        let mut cards = Vec::new();
+        let mut seen = HashMap::new();
+        assert_eq!(check(&mut cards, &mut seen, "abort", "khupha isisu"), None);
+        assert_eq!(
+            check(&mut cards, &mut seen, "abort", "ukhupha isisu"),
+            Some("duplicate of an already-created card")
+        );
+        assert_eq!(cards.len(), 1);
+    }
+
+    #[test]
+    fn keeps_a_near_duplicate_target_text_under_a_different_english() {
+        // The near-duplicate fallback is gated on the English side
+        // matching first — a short Xhosa stem legitimately recurring
+        // under a genuinely different English sense within the same
+        // entry must not be merged away.
+        let mut cards = Vec::new();
+        let mut seen = HashMap::new();
+        assert_eq!(check(&mut cards, &mut seen, "abort", "khupha isisu"), None);
+        assert_eq!(
+            check(&mut cards, &mut seen, "aborted fetus", "isisu esiphumileyo"),
+            None
+        );
+        assert_eq!(cards.len(), 2);
+    }
+
+    #[test]
     fn treats_the_duplicate_check_case_insensitively() {
         let mut cards = Vec::new();
         let mut seen = HashMap::new();
@@ -801,6 +987,59 @@ mod tests {
             label: label.to_string(),
             source_excerpt: source_excerpt.to_string(),
         }
+    }
+
+    #[test]
+    fn short_entries_are_not_chunked() {
+        assert_eq!(split_into_overlapping_chunks("abode, n. ikhaya."), None);
+    }
+
+    #[test]
+    fn splits_the_real_about_prep_entry_without_cutting_any_sense_in_half() {
+        // Real entry, 562 characters — one of the longest in this
+        // dictionary, and the one that originally motivated this
+        // change.
+        let raw_entry = "about, prep. (with verbs of movement) apha naphaya (plus \
+            locative); eg. he was walking ~ the town; wayehamba-hamba apha naphaya \
+            edolphini; (indicating position or state) alpha naphaya (plus locative); \
+            eg. books are lying ~ her room: kukho iincwadi apha naphaya egumbini \
+            lakhe; (near to) kufuphi na-; (expressing 'concerning, regarding, in \
+            connection with') nga-; eg. he does not care ~ his clothes: \
+            akazikha-thazi ngempahla yakhe; what are you talking ~?: nithetha \
+            ngantoni?; go/set ~ something: -enza.";
+        let (first_half, second_half) = split_into_overlapping_chunks(raw_entry).unwrap();
+        // Every real sense/example must be fully contained in at least
+        // one half, not torn across the split point.
+        assert!(first_half.contains("(with verbs of movement) apha naphaya (plus locative)"));
+        assert!(first_half.contains("he was walking ~ the town"));
+        assert!(second_half.contains("(near to) kufuphi na-"));
+        assert!(second_half.contains("go/set ~ something: -enza."));
+        // The overlap must give both halves a real seam to dedup
+        // against, not just abut exactly at the split.
+        assert!(first_half.len() + second_half.len() > raw_entry.len());
+    }
+
+    #[test]
+    fn split_into_overlapping_chunks_never_panics_on_short_or_delimiter_free_long_text() {
+        assert_eq!(split_into_overlapping_chunks(""), None);
+        // Long enough to pass the threshold, but with no semicolon at
+        // all to split on.
+        let no_semicolons = "a".repeat(400);
+        assert_eq!(split_into_overlapping_chunks(&no_semicolons), None);
+    }
+
+    #[test]
+    fn split_into_overlapping_chunks_is_safe_on_multi_byte_utf8_near_the_midpoint() {
+        // "é" and "·" are both real characters this dictionary's own
+        // headwords and derived-word markers use — the midpoint/overlap
+        // char-boundary search must never panic on them.
+        let raw_entry = format!(
+            "abbé, n. {}; eg. umfundisi waseFransi ~·té: something; {}",
+            "x".repeat(140),
+            "y".repeat(160)
+        );
+        let result = split_into_overlapping_chunks(&raw_entry);
+        assert!(result.is_some());
     }
 
     #[test]
