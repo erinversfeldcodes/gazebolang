@@ -196,7 +196,14 @@ fn youtube_embed_url(input: &str) -> Result<String, String> {
 #[allow(clippy::struct_excessive_bools)]
 struct CardFormFields {
     target_text: String,
+    // The known-language sentence — only meaningful for (and only ever
+    // rendered on the form for) `sentence_translation` cards.
+    source_text: String,
     tags_raw: String,
+    // Validated against `web::cards::CARD_TYPES` in `parse_card_multipart`
+    // — always a known value by the time a caller sees this field, never
+    // arbitrary user text.
+    card_type: String,
     two_way: bool,
     image_url: Option<String>,
     audio_url: Option<String>,
@@ -232,7 +239,9 @@ async fn parse_card_multipart(
 ) -> Result<CardFormFields, (axum::http::StatusCode, String)> {
     let mut fields = CardFormFields {
         target_text: String::new(),
+        source_text: String::new(),
         tags_raw: String::new(),
+        card_type: "image_to_target".to_string(),
         two_way: false,
         image_url: None,
         audio_url: None,
@@ -255,7 +264,19 @@ async fn parse_card_multipart(
             "target_text" => {
                 fields.target_text = field.text().await.unwrap_or_default().trim().to_string();
             }
+            "source_text" => {
+                fields.source_text = field.text().await.unwrap_or_default().trim().to_string();
+            }
             "tags" => fields.tags_raw = field.text().await.unwrap_or_default(),
+            "card_type" => {
+                let raw = field.text().await.unwrap_or_default();
+                if web::cards::CARD_TYPES
+                    .iter()
+                    .any(|(value, _)| *value == raw)
+                {
+                    fields.card_type = raw;
+                }
+            }
             // A checkbox only appears in the multipart body at all when
             // checked, so this field's mere presence means true.
             "two_way" => fields.two_way = true,
@@ -377,11 +398,13 @@ async fn cards_new(
         &state.db_pool,
         user.id,
         web::db::NewCard {
+            card_type: &fields.card_type,
             image_url: fields.image_url.as_deref().unwrap_or(""),
             audio_url: fields.audio_url.as_deref().unwrap_or(""),
             video_url: fields.video_url.as_deref().unwrap_or(""),
             youtube_url: fields.youtube_url.as_deref().unwrap_or(""),
             target_text: &fields.target_text,
+            source_text: &fields.source_text,
             two_way: fields.two_way,
         },
         &parse_tags(&fields.tags_raw),
@@ -681,11 +704,13 @@ async fn cards_update(
         &state.db_pool,
         card_id,
         web::db::NewCard {
+            card_type: &fields.card_type,
             image_url: &image_url,
             audio_url: &audio_url,
             video_url: &video_url,
             youtube_url: &youtube_url,
             target_text: &fields.target_text,
+            source_text: &fields.source_text,
             two_way: fields.two_way,
         },
         &parse_tags(&fields.tags_raw),

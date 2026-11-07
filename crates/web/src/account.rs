@@ -37,9 +37,32 @@ async fn session_cookies() -> Result<tower_cookies::Cookies, ServerFnError> {
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
+/// Mints an invite and emails the link. Any signed-in user may invite —
+/// see `auth::create_invite`'s doc comment for why.
 #[server]
-pub async fn sign_up(
-    email: String,
+pub async fn create_invite(email: String) -> Result<(), ServerFnError> {
+    let user = require_user().await?;
+    let state = expect_context::<crate::state::AppState>();
+    let base_url =
+        std::env::var("APP_BASE_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let token = crate::auth::create_invite(&state.db_pool, user.id, &email)
+        .await
+        .map_err(ServerFnError::new)?;
+    let link = format!("{base_url}/signup?token={token}");
+    if let Err(e) = state.email_sender.send_invite(&email, &link).await {
+        return Err(ServerFnError::new(format!(
+            "invite created, but the email failed to send: {e}"
+        )));
+    }
+    Ok(())
+}
+
+/// Creates a new account by redeeming an invite token. This is now the
+/// *only* way a new account gets created — open self-serve signup no
+/// longer exists (see `auth::sign_up_via_invite`'s doc comment).
+#[server]
+pub async fn sign_up_via_invite(
+    token: String,
     name: String,
     password: String,
     confirm_password: String,
@@ -48,7 +71,7 @@ pub async fn sign_up(
         return Err(ServerFnError::new("passwords do not match"));
     }
     let state = expect_context::<crate::state::AppState>();
-    let session_token = crate::auth::sign_up(&state.db_pool, &email, &name, &password)
+    let session_token = crate::auth::sign_up_via_invite(&state.db_pool, &token, &name, &password)
         .await
         .map_err(ServerFnError::new)?;
     session_cookies()

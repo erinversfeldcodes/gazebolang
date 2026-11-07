@@ -11,6 +11,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct CardRow {
     pub id: Uuid,
+    pub card_type: String,
     pub image_url: Option<String>,
     pub audio_url: Option<String>,
     pub video_url: Option<String>,
@@ -22,6 +23,8 @@ pub struct CardRow {
     /// nothing stops both being set if a caller really wants that.
     pub youtube_url: Option<String>,
     pub target_text: String,
+    /// The known-language sentence, `sentence_translation` cards only.
+    pub source_text: Option<String>,
     pub two_way: bool,
 }
 
@@ -75,22 +78,26 @@ impl Direction {
 #[derive(Debug, Clone)]
 pub struct ReviewQueueCard {
     pub id: Uuid,
+    pub card_type: String,
     pub image_url: Option<String>,
     pub audio_url: Option<String>,
     pub video_url: Option<String>,
     pub youtube_url: Option<String>,
     pub target_text: String,
+    pub source_text: Option<String>,
     pub direction: Direction,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct ReviewQueueCardRow {
     id: Uuid,
+    card_type: String,
     image_url: Option<String>,
     audio_url: Option<String>,
     video_url: Option<String>,
     youtube_url: Option<String>,
     target_text: String,
+    source_text: Option<String>,
     direction: String,
 }
 
@@ -98,11 +105,13 @@ impl From<ReviewQueueCardRow> for ReviewQueueCard {
     fn from(row: ReviewQueueCardRow) -> Self {
         ReviewQueueCard {
             id: row.id,
+            card_type: row.card_type,
             image_url: row.image_url,
             audio_url: row.audio_url,
             video_url: row.video_url,
             youtube_url: row.youtube_url,
             target_text: row.target_text,
+            source_text: row.source_text,
             direction: Direction::from_db(&row.direction),
         }
     }
@@ -151,11 +160,19 @@ pub struct NewCard<'a> {
     /// `main.rs::youtube_embed_url`).
     pub youtube_url: &'a str,
     pub target_text: &'a str,
+    /// The known-language sentence, `sentence_translation` cards only —
+    /// `""` means `NULL` (same `non_empty` convention as the media URLs).
+    pub source_text: &'a str,
     pub two_way: bool,
+    /// One of `cards::CARD_TYPES`'s DB values. `""` (the `Default` value)
+    /// means "use the default" — see `create_card`'s/`update_card`'s own
+    /// fallback — the same `""`-means-absent convention `non_empty`
+    /// already uses for the media URL fields below.
+    pub card_type: &'a str,
 }
 
-const CARD_COLUMNS: &str =
-    "c.id, c.image_url, c.audio_url, c.video_url, c.youtube_url, c.target_text, c.two_way";
+const CARD_COLUMNS: &str = "c.id, c.card_type, c.image_url, c.audio_url, c.video_url, \
+     c.youtube_url, c.target_text, c.source_text, c.two_way";
 
 // --- cards --------------------------------------------------------------
 
@@ -268,16 +285,23 @@ pub async fn create_card(
     tags: &[String],
 ) -> sqlx::Result<Uuid> {
     let mut tx = pool.begin().await?;
+    let card_type = if card.card_type.is_empty() {
+        "image_to_target"
+    } else {
+        card.card_type
+    };
 
     let id: Uuid = sqlx::query_scalar(
-        "INSERT INTO cards (card_type, image_url, audio_url, video_url, youtube_url, target_text, two_way, created_by) \
-         VALUES ('image_to_target', $1, $2, $3, $4, $5, $6, $7) RETURNING id",
+        "INSERT INTO cards (card_type, image_url, audio_url, video_url, youtube_url, target_text, source_text, two_way, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
     )
+    .bind(card_type)
     .bind(non_empty(card.image_url))
     .bind(non_empty(card.audio_url))
     .bind(non_empty(card.video_url))
     .bind(non_empty(card.youtube_url))
     .bind(card.target_text)
+    .bind(non_empty(card.source_text))
     .bind(card.two_way)
     .bind(created_by)
     .fetch_one(&mut *tx)
@@ -303,16 +327,23 @@ pub async fn update_card(
     tags: &[String],
 ) -> sqlx::Result<()> {
     let mut tx = pool.begin().await?;
+    let card_type = if card.card_type.is_empty() {
+        "image_to_target"
+    } else {
+        card.card_type
+    };
 
     sqlx::query(
-        "UPDATE cards SET image_url = $1, audio_url = $2, video_url = $3, youtube_url = $4, \
-         target_text = $5, two_way = $6 WHERE id = $7",
+        "UPDATE cards SET card_type = $1, image_url = $2, audio_url = $3, video_url = $4, \
+         youtube_url = $5, target_text = $6, source_text = $7, two_way = $8 WHERE id = $9",
     )
+    .bind(card_type)
     .bind(non_empty(card.image_url))
     .bind(non_empty(card.audio_url))
     .bind(non_empty(card.video_url))
     .bind(non_empty(card.youtube_url))
     .bind(card.target_text)
+    .bind(non_empty(card.source_text))
     .bind(card.two_way)
     .bind(card_id)
     .execute(&mut *tx)
@@ -567,6 +598,7 @@ async fn due_review_cards(
     pool: &PgPool,
     user_id: Uuid,
     deck_id: Option<Uuid>,
+    tag: Option<&str>,
     order: ReviewOrder,
 ) -> sqlx::Result<Vec<ReviewQueueCard>> {
     // `order_clause` is one of three fixed literals selected by a closed
@@ -580,31 +612,28 @@ async fn due_review_cards(
         ReviewOrder::HardestFirst => "rs.difficulty DESC",
     };
 
-    let rows: Vec<ReviewQueueCardRow> = if let Some(deck_id) = deck_id {
-        let sql = format!(
-            "SELECT c.id, c.image_url, c.audio_url, c.video_url, c.youtube_url, c.target_text, rs.direction \
-             FROM cards c \
-             JOIN review_state rs ON rs.card_id = c.id AND rs.user_id = $1 \
-             JOIN deck_cards dc ON dc.card_id = c.id AND dc.deck_id = $2 \
-             WHERE rs.due_at <= now() ORDER BY {order_clause}"
-        );
-        sqlx::query_as(sqlx::AssertSqlSafe(sql))
-            .bind(user_id)
-            .bind(deck_id)
-            .fetch_all(pool)
-            .await?
-    } else {
-        let sql = format!(
-            "SELECT c.id, c.image_url, c.audio_url, c.video_url, c.youtube_url, c.target_text, rs.direction \
-             FROM cards c \
-             JOIN review_state rs ON rs.card_id = c.id AND rs.user_id = $1 \
-             WHERE rs.due_at <= now() ORDER BY {order_clause}"
-        );
-        sqlx::query_as(sqlx::AssertSqlSafe(sql))
-            .bind(user_id)
-            .fetch_all(pool)
-            .await?
-    };
+    // `deck_id`/`tag` are bound as nullable params with an `IS NULL OR ...`
+    // guard rather than branching into separate queries per combination —
+    // `dc`/`t` are pinned (via the JOIN condition) to at most the one row
+    // that matches the filter, so a NULL filter never multiplies rows.
+    let sql = format!(
+        "SELECT c.id, c.card_type, c.image_url, c.audio_url, c.video_url, c.youtube_url, c.target_text, \
+                c.source_text, rs.direction \
+         FROM cards c \
+         JOIN review_state rs ON rs.card_id = c.id AND rs.user_id = $1 \
+         LEFT JOIN deck_cards dc ON dc.card_id = c.id AND dc.deck_id = $2 \
+         LEFT JOIN card_tags t ON t.card_id = c.id AND t.tag = $3 \
+         WHERE rs.due_at <= now() \
+           AND ($2::uuid IS NULL OR dc.card_id IS NOT NULL) \
+           AND ($3::text IS NULL OR t.card_id IS NOT NULL) \
+         ORDER BY {order_clause}"
+    );
+    let rows: Vec<ReviewQueueCardRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(user_id)
+        .bind(deck_id)
+        .bind(tag)
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
@@ -617,55 +646,43 @@ async fn new_cards(
     pool: &PgPool,
     user_id: Uuid,
     deck_id: Option<Uuid>,
+    tag: Option<&str>,
     limit: i64,
 ) -> sqlx::Result<Vec<ReviewQueueCard>> {
     if limit <= 0 {
         return Ok(Vec::new());
     }
-    let rows: Vec<ReviewQueueCardRow> = if let Some(deck_id) = deck_id {
-        sqlx::query_as(
-            "SELECT id, image_url, audio_url, video_url, youtube_url, target_text, direction FROM ( \
-                 SELECT c.id, c.image_url, c.audio_url, c.video_url, c.youtube_url, c.target_text, \
-                        'forward' AS direction, c.created_at AS sort_key \
-                 FROM cards c \
-                 JOIN deck_cards dc ON dc.card_id = c.id AND dc.deck_id = $3 \
-                 LEFT JOIN review_state rs ON rs.card_id = c.id AND rs.user_id = $1 AND rs.direction = 'forward' \
-                 WHERE rs.card_id IS NULL \
-                 UNION ALL \
-                 SELECT c.id, c.image_url, c.audio_url, c.video_url, c.youtube_url, c.target_text, \
-                        'reverse' AS direction, c.created_at AS sort_key \
-                 FROM cards c \
-                 JOIN deck_cards dc ON dc.card_id = c.id AND dc.deck_id = $3 \
-                 LEFT JOIN review_state rs ON rs.card_id = c.id AND rs.user_id = $1 AND rs.direction = 'reverse' \
-                 WHERE c.two_way AND rs.card_id IS NULL \
-             ) combined ORDER BY sort_key ASC LIMIT $2",
-        )
-        .bind(user_id)
-        .bind(limit)
-        .bind(deck_id)
-        .fetch_all(pool)
-        .await?
-    } else {
-        sqlx::query_as(
-            "SELECT id, image_url, audio_url, video_url, youtube_url, target_text, direction FROM ( \
-                 SELECT c.id, c.image_url, c.audio_url, c.video_url, c.youtube_url, c.target_text, \
-                        'forward' AS direction, c.created_at AS sort_key \
-                 FROM cards c \
-                 LEFT JOIN review_state rs ON rs.card_id = c.id AND rs.user_id = $1 AND rs.direction = 'forward' \
-                 WHERE rs.card_id IS NULL \
-                 UNION ALL \
-                 SELECT c.id, c.image_url, c.audio_url, c.video_url, c.youtube_url, c.target_text, \
-                        'reverse' AS direction, c.created_at AS sort_key \
-                 FROM cards c \
-                 LEFT JOIN review_state rs ON rs.card_id = c.id AND rs.user_id = $1 AND rs.direction = 'reverse' \
-                 WHERE c.two_way AND rs.card_id IS NULL \
-             ) combined ORDER BY sort_key ASC LIMIT $2",
-        )
-        .bind(user_id)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?
-    };
+    // Same nullable-param guard as `due_review_cards` — see its comment.
+    let rows: Vec<ReviewQueueCardRow> = sqlx::query_as(
+        "SELECT id, card_type, image_url, audio_url, video_url, youtube_url, target_text, \
+                source_text, direction FROM ( \
+             SELECT c.id, c.card_type, c.image_url, c.audio_url, c.video_url, c.youtube_url, c.target_text, \
+                    c.source_text, 'forward' AS direction, c.created_at AS sort_key \
+             FROM cards c \
+             LEFT JOIN deck_cards dc ON dc.card_id = c.id AND dc.deck_id = $3 \
+             LEFT JOIN card_tags t ON t.card_id = c.id AND t.tag = $4 \
+             LEFT JOIN review_state rs ON rs.card_id = c.id AND rs.user_id = $1 AND rs.direction = 'forward' \
+             WHERE rs.card_id IS NULL \
+               AND ($3::uuid IS NULL OR dc.card_id IS NOT NULL) \
+               AND ($4::text IS NULL OR t.card_id IS NOT NULL) \
+             UNION ALL \
+             SELECT c.id, c.card_type, c.image_url, c.audio_url, c.video_url, c.youtube_url, c.target_text, \
+                    c.source_text, 'reverse' AS direction, c.created_at AS sort_key \
+             FROM cards c \
+             LEFT JOIN deck_cards dc ON dc.card_id = c.id AND dc.deck_id = $3 \
+             LEFT JOIN card_tags t ON t.card_id = c.id AND t.tag = $4 \
+             LEFT JOIN review_state rs ON rs.card_id = c.id AND rs.user_id = $1 AND rs.direction = 'reverse' \
+             WHERE c.two_way AND rs.card_id IS NULL \
+               AND ($3::uuid IS NULL OR dc.card_id IS NOT NULL) \
+               AND ($4::text IS NULL OR t.card_id IS NOT NULL) \
+         ) combined ORDER BY sort_key ASC LIMIT $2",
+    )
+    .bind(user_id)
+    .bind(limit)
+    .bind(deck_id)
+    .bind(tag)
+    .fetch_all(pool)
+    .await?;
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
@@ -707,9 +724,10 @@ pub async fn review_queue(
     pool: &PgPool,
     user_id: Uuid,
     deck_id: Option<Uuid>,
+    tag: Option<&str>,
     order: ReviewOrder,
 ) -> sqlx::Result<ReviewQueue> {
-    let review_cards = due_review_cards(pool, user_id, deck_id, order).await?;
+    let review_cards = due_review_cards(pool, user_id, deck_id, tag, order).await?;
     let limit = daily_new_card_limit(pool, user_id).await?;
     let introduced_today = new_cards_introduced_today(pool, user_id).await?;
 
@@ -717,7 +735,7 @@ pub async fn review_queue(
         Some(limit) => (i64::from(limit) - introduced_today).max(0),
         None => 1000, // sane hard cap so an "unlimited" setting can't blow up one query
     };
-    let new = new_cards(pool, user_id, deck_id, remaining_new).await?;
+    let new = new_cards(pool, user_id, deck_id, tag, remaining_new).await?;
 
     #[allow(clippy::cast_possible_wrap)] // card counts are nowhere near i64::MAX
     let due_review_count = review_cards.len() as i64;
@@ -1484,6 +1502,92 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn card_type_defaults_to_image_to_target_and_round_trips_when_set(pool: PgPool) {
+        let user_id = test_user(&pool).await;
+        let defaulted = create_card(&pool, user_id, card_with_text("default"), &[])
+            .await
+            .unwrap();
+        let sound_card = create_card(
+            &pool,
+            user_id,
+            NewCard {
+                card_type: "sound_to_written",
+                audio_url: "https://example.com/word.mp3",
+                target_text: "isiZulu",
+                ..Default::default()
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            get_card(&pool, defaulted).await.unwrap().unwrap().card_type,
+            "image_to_target"
+        );
+        assert_eq!(
+            get_card(&pool, sound_card)
+                .await
+                .unwrap()
+                .unwrap()
+                .card_type,
+            "sound_to_written"
+        );
+
+        update_card(
+            &pool,
+            sound_card,
+            NewCard {
+                card_type: "image_to_target",
+                target_text: "isiZulu",
+                ..Default::default()
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get_card(&pool, sound_card)
+                .await
+                .unwrap()
+                .unwrap()
+                .card_type,
+            "image_to_target"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn sentence_translation_card_round_trips_source_text(pool: PgPool) {
+        let user_id = test_user(&pool).await;
+        let card_id = create_card(
+            &pool,
+            user_id,
+            NewCard {
+                card_type: "sentence_translation",
+                target_text: "Ndiya kudla",
+                source_text: "I am going to eat",
+                ..Default::default()
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let card = get_card(&pool, card_id).await.unwrap().unwrap();
+        assert_eq!(card.card_type, "sentence_translation");
+        assert_eq!(card.source_text, Some("I am going to eat".to_string()));
+
+        // Every other card type leaves it unset.
+        let other = create_card(&pool, user_id, card_with_text("word"), &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            get_card(&pool, other).await.unwrap().unwrap().source_text,
+            None
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn list_cards_filters_by_tag(pool: PgPool) {
         let user_id = test_user(&pool).await;
         create_card(
@@ -1606,11 +1710,33 @@ mod tests {
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].id, in_deck);
 
-        let queue = review_queue(&pool, user_id, Some(deck_id), ReviewOrder::DueDate)
+        let queue = review_queue(&pool, user_id, Some(deck_id), None, ReviewOrder::DueDate)
             .await
             .unwrap();
         assert_eq!(queue.cards.len(), 1);
         assert_eq!(queue.cards[0].id, in_deck);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn tag_scopes_review_queue(pool: PgPool) {
+        let user_id = test_user(&pool).await;
+        let tagged = create_card(
+            &pool,
+            user_id,
+            card_with_text("tagged"),
+            &["topic".to_string()],
+        )
+        .await
+        .unwrap();
+        let _untagged = create_card(&pool, user_id, card_with_text("untagged"), &[])
+            .await
+            .unwrap();
+
+        let queue = review_queue(&pool, user_id, None, Some("topic"), ReviewOrder::DueDate)
+            .await
+            .unwrap();
+        assert_eq!(queue.cards.len(), 1);
+        assert_eq!(queue.cards[0].id, tagged);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -1788,7 +1914,7 @@ mod tests {
 
         // Before any review, a two-way card offers two independent "new"
         // slots — one per direction — not one.
-        let before = review_queue(&pool, user_id, None, ReviewOrder::DueDate)
+        let before = review_queue(&pool, user_id, None, None, ReviewOrder::DueDate)
             .await
             .unwrap();
         assert_eq!(before.new_available_today, 2);
@@ -1799,7 +1925,7 @@ mod tests {
 
         // Grading the forward direction doesn't touch the reverse one:
         // it's still new, and forward isn't due again immediately.
-        let after_forward = review_queue(&pool, user_id, None, ReviewOrder::DueDate)
+        let after_forward = review_queue(&pool, user_id, None, None, ReviewOrder::DueDate)
             .await
             .unwrap();
         assert_eq!(after_forward.new_available_today, 1);
@@ -1822,7 +1948,7 @@ mod tests {
             .await
             .unwrap();
 
-        let queue = review_queue(&pool, user_id, None, ReviewOrder::DueDate)
+        let queue = review_queue(&pool, user_id, None, None, ReviewOrder::DueDate)
             .await
             .unwrap();
         assert_eq!(queue.new_available_today, 1);
@@ -1836,7 +1962,7 @@ mod tests {
             .unwrap();
 
         // Before any review, it's a "new" card, not a "due review" one.
-        let before = review_queue(&pool, user_id, None, ReviewOrder::DueDate)
+        let before = review_queue(&pool, user_id, None, None, ReviewOrder::DueDate)
             .await
             .unwrap();
         assert_eq!(before.due_review_count, 0);
@@ -1846,7 +1972,7 @@ mod tests {
             .await
             .unwrap();
 
-        let after = review_queue(&pool, user_id, None, ReviewOrder::DueDate)
+        let after = review_queue(&pool, user_id, None, None, ReviewOrder::DueDate)
             .await
             .unwrap();
         assert!(
@@ -1869,7 +1995,7 @@ mod tests {
             .await
             .unwrap();
 
-        let queue = review_queue(&pool, user_id, None, ReviewOrder::DueDate)
+        let queue = review_queue(&pool, user_id, None, None, ReviewOrder::DueDate)
             .await
             .unwrap();
         assert_eq!(
@@ -1904,7 +2030,7 @@ mod tests {
         .await
         .unwrap();
 
-        let queue = review_queue(&pool, user_id, None, ReviewOrder::DueDate)
+        let queue = review_queue(&pool, user_id, None, None, ReviewOrder::DueDate)
             .await
             .unwrap();
         assert_eq!(
@@ -1932,7 +2058,7 @@ mod tests {
             .await
             .unwrap();
 
-        let queue = review_queue(&pool, user_id, None, ReviewOrder::DueDate)
+        let queue = review_queue(&pool, user_id, None, None, ReviewOrder::DueDate)
             .await
             .unwrap();
         assert_eq!(

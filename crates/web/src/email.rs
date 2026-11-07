@@ -48,6 +48,11 @@ impl EmailSender {
             .await
     }
 
+    pub async fn send_invite(&self, to: &str, link: &str) -> Result<(), String> {
+        self.send(to, "You're invited to Gazebo", &invite_html(link))
+            .await
+    }
+
     /// Sends a clearly-labeled, harmless email used only to prove the
     /// Resend integration actually works end to end — see
     /// `/internal/email-check`, which CI hits right after every deploy.
@@ -113,6 +118,13 @@ fn password_reset_html(link: &str) -> String {
     )
 }
 
+fn invite_html(link: &str) -> String {
+    format!(
+        "<p>You've been invited to Gazebo. Click to sign up:</p><p><a href=\"{link}\">{link}</a></p>\
+         <p>This link expires in 7 days.</p>"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,12 +143,28 @@ mod tests {
         insta::assert_snapshot!(TEST_EMAIL_HTML);
     }
 
+    #[test]
+    fn invite_email_body_snapshot() {
+        insta::assert_snapshot!(invite_html("https://gazebo.fly.dev/signup?token=abc123"));
+    }
+
     #[tokio::test]
     async fn console_send_password_reset_always_succeeds() {
         let result = EmailSender::Console
             .send_password_reset(
                 "someone@example.com",
                 "https://example.com/reset-password?token=abc",
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn console_send_invite_always_succeeds() {
+        let result = EmailSender::Console
+            .send_invite(
+                "someone@example.com",
+                "https://example.com/signup?token=abc",
             )
             .await;
         assert!(result.is_ok());

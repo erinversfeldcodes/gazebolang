@@ -20,11 +20,13 @@ use uuid::Uuid;
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct CardRow {
     id: Uuid,
+    card_type: String,
     image_url: Option<String>,
     audio_url: Option<String>,
     video_url: Option<String>,
     youtube_url: Option<String>,
     target_text: String,
+    source_text: Option<String>,
     two_way: bool,
 }
 
@@ -36,11 +38,13 @@ impl From<CardRow> for crate::cards::Card {
         // generic From impl living on crate::cards::Card itself.
         crate::cards::Card {
             id: r.id,
+            card_type: r.card_type,
             image_url: r.image_url,
             audio_url: r.audio_url,
             video_url: r.video_url,
             youtube_url: r.youtube_url,
             target_text: r.target_text,
+            source_text: r.source_text,
             two_way: r.two_way,
         }
     }
@@ -53,8 +57,8 @@ impl From<CardRow> for crate::cards::Card {
 #[cfg(feature = "ssr")]
 async fn starting_card_rows(pool: &sqlx::PgPool) -> sqlx::Result<Vec<CardRow>> {
     sqlx::query_as(
-        "SELECT DISTINCT c.id, c.image_url, c.audio_url, c.video_url, c.youtube_url, \
-                c.target_text, c.two_way \
+        "SELECT DISTINCT c.id, c.card_type, c.image_url, c.audio_url, c.video_url, c.youtube_url, \
+                c.target_text, c.source_text, c.two_way \
          FROM cards c \
          JOIN card_links cl ON cl.card_id = c.id AND cl.link_type = 'back_chain_step' \
          WHERE NOT EXISTS ( \
@@ -76,8 +80,8 @@ async fn starting_card_rows(pool: &sqlx::PgPool) -> sqlx::Result<Vec<CardRow>> {
 #[cfg(feature = "ssr")]
 async fn next_step_row(pool: &sqlx::PgPool, card_id: Uuid) -> sqlx::Result<Option<CardRow>> {
     sqlx::query_as(
-        "SELECT c.id, c.image_url, c.audio_url, c.video_url, c.youtube_url, \
-                c.target_text, c.two_way \
+        "SELECT c.id, c.card_type, c.image_url, c.audio_url, c.video_url, c.youtube_url, \
+                c.target_text, c.source_text, c.two_way \
          FROM card_links cl \
          JOIN cards c ON c.id = cl.linked_card_id \
          WHERE cl.card_id = $1 AND cl.link_type = 'back_chain_step' \
