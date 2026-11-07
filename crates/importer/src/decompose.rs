@@ -382,19 +382,188 @@ fn split_into_overlapping_chunks(raw_entry: &str) -> Option<(String, String)> {
 /// free-form generation was, compounding the loss rather than just
 /// capping it. Kept as a cautionary real finding, not reattempted
 /// without addressing both failure modes, not just the first.
+/// Part-of-speech abbreviations this dictionary uses right after a
+/// comma to introduce a derived word spelled out in full (e.g.
+/// "abusive, adj.") — one of the markers `marker_based_minimum_item_count`
+/// counts. Mirrors `schema::fill_schema`'s own part-of-speech enum
+/// (minus the empty string, which can't introduce anything).
+const DERIVED_WORD_POS_TAGS: &[&str] = &[
+    "n.", "v.", "vt.", "vi.", "adj.", "adv.", "prep.", "conj.", "pron.", "interj.", "num.",
+];
+
+/// Whether `piece` (one semicolon-delimited slice of a raw entry,
+/// already trimmed) looks like the start of a new learnable unit —
+/// an open paren, a "~" standing in for the headword, an "eg."
+/// worked example, or a spelled-out derived word with its own
+/// part-of-speech tag. See `marker_based_minimum_item_count`.
+fn starts_a_new_structural_unit(piece: &str) -> bool {
+    if piece.starts_with('(') || piece.starts_with('~') {
+        return true;
+    }
+    if piece.starts_with("eg.") || piece.starts_with("e.g.") {
+        return true;
+    }
+    if let Some(comma_idx) = piece.find(',') {
+        let word = &piece[..comma_idx];
+        let looks_like_a_word =
+            !word.is_empty() && word.chars().all(|c| c.is_alphabetic() || c == '-');
+        if looks_like_a_word {
+            let after_comma = piece[comma_idx + 1..].trim_start();
+            if DERIVED_WORD_POS_TAGS
+                .iter()
+                .any(|tag| after_comma.starts_with(tag))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Rough, deliberately conservative lower bound on how many distinct
+/// learnable units `raw_entry` structurally contains — counts the
+/// semicolon-delimited spans that start with a clear marker (reusing
+/// `starts_a_new_structural_unit`, the same signal an earlier,
+/// reverted attempt used to *constrain* enumeration — see
+/// `enumerate_items`'s own doc comment), with one span of safety
+/// margin subtracted.
+///
+/// Deliberately a soft, logged diagnostic — never a hard grammar
+/// constraint (e.g. a JSON-Schema `minItems`). A real run proved that
+/// risk isn't hypothetical: forcing the model's output to match a
+/// mechanical count is exactly what made the reverted attempt above
+/// collapse enumeration by 37% across this corpus, and this same
+/// count is just as unreliable a proxy in the other direction — e.g.
+/// "abode" has zero semicolons at all, yet five genuinely distinct
+/// comma-separated Xhosa words worth their own cards. This can only
+/// ever warn that an entry looks under-enumerated relative to its own
+/// visible structure, for a human to glance at — never force a fix
+/// that could just as easily force bad padding instead.
+fn marker_based_minimum_item_count(raw_entry: &str) -> usize {
+    let marker_spans = raw_entry
+        .split(';')
+        .map(str::trim)
+        .filter(|piece| !piece.is_empty())
+        .enumerate()
+        .filter(|(i, piece)| *i == 0 || starts_a_new_structural_unit(piece))
+        .count();
+    marker_spans.saturating_sub(1)
+}
+
 pub fn enumerate_items(
     engine: &TextEngine,
     headword: &str,
     raw_entry: &str,
 ) -> Result<Vec<Item>, String> {
-    match split_into_overlapping_chunks(raw_entry) {
-        None => enumerate_items_single_call(engine, headword, raw_entry),
+    let mut items = match split_into_overlapping_chunks(raw_entry) {
+        None => enumerate_items_single_call(engine, headword, raw_entry)?,
         Some((first_half, second_half)) => {
             let mut items = enumerate_items_single_call(engine, headword, &first_half)?;
             items.extend(enumerate_items_single_call(engine, headword, &second_half)?);
-            Ok(items)
+            items
         }
+    };
+    let missed = find_missed_synonyms(engine, headword, raw_entry, &items)?;
+    if !missed.is_empty() {
+        println!(
+            "  {headword}: missed-synonym check found {} more item(s)",
+            missed.len()
+        );
+        items.extend(missed);
     }
+    let floor = marker_based_minimum_item_count(raw_entry);
+    if items.len() < floor {
+        println!(
+            "  WARNING: \"{headword}\" found only {} item(s), below the {floor} this \
+             entry's own visible structure suggests — worth a manual look",
+            items.len()
+        );
+    }
+    Ok(items)
+}
+
+/// A single, narrowly-targeted second pass checking specifically
+/// whether any sense above lists more than one alternative
+/// target-language translation where only some of those alternatives
+/// made it into that item's own excerpt — not a generic "did you miss
+/// anything?" self-critique. This session's own research review found
+/// essentially no positive completeness evidence for open-ended
+/// self-critique at this model's scale, and real precedent of it
+/// actively *hurting* recall by acting as a precision filter instead;
+/// the one positive signal it did find came specifically from a
+/// narrowly-named gap, checked once, not iterated (diminishing
+/// returns past a single round are well documented). This is that
+/// narrow framing, scoped to the one completeness gap this project
+/// has repeatedly confirmed in real runs — a sense's own secondary
+/// synonym getting dropped — rather than a generic invitation to
+/// second-guess everything.
+fn find_missed_synonyms(
+    engine: &TextEngine,
+    headword: &str,
+    raw_entry: &str,
+    items: &[Item],
+) -> Result<Vec<Item>, String> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Deliberately NOT a numbered list: a real run showed the model
+    // copying the list's own "1."/"2." position markers back as the
+    // item's "label" field, rather than the label text itself —
+    // which then always fails the grounding filter below (by design,
+    // since "1"/"2" never match a real label) and silently discards
+    // the whole item instead of returning the real missing
+    // alternative. Each entry is already visually self-delimited by
+    // its own label prefix, so a number added no information the
+    // model needed anyway.
+    let items_so_far = items
+        .iter()
+        .map(|item| format!("label \"{}\" — \"{}\"", item.label, item.source_excerpt))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = format!(
+        "Below is one raw, correctly-transcribed dictionary entry and the items \
+already identified for it. Check specifically for ONE kind of gap: does any \
+sense above list more than one alternative target-language translation \
+(e.g. two or more words separated by commas or semicolons) where only SOME \
+of those alternatives ended up in that item's own excerpt below? This is \
+the only thing to check for — not whether a sense, example, or derived \
+word was missed entirely, only whether an already-found sense is missing \
+one of its own listed alternatives.\n\n\
+If you find any, output one new item per missing alternative, in the same \
+\"label\"/\"source_excerpt\" shape as before. The \"label\" field must be \
+copied EXACTLY, character for character, from one of the existing labels \
+quoted below — never a number, never a new label you make up yourself. \
+The \"source_excerpt\" is the missing alternative itself. If every \
+alternative is already covered, output an empty array — do not invent an \
+item just to have something to report.\n\n\
+Entry (headword: \"{headword}\"):\n{raw_entry}\n\n\
+Items already found:\n{items_so_far}"
+    );
+    let schema = enumerate_schema();
+    let text = engine.generate(&prompt, Some(&schema))?;
+    let context = format!("{headword} (missed-synonym check)");
+    let extra_items = extract_json_array(&text, &context)?;
+    let existing_labels: std::collections::HashSet<String> = items
+        .iter()
+        .map(|i| i.label.trim().to_lowercase())
+        .collect();
+    Ok(extra_items
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<Item>(v).ok())
+        .filter(|i| !i.label.is_empty() && !i.source_excerpt.is_empty())
+        // The prompt above explicitly instructs the model to reuse the
+        // SAME label as the sense an alternative belongs to — a label
+        // that doesn't match anything already found means the model
+        // either ignored that instruction or reached beyond this
+        // pass's own deliberately narrow scope (finding a missing
+        // alternative for an *existing* sense, never a whole new
+        // sense). Confirmed necessary in a real run: this check is
+        // what catches "abash" getting a fabricated "abashment" item
+        // (translation "ukuthotywa") that appears nowhere in that
+        // entry's real raw text at all, under a label the original
+        // enumeration never produced.
+        .filter(|i| existing_labels.contains(&i.label.trim().to_lowercase()))
+        .collect())
 }
 
 fn enumerate_items_single_call(
@@ -992,6 +1161,40 @@ mod tests {
     #[test]
     fn short_entries_are_not_chunked() {
         assert_eq!(split_into_overlapping_chunks("abode, n. ikhaya."), None);
+    }
+
+    #[test]
+    fn marker_count_matches_abuse_real_sense_count_conservatively() {
+        // Real entry: the base verb sense plus 5 more marker-
+        // introduced spans — 3 more "(...)" verb senses, the "~, n."
+        // noun sense, and "abusively, adv." (its own two noun-sense
+        // alternate translations, "impatho embi"/"isithuko,
+        // isinyeliso", have no marker of their own and don't add to
+        // the count, same as the real, confirmed enumeration gap this
+        // session already found and fixed a different way via
+        // chunking) — 6 marker spans total, so a floor of 5 (one
+        // below that).
+        let raw_entry = "abuse, vt. (of authority, confidence, etc.) -sebenzisa kakubi; \
+            (in words) -thuka, -tshabisa; (old use) -phatha kakubi; ~, n. ukusebenzisa \
+            kakubi; impatho embi (im- iim-); isithuko, isinyeliso; abusive, adj. \
+            -nyelisa(yo); abusively, adv. ngokunyelisayo.";
+        assert_eq!(marker_based_minimum_item_count(raw_entry), 5);
+    }
+
+    #[test]
+    fn marker_count_never_overestimates_abode_which_has_no_semicolons_at_all() {
+        // Real entry this check *can't* help with — three genuinely
+        // distinct Xhosa words separated only by commas, not
+        // semicolons — but it must never overestimate it as "needing"
+        // more items than the floor logic can actually see.
+        let raw_entry = "abode, n. (old or liter. use) ikhaya (ili- ama-), umzi, \
+            indlu (in- izin-).";
+        assert_eq!(marker_based_minimum_item_count(raw_entry), 0);
+    }
+
+    #[test]
+    fn marker_count_is_zero_for_a_single_clause_entry() {
+        assert_eq!(marker_based_minimum_item_count("abscess, n. ithumba."), 0);
     }
 
     #[test]
