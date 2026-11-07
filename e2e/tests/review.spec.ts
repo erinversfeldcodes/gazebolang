@@ -1,5 +1,5 @@
 import { test, expect } from "./fixtures";
-import { uniqueWord, createCardInOwnDeck, reviewOwnCard, recordClip } from "./helpers";
+import { uniqueWord, createCardInOwnDeck, reviewOwnCard, recordClip, withServerResponse } from "./helpers";
 
 test("grading a due card removes it from today's review queue", async ({ page }) => {
   const { word, deckName } = await createCardInOwnDeck(page, "review-spec");
@@ -68,7 +68,12 @@ test("filtering the review queue by tag narrows it to the tagged card", async ({
   await expect(page.getByText("Reveal")).toBeVisible();
   await page.getByText("Reveal").click();
   await expect(page.getByText(word, { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Good" }).click();
+  // Without this, the immediate page.goto below races the grade_card fetch
+  // and can cancel it mid-flight (see withServerResponse's own comment in
+  // helpers.ts) — leaving the card still due and this assertion flaky.
+  await withServerResponse(page, "grade_card", () =>
+    page.getByRole("button", { name: "Good" }).click(),
+  );
 
   await page.goto("/review");
   await page.getByLabel("Filter by tag").selectOption(tag);
