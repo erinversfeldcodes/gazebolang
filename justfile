@@ -31,6 +31,21 @@ storage-init:
     docker compose exec -T garage /garage bucket website --allow gazebo-cards
     echo "garage ready: bucket=gazebo-cards key=gazebo-local-dev-key"
 
+# One-time/idempotent: clone (or update, if already cloned) the private
+# fixtures repo crates/importer's golden regression test needs — real
+# photographed dictionary pages, kept out of this public repo (see that
+# repo's own README). Lands as a sibling directory, not tracked here.
+fixtures-pull:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="../ulungelelwano-lwe-gazebo-fixtures"
+    if [ -d "$dir/.git" ]; then
+        git -C "$dir" pull --ff-only origin main
+    else
+        git clone git@github.com:erinversfeldcodes/gazebolang-fixtures.git "$dir"
+    fi
+    echo "fixtures ready at $dir"
+
 # Run pending migrations against the local database
 db-migrate:
     sqlx migrate run --source migrations

@@ -1617,4 +1617,159 @@ mod tests {
         assert!(!html.contains("onmouseover=\"evil"), "{html}");
         assert!(html.contains("&quot;"), "{html}");
     }
+
+    proptest::proptest! {
+        /// The whole point of `escape_html`: no matter what a page
+        /// author types, the rendered output must never contain a raw
+        /// `<` or `>` that could start or close an HTML tag.
+        #[test]
+        fn escape_html_never_leaves_a_raw_angle_bracket(s in ".*") {
+            let escaped = escape_html(&s);
+            proptest::prop_assert!(!escaped.contains('<'));
+            proptest::prop_assert!(!escaped.contains('>'));
+        }
+
+        /// Every `&` the function itself emits is the start of one of
+        /// its three recognized entities — never a bare `&` a browser
+        /// might interpret as the start of some other, unintended
+        /// entity.
+        #[test]
+        fn escape_html_every_ampersand_starts_a_recognized_entity(s in ".*") {
+            let escaped = escape_html(&s);
+            let mut search_from = 0;
+            while let Some(rel_idx) = escaped[search_from..].find('&') {
+                let idx = search_from + rel_idx;
+                let after = &escaped[idx + 1..];
+                proptest::prop_assert!(
+                    after.starts_with("amp;") || after.starts_with("lt;") || after.starts_with("gt;"),
+                    "unescaped & in {escaped:?} at byte {idx}"
+                );
+                search_from = idx + 1;
+            }
+        }
+
+        /// `escape_attr` is `escape_html` plus quote-escaping — it must
+        /// hold the same no-raw-angle-bracket guarantee, and must
+        /// additionally never leave a raw `"` that could close an
+        /// attribute value early.
+        #[test]
+        fn escape_attr_never_leaves_a_raw_angle_bracket_or_quote(s in ".*") {
+            let escaped = escape_attr(&s);
+            proptest::prop_assert!(!escaped.contains('<'));
+            proptest::prop_assert!(!escaped.contains('>'));
+            proptest::prop_assert!(!escaped.contains('"'));
+        }
+
+        /// Every `&` `escape_attr` emits starts one of its four
+        /// recognized entities (the three from `escape_html` plus
+        /// `&quot;`).
+        #[test]
+        fn escape_attr_every_ampersand_starts_a_recognized_entity(s in ".*") {
+            let escaped = escape_attr(&s);
+            let mut search_from = 0;
+            while let Some(rel_idx) = escaped[search_from..].find('&') {
+                let idx = search_from + rel_idx;
+                let after = &escaped[idx + 1..];
+                proptest::prop_assert!(
+                    after.starts_with("amp;")
+                        || after.starts_with("lt;")
+                        || after.starts_with("gt;")
+                        || after.starts_with("quot;"),
+                    "unescaped & in {escaped:?} at byte {idx}"
+                );
+                search_from = idx + 1;
+            }
+        }
+
+        /// `is_hex_color` gates whether an untrusted color string ever
+        /// reaches a raw `style` attribute — it must accept exactly the
+        /// shapes a CSS hex color can take (`#` + 3/4/6/8 hex digits)
+        /// and reject everything else, checked against both
+        /// deliberately-valid and deliberately-near-miss inputs.
+        #[test]
+        fn is_hex_color_accepts_exactly_well_formed_hex_colors(
+            digit_count in proptest::sample::select(vec![3usize, 4, 6, 8]),
+            hex_digits in "[0-9a-fA-F]{8}",
+        ) {
+            let value = format!("#{}", &hex_digits[..digit_count]);
+            proptest::prop_assert!(is_hex_color(&value), "{value}");
+        }
+
+        /// Valid hex content without the leading `#` must be rejected
+        /// — the `#` isn't optional.
+        #[test]
+        fn is_hex_color_rejects_a_missing_hash_prefix(hex_digits in "[0-9a-fA-F]{6}") {
+            proptest::prop_assert!(!is_hex_color(&hex_digits));
+        }
+
+        /// Any digit count other than the four CSS allows (3/4/6/8)
+        /// must be rejected, even with otherwise-valid hex content.
+        #[test]
+        fn is_hex_color_rejects_a_disallowed_digit_count(
+            digit_count in proptest::sample::select(vec![0usize, 1, 2, 5, 7, 9, 10, 12]),
+            hex_digits in "[0-9a-fA-F]{12}",
+        ) {
+            let value = format!("#{}", &hex_digits[..digit_count]);
+            proptest::prop_assert!(!is_hex_color(&value), "{value}");
+        }
+
+        /// A single non-hex character anywhere in an otherwise
+        /// valid-length body must be enough to reject the whole value.
+        #[test]
+        fn is_hex_color_rejects_a_single_non_hex_character(
+            position in 0usize..6,
+            hex_digits in "[0-9a-fA-F]{6}",
+        ) {
+            let mut body: Vec<char> = hex_digits.chars().collect();
+            body[position] = 'g'; // not a hex digit
+            let value = format!("#{}", body.into_iter().collect::<String>());
+            proptest::prop_assert!(!is_hex_color(&value), "{value}");
+        }
+
+        /// `slugify`'s own three guarantees: ASCII lowercase
+        /// alphanumerics and single-hyphen separators only, never a
+        /// leading/trailing/doubled hyphen, and never empty (an
+        /// all-symbol title falls back to a fixed default rather than
+        /// an empty slug).
+        #[test]
+        fn slugify_produces_a_safe_nonempty_slug(title in ".*") {
+            let slug = slugify(&title);
+            proptest::prop_assert!(!slug.is_empty());
+            proptest::prop_assert!(
+                slug.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            );
+            proptest::prop_assert!(!slug.starts_with('-'));
+            proptest::prop_assert!(!slug.ends_with('-'));
+            proptest::prop_assert!(!slug.contains("--"));
+        }
+
+        /// Every step `strip_tags` performs — dropping characters
+        /// between `<`/`>`, or replacing a multi-character entity with
+        /// a single literal character — only ever removes content,
+        /// never adds any: the output can never be longer than the
+        /// input.
+        #[test]
+        fn strip_tags_never_grows_the_input(s in ".*") {
+            let stripped = strip_tags(&s);
+            proptest::prop_assert!(stripped.len() <= s.len());
+        }
+
+        /// The entire reason `unique_heading_id` exists: feed it any
+        /// sequence of heading texts sharing the same `used` map (the
+        /// same shape as `srs.rs`'s own state-evolves-through-a-
+        /// sequence property test), and every id it has ever returned
+        /// must be unique — duplicate ids would mean two headings'
+        /// in-page anchors collide.
+        #[test]
+        fn unique_heading_id_never_repeats_an_id_across_a_sequence(
+            texts in proptest::collection::vec(".*", 0..20),
+        ) {
+            let mut used = std::collections::HashMap::new();
+            let mut seen = std::collections::HashSet::new();
+            for text in texts {
+                let id = unique_heading_id(&text, &mut used);
+                proptest::prop_assert!(seen.insert(id.clone()), "duplicate id: {id}");
+            }
+        }
+    }
 }

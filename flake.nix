@@ -33,6 +33,7 @@
           just
           flyctl
           pkg-config
+          cmake # builds llama.cpp, vendored by crates/importer's llama-cpp-2 dependency
         ] ++ lib.optionals stdenv.isLinux [ mold ];
 
         buildLibs = with pkgs; [ openssl ]

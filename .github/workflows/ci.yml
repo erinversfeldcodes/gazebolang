@@ -20,12 +20,32 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
+      # importer vendors and CMake-builds llama.cpp from source (see
+      # crates/importer's own Cargo.toml) — can't confirm cmake ships
+      # preinstalled on this runner image, so install it explicitly rather
+      # than find out the hard way.
+      - run: sudo apt-get update && sudo apt-get install -y cmake
       - run: cargo fmt --all -- --check
       # web's ssr and hydrate halves are mutually exclusive features that
       # each only compile for one target (native vs wasm32), so each needs
       # its own pass.
       - run: cargo clippy --workspace --all-targets --features web/ssr -- -W clippy::pedantic -D warnings
       - run: cargo clippy -p web --no-default-features --features hydrate --target wasm32-unknown-unknown --lib -- -W clippy::pedantic -D warnings
+      - run: cargo clippy -p importer --all-targets -- -W clippy::pedantic -D warnings
+
+  # Exercises the `metal` feature path (see crates/importer/Cargo.toml's
+  # comment on how it gets pulled in on macOS/aarch64) — the `check` job
+  # above only builds/lints importer on Linux, which never compiles that
+  # path at all.
+  importer-macos:
+    name: importer (macOS/Metal)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p importer
+      - run: cargo test -p importer
 
   test:
     name: test
@@ -129,6 +149,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: sqlx-cli,cargo-leptos,just
+      # importer vendors and CMake-builds llama.cpp from source — see the
+      # same comment on the `check` job above.
+      - run: sudo apt-get update && sudo apt-get install -y cmake
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -154,6 +177,11 @@ jobs:
         run: just storage-init
       - run: sqlx migrate run --source migrations
       - run: cargo leptos build
+      # Built here (not in a separate job) so it lands in this job's own
+      # target/debug/ for e2e/tests/import-dictionary.spec.ts to exec
+      # directly — that test only exercises the `create` stage, which
+      # needs no model/GPU, so a plain debug build is enough.
+      - run: cargo build -p importer
       - name: Start the app in the background
         # Redirected to a file so the server's own logs (RUST_LOG above)
         # are actually retrievable afterwards — see the artifact upload

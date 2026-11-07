@@ -928,4 +928,79 @@ mod tests {
             "the session active during the change should be revoked too"
         );
     }
+
+    proptest::proptest! {
+        // Argon2 is deliberately slow (that's the whole point of using
+        // it for passwords) — far fewer cases than proptest's default
+        // keeps this from dominating the test suite's runtime, without
+        // weakening what the property itself actually checks.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(10))]
+
+        /// The one thing `hash_password`/`verify_password` exist for:
+        /// a password must always verify successfully against a fresh
+        /// hash of itself, for any password.
+        #[test]
+        fn hash_password_then_verify_password_always_succeeds(password in ".{1,100}") {
+            let hash = hash_password(&password).unwrap();
+            proptest::prop_assert!(verify_password(&password, &hash));
+        }
+    }
+
+    proptest::proptest! {
+        /// Login passes `verify_password` whatever's actually stored in
+        /// the `password_hash` column — it must degrade to "doesn't
+        /// verify" rather than panic on anything that isn't a
+        /// well-formed Argon2 hash. No real Argon2 work happens on the
+        /// parse-failure path, so this can run at the default case
+        /// count cheaply.
+        #[test]
+        fn verify_password_never_panics_on_a_malformed_hash(password in ".*", garbage_hash in ".*") {
+            let _ = verify_password(&password, &garbage_hash);
+        }
+
+        /// `validate_password` counts Unicode *characters*, not bytes —
+        /// generating from a multi-byte range (Latin-1 Supplement /
+        /// Extended-A, e.g. "é", "ñ") specifically exercises the case
+        /// where byte length and char count diverge, which an
+        /// ASCII-only input never would.
+        #[test]
+        fn validate_password_counts_multi_byte_characters_as_one_each(
+            password in proptest::strategy::Strategy::prop_map(
+                proptest::collection::vec(proptest::char::range('\u{00C0}', '\u{024F}'), 0..20),
+                |chars| chars.into_iter().collect::<String>(),
+            ),
+        ) {
+            let char_count = password.chars().count();
+            proptest::prop_assert_eq!(validate_password(&password).is_ok(), char_count >= MIN_PASSWORD_LEN);
+        }
+
+        /// Anything shaped like `local@domain.tld` must be accepted —
+        /// this is a shape check, not a real-deliverability check.
+        #[test]
+        fn validate_email_accepts_anything_shaped_like_an_email(
+            local in "[a-zA-Z0-9]{1,10}",
+            domain in "[a-zA-Z0-9]{1,10}",
+            tld in "[a-zA-Z]{2,5}",
+        ) {
+            let email = format!("{local}@{domain}.{tld}");
+            proptest::prop_assert!(validate_email(&email).is_ok());
+        }
+
+        /// No `@` at all must always be rejected.
+        #[test]
+        fn validate_email_rejects_anything_without_an_at_sign(s in "[a-zA-Z0-9]{0,20}") {
+            proptest::prop_assert!(validate_email(&s).is_err());
+        }
+
+        /// An `@` with no `.` anywhere after it must always be
+        /// rejected — a domain needs a TLD.
+        #[test]
+        fn validate_email_rejects_a_domain_with_no_dot(
+            local in "[a-zA-Z0-9]{1,10}",
+            domain in "[a-zA-Z0-9]{1,10}",
+        ) {
+            let email = format!("{local}@{domain}");
+            proptest::prop_assert!(validate_email(&email).is_err());
+        }
+    }
 }

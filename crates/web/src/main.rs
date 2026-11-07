@@ -473,6 +473,111 @@ async fn parse_bulk_multipart(
         .collect())
 }
 
+#[cfg(feature = "ssr")]
+#[derive(serde::Deserialize)]
+struct ImporterLoginForm {
+    email: String,
+    password: String,
+}
+
+/// Plain, stable login route for the `importer` CLI tool
+/// (`crates/importer/src/app_client.rs`), as a URL-encoded POST rather
+/// than a Leptos `#[server]` fn call. The browser's own login goes
+/// through `account::log_in`'s server-fn wire format instead, whose
+/// path is auto-generated at build time and — confirmed in a real run
+/// — isn't even stable across build platforms for the same source
+/// (macOS vs. Linux produced different hashes), making it unusable as
+/// a fixed target for a native binary. This route's path never
+/// changes, so `importer` doesn't need to reverse-engineer anything.
+#[cfg(feature = "ssr")]
+async fn importer_login(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    cookies: tower_cookies::Cookies,
+    axum::Form(form): axum::Form<ImporterLoginForm>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match web::auth::log_in(&state.db_pool, &form.email, &form.password).await {
+        Ok(session_token) => {
+            cookies.add(web::auth::build_session_cookie(session_token));
+            axum::http::StatusCode::OK.into_response()
+        }
+        Err(message) => (axum::http::StatusCode::UNAUTHORIZED, message).into_response(),
+    }
+}
+
+#[cfg(feature = "ssr")]
+#[derive(serde::Deserialize)]
+struct ImporterSaveWordDefinitionForm {
+    target_text: String,
+    #[serde(default)]
+    part_of_speech: String,
+    #[serde(default)]
+    notes: String,
+    #[serde(default)]
+    english_translation: String,
+    #[serde(default)]
+    example_target_sentence: String,
+    #[serde(default)]
+    example_gloss_sentence: String,
+    #[serde(default)]
+    linked_words_raw: String,
+}
+
+/// Plain, stable counterpart to `importer_login` for
+/// `dictionary::save_word_definition` — see that fn's own doc comment
+/// for why. Field-level behavior (trimming, blank-to-`None`, the
+/// comma-separated linked-words list) mirrors the server-fn version
+/// exactly; `non_empty_trimmed` is duplicated rather than shared across
+/// the bin/lib boundary, the same way `parse_tags`/`parse_comma_list`
+/// already are for the same reason (see that fn's own comment).
+#[cfg(feature = "ssr")]
+async fn importer_save_word_definition(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    cookies: tower_cookies::Cookies,
+    axum::Form(form): axum::Form<ImporterSaveWordDefinitionForm>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    fn non_empty_trimmed(s: &str) -> Option<String> {
+        let s = s.trim();
+        (!s.is_empty()).then(|| s.to_string())
+    }
+
+    let Some(user) = web::auth::current_user(&state.db_pool, &cookies).await else {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    };
+    let target_text = form.target_text.trim();
+    if target_text.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "target_text can't be empty",
+        )
+            .into_response();
+    }
+    let examples = non_empty_trimmed(&form.example_target_sentence)
+        .map(|t| vec![(t, non_empty_trimmed(&form.example_gloss_sentence))])
+        .unwrap_or_default();
+    let linked = parse_tags(&form.linked_words_raw);
+
+    let result = web::db::upsert_word_definition(
+        &state.db_pool,
+        target_text,
+        user.id,
+        web::db::WordFields {
+            part_of_speech: non_empty_trimmed(&form.part_of_speech).as_deref(),
+            notes: non_empty_trimmed(&form.notes).as_deref(),
+            english_translation: non_empty_trimmed(&form.english_translation).as_deref(),
+        },
+        &examples,
+        &linked,
+    )
+    .await;
+    match result {
+        Ok(_) => axum::http::StatusCode::OK.into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 /// Creates every draft from `BulkAddPage` in one submission. Stops at the
 /// first failure — same bail-on-first-error semantics `cards_new` already
 /// uses — rather than inventing partial-success UX for what should be a
@@ -699,6 +804,11 @@ async fn main() {
         .route("/auth/logout", axum::routing::get(auth_logout))
         .route("/internal/email-check", axum::routing::get(email_check))
         .route("/internal/storage-check", axum::routing::get(storage_check))
+        .route("/api/importer/login", axum::routing::post(importer_login))
+        .route(
+            "/api/importer/save-word-definition",
+            axum::routing::post(importer_save_word_definition),
+        )
         .route("/cards/new", axum::routing::post(cards_new))
         .route("/cards/bulk", axum::routing::post(cards_bulk))
         .route("/cards/{id}", axum::routing::post(cards_update))
@@ -793,5 +903,67 @@ mod tests {
     fn percent_encode_escapes_multi_byte_utf8_one_byte_at_a_time() {
         // "é" is the two-byte UTF-8 sequence 0xC3 0xA9.
         assert_eq!(percent_encode_query_value("café"), "caf%C3%A9");
+    }
+
+    /// Decodes `%XX` escapes back to raw bytes, for round-tripping
+    /// `percent_encode_query_value`'s own output — deliberately minimal
+    /// (this file has no decoder of its own to reuse), not a general
+    /// URL-decoding utility.
+    fn percent_decode(s: &str) -> Vec<u8> {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap();
+                out.push(u8::from_str_radix(hex, 16).unwrap());
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    proptest::proptest! {
+        /// The entire point of percent-encoding: decoding the output
+        /// must always reconstruct the exact original bytes, for any
+        /// string — not just the specific reserved/multi-byte examples
+        /// already covered above.
+        #[test]
+        fn percent_encode_query_value_round_trips_through_percent_decode(s in ".*") {
+            let encoded = percent_encode_query_value(&s);
+            let decoded = percent_decode(&encoded);
+            proptest::prop_assert_eq!(decoded, s.as_bytes().to_vec());
+        }
+
+        /// Every byte in the output is either one of the explicitly
+        /// unreserved characters, verbatim, or part of a `%XX` escape
+        /// — never anything else that could be misread as a query
+        /// delimiter.
+        #[test]
+        fn percent_encode_query_value_only_emits_unreserved_chars_or_percent_escapes(s in ".*") {
+            let encoded = percent_encode_query_value(&s);
+            let bytes = encoded.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                let b = bytes[i];
+                let is_unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
+                if is_unreserved {
+                    i += 1;
+                } else {
+                    proptest::prop_assert_eq!(b, b'%', "unexpected raw byte {} in {:?}", b, encoded);
+                    proptest::prop_assert!(i + 2 < bytes.len(), "truncated %-escape at end of {:?}", encoded);
+                    let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap();
+                    proptest::prop_assert!(
+                        u8::from_str_radix(hex, 16).is_ok(),
+                        "invalid escape in {:?}",
+                        encoded
+                    );
+                    i += 3;
+                }
+            }
+        }
     }
 }

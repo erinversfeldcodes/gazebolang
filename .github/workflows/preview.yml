@@ -275,6 +275,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      # import-dictionary.spec.ts execs the importer binary directly
+      # against this job's own checkout (only the `create` stage, which
+      # needs no model/GPU — see ci.yml's matching comment) — built here
+      # since this job otherwise has no Rust toolchain at all.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+      # importer vendors and CMake-builds llama.cpp from source — see the
+      # matching comment in ci.yml.
+      - run: sudo apt-get update && sudo apt-get install -y cmake
+      - run: cargo build -p importer
       # See the `db_password_enc` comment on `neon-branch`'s `outputs:` —
       # decrypt and re-mask it locally before use; a cross-job
       # `needs.*.outputs.*` read of the raw masked password comes back
