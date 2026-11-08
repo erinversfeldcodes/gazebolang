@@ -40,6 +40,12 @@ impl ReviewState {
     /// for a card that's never been reviewed) — FSRS schedules differently
     /// for a card reviewed exactly on time versus one reviewed late, so
     /// this can't be derived from `self` alone.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the only failure modes `FSRS::next_states` has
+    /// are invalid model parameters or an invalid `desired_retention`,
+    /// both of which are fixed, known-valid constants here.
     #[must_use]
     pub fn schedule(self, grade: Grade, elapsed_days: u32) -> Self {
         let fsrs = FSRS::default();
