@@ -16,11 +16,6 @@ fn cache_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// Resolves a model spec to a local file path, downloading it into the
-/// cache if it isn't already there. Checksum is only verified on a fresh
-/// download, not on every cache hit — re-hashing a multi-GB file on every
-/// single run would be its own meaningful cost; a cache hit is just "does
-/// this file already exist at this path."
 pub fn resolve(spec: &ModelSpec) -> Result<PathBuf, String> {
     let path = cache_dir()?.join(spec.file);
     if path.exists() {
@@ -51,10 +46,6 @@ fn download(spec: &ModelSpec, dest: &Path) -> Result<(), String> {
     }
     let total = response.content_length();
 
-    // Downloaded alongside the final path (not to a system temp dir) so
-    // the final rename is a same-filesystem, same-directory move —
-    // atomic, and never left half-written at the path a later run would
-    // treat as a cache hit.
     let part_path = dest.with_extension("part");
     let mut file = std::fs::File::create(&part_path).map_err(|e| e.to_string())?;
     let progress = total.map(|t| {

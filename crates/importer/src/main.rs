@@ -137,10 +137,6 @@ fn run() -> Result<(), String> {
     }
 }
 
-/// clap has no built-in "first argument isn't a subcommand name, so treat
-/// it as the default subcommand" behavior — splice `all` in explicitly so
-/// `importer photo1.jpg` keeps working the same way the original script's
-/// own `KNOWN.has(argv[0]) ? argv[0] : "all"` dispatch did.
 fn normalize_args(argv: Vec<String>) -> Vec<String> {
     const KNOWN: &[&str] = &[
         "segment",
@@ -172,12 +168,6 @@ fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
-/// Resolves a model's local path: an explicit env var override if set
-/// (pointing straight at a GGUF file, skipping the catalog/download
-/// entirely — a cleaner override than the original script's, which named
-/// an Ollama model tag that still had to be `ollama pull`ed separately),
-/// otherwise the pinned default from `model_catalog.rs`, downloaded into
-/// a local cache on first use.
 fn resolve_model_path(env_var: &str, spec: &model_catalog::ModelSpec) -> Result<PathBuf, String> {
     match std::env::var(env_var) {
         Ok(path) => Ok(PathBuf::from(path)),
@@ -217,20 +207,11 @@ fn run_create_cmd(cards_in_file: &Path) -> Result<(), String> {
     create::run_create(&config, cards_in_file)
 }
 
-/// Runs all three stages as three separate OS processes (re-execs this
-/// same binary via `current_exe()`), not three function calls in one
-/// process — deliberate, same as the original script: letting two
-/// differently-sized models stay loaded across stages risks a low-memory
-/// kill on a 24GB host, even with the embedded engine replacing Ollama.
 fn run_all(images: &[PathBuf], run_dir_override: Option<&Path>) -> Result<(), String> {
     if images.is_empty() {
         return Err("usage: importer [all] <photo1.jpg> [photo2.jpg ...]".to_string());
     }
 
-    // Fail fast on missing/wrong credentials before spending 10+ minutes
-    // on segment+decompose, even though `create` (the only stage that
-    // actually needs them) runs last. `create` logs in again, fresh — see
-    // AppClient::log_in's own comment on why that's not wasteful here.
     let base_url = env_or("BASE_URL", "http://127.0.0.1:3000");
     let auth_email = require_env("AUTH_EMAIL")?;
     let auth_password = require_env("AUTH_PASSWORD")?;

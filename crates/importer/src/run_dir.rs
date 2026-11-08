@@ -66,12 +66,6 @@ mod tests {
     }
 
     proptest::proptest! {
-        /// Whatever a real phone photo's filename looks like (and phone
-        /// photos have shown up with genuinely weird ones), the result
-        /// must never panic and must always be safe to use as a
-        /// directory name — every character either comes through
-        /// `is_safe_char`'s own filter or is part of the fixed,
-        /// already-safe timestamp format appended after it.
         #[test]
         fn run_dir_name_never_panics_and_only_uses_safe_characters(path in ".*") {
             let name = run_dir_name(&path);
