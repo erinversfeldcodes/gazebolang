@@ -4,11 +4,11 @@
 //! `importer_save_word_definition`) built specifically for this binary,
 //! rather than the browser's own Leptos `#[server]` fns — those
 //! auto-generate their wire path at build time, and that path isn't
-//! even stable across build platforms for the same source (confirmed
-//! in a real run: macOS and Linux builds produced different hashes),
-//! making them unusable as a fixed target here. `create_cards` instead
-//! posts straight to `/cards/bulk`, the same plain route the app's own
-//! bulk-add form already submits to.
+//! even stable across build platforms for the same source (macOS and
+//! Linux builds produced different hashes), making them unusable as a
+//! fixed target here. `create_cards` insteadnposts straight to
+//! `/cards/bulk`, the same plain route the app's own bulk-add form
+//! already submits to.
 use crate::decompose::Card;
 use reqwest::blocking::{Client, multipart};
 
@@ -31,13 +31,6 @@ impl AppClient {
         })
     }
 
-    /// A successful call sets a `session=<token>` cookie; a failure
-    /// (wrong password, no such user — deliberately indistinguishable,
-    /// see `auth.rs`) comes back as a non-2xx status with "invalid
-    /// email or password" in the body. Logs in fresh every run rather
-    /// than caching the resulting cookie: a stale cached session cookie
-    /// is exactly what broke a `create` run partway through once
-    /// already.
     pub fn log_in(&mut self, email: &str, password: &str) -> Result<(), String> {
         let res = self
             .http
@@ -77,12 +70,6 @@ impl AppClient {
             .ok_or_else(|| "not logged in".to_string())
     }
 
-    /// Posts straight to the same `/cards/bulk` route the app's own bulk-add
-    /// form submits to — reuses all of its existing create-card/validation
-    /// logic, no new app code. That handler always redirects (to `/` on
-    /// success, back to `/bulk-add?error=...` on failure, or to `/login` if
-    /// the cookie's no good) rather than returning a 200, so the redirect
-    /// target is what's checked, not the status code.
     pub fn create_cards(&self, cards: &[Card]) -> Result<(), String> {
         let cookie = self.cookie_header()?;
         let mut form = multipart::Form::new();
@@ -114,12 +101,6 @@ impl AppClient {
         Ok(())
     }
 
-    /// Populates the same "Dictionary details" popup the edit page's
-    /// `DictionaryDetailsEditor` saves to, keyed by exact `target_text` (an
-    /// upsert — see `dictionary.rs::save_word_definition`'s own doc
-    /// comment). `/cards/bulk` gives back no card ids, but none are needed
-    /// here: this writes to the standalone `words` table, looked up by
-    /// `target_text` at render time, not tied to a specific card row.
     pub fn save_word_definition(&self, card: &Card) -> Result<(), String> {
         let cookie = self.cookie_header()?;
         let res = self

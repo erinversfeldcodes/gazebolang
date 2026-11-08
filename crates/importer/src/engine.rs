@@ -43,10 +43,6 @@ use std::ffi::CString;
 use std::num::NonZeroU32;
 use std::path::Path;
 
-/// Ollama defaulted to a 4096-token context window regardless of what the
-/// model itself supported, which overflowed on a single dense dictionary
-/// photo — this mirrors the override env var the original script used
-/// (`OLLAMA_NUM_CTX`) under its new name.
 fn num_ctx() -> NonZeroU32 {
     let n = std::env::var("IMPORTER_NUM_CTX")
         .ok()
@@ -152,13 +148,7 @@ fn gpt_oss_system_message(reasoning_effort: &str) -> String {
 
 fn penalty_sampler(model: &LlamaModel) -> LlamaSampler {
     // Without this, greedy decoding has no defense against repetition
-    // loops — confirmed in a real run against the production decompose
-    // model: an open-ended schema field (part_of_speech) degenerated into
-    // hundreds of repeated "?"/"." characters once the model had nothing
-    // confident left to say. The original Ollama-based prototype never
-    // hit this because Ollama applies its own default repeat penalty
-    // (repeat_last_n=64, repeat_penalty=1.1) unconditionally; this chain,
-    // built from scratch, had never replicated it.
+    // loops
     LlamaSampler::penalties(model.n_vocab(), 64, 1.1, 0.0, 0.0)
 }
 
@@ -202,8 +192,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// The shared generation loop, used by both `TextEngine` and
 /// `VisionEngine` once their respective prefill has put `start_n_past`
-/// tokens into `ctx`. See the module doc comment for why this never calls
-/// `LlamaSampler::sample()`.
+/// tokens into `ctx`.
 fn generate_with_workaround(
     model: &LlamaModel,
     ctx: &mut LlamaContext,
@@ -410,10 +399,7 @@ impl TextEngine {
         // completion prompt rather than its own chat format, isn't in
         // "answer this" mode, and under grammar-constrained greedy
         // decoding takes the path of least resistance — closing a JSON
-        // array immediately as `[]`. Confirmed this was silently
-        // happening (misdiagnosed at the time as a tiny-model capability
-        // limit) until a real end-to-end run against the full-size
-        // production model reproduced the exact same empty-array output.
+        // array immediately as `[]`.
         let Some(schema) = schema else {
             return generate_text_eager(&self.model, &self.backend, self.n_ctx, prompt, None);
         };
@@ -539,13 +525,6 @@ impl VisionEngine {
             .model
             .chat_template(None)
             .map_err(|e| format!("chat_template failed: {e:?}"))?;
-        // llama.cpp's own reference mtmd-cli tool puts the marker BEFORE
-        // the text ("most models require the marker before each image"),
-        // not after — this previously had it backwards, which plausibly
-        // explains a real run only reading part of a real dictionary photo
-        // (the entire right column of a two-column page went missing)
-        // despite two unrelated fixes (image token budget, prompt wording)
-        // having no effect on that same symptom.
         let mut full_prompt = mtmd_default_marker().to_string();
         full_prompt.push_str(prompt);
         let msg =
@@ -566,14 +545,6 @@ impl VisionEngine {
             .map_err(|e| format!("mtmd tokenize failed: {e:?}"))?;
 
         let n_ctx_i32 = i32::try_from(self.n_ctx.get()).map_err(|e| e.to_string())?;
-        // The reference mtmd-cli tool passes its own configured n_batch
-        // here, never a literal 1 — confirmed in a real run that a
-        // hardcoded n_batch=1 processes the image one token at a time
-        // (every logged chunk showed "n_tokens_batch = 1") and, on a
-        // large composite image, eventually fails with "failed to find a
-        // memory slot" even at a generously large n_ctx — not a capacity
-        // problem, a fragmentation problem from thousands of sequential
-        // single-token commits instead of real batches.
         let n_past = chunks
             .eval_chunks(&mut self.mtmd_ctx, &mut ctx, 0, 0, n_ctx_i32, true)
             .map_err(|e| format!("mtmd eval_chunks failed: {e:?}"))?;
@@ -602,10 +573,6 @@ mod tests {
 
     #[test]
     fn gpt_oss_system_message_keeps_the_channel_validity_note() {
-        // The hardcoded template shortcut this works around (see this
-        // function's own doc comment) passes a system message through
-        // completely verbatim — if this note is missing, `gpt-oss`
-        // never learns it must tag every message with a channel at all.
         let msg = gpt_oss_system_message("low");
         assert!(msg.contains("# Valid channels: analysis, commentary, final."));
     }

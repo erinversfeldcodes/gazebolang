@@ -1,23 +1,9 @@
-//! FSRS-based spaced-repetition scheduling over Anki's 4-button grading.
-//! Pure and persistence-agnostic: callers own turning `interval_days` into
-//! an actual due timestamp and storing it.
-//!
-//! Short relearning steps (a failed card coming back within the same
-//! session rather than a full day out) aren't something FSRS itself models
-//! — Anki layers them on top of its own FSRS scheduling the same way this
-//! does: on `Again`, FSRS still updates `stability`/`difficulty` to reflect
-//! the lapse, but the actual next-due interval is overridden with a short
-//! fixed step instead of FSRS's own (much longer) suggested interval.
+//! FSRS-based spaced-repetition scheduling over Anki's 4-button grading
 
 use fsrs::{FSRS, MemoryState};
 
-/// Target recall probability FSRS schedules toward. 0.9 is the FSRS
-/// project's own recommended default for general use.
 const DESIRED_RETENTION: f32 = 0.9;
 
-/// How soon a failed card comes back within the same session, rather than
-/// instantly (which would just loop it forever in a busy queue) or a full
-/// day out (which defeats the point of "relearning" it now).
 const RELEARNING_INTERVAL_DAYS: f32 = 10.0 / (24.0 * 60.0); // 10 minutes
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,16 +17,11 @@ pub enum Grade {
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ReviewState {
     /// FSRS memory state. `None` only for `ReviewState::default()` — a
-    /// card that's never been reviewed at all. FSRS fits a memory state on
-    /// every grade, including `Again`, so once a card has been reviewed
-    /// even once these are always populated.
+    /// card that's never been reviewed at all.
     pub stability: Option<f32>,
     pub difficulty: Option<f32>,
     pub interval_days: f32,
     pub repetitions: u32,
-    /// Times a card already past initial learning (`repetitions > 0`) was
-    /// failed. A fresh card's first "Again" doesn't count — there's
-    /// nothing to have lapsed from yet.
     pub lapses: u32,
 }
 
@@ -59,12 +40,6 @@ impl ReviewState {
     /// for a card that's never been reviewed) — FSRS schedules differently
     /// for a card reviewed exactly on time versus one reviewed late, so
     /// this can't be derived from `self` alone.
-    ///
-    /// # Panics
-    ///
-    /// Never in practice: the only failure modes `FSRS::next_states` has
-    /// are invalid model parameters or an invalid `desired_retention`,
-    /// both of which are fixed, known-valid constants here.
     #[must_use]
     pub fn schedule(self, grade: Grade, elapsed_days: u32) -> Self {
         let fsrs = FSRS::default();
@@ -127,8 +102,6 @@ mod tests {
         let next = state.schedule(Grade::Again, 10);
         assert_eq!(next.repetitions, 0);
         assert_eq!(next.interval_days, RELEARNING_INTERVAL_DAYS);
-        // A lapse should leave the card with lower modeled stability than
-        // it had going in.
         assert!(next.stability.unwrap() < state.stability.unwrap());
     }
 

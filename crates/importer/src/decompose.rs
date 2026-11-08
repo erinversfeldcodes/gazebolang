@@ -34,14 +34,6 @@ pub struct Card {
     pub image_url: Option<String>,
 }
 
-/// A bare part-of-speech tag in parentheses (e.g. `"abhor (verb)"`) adds
-/// no sense-distinguishing information — the card already has its own
-/// `part_of_speech` field — so it's dropped entirely before comparison,
-/// unlike a real qualifying parenthetical (`"ablaze (excited)"`,
-/// `"ablaze (with)"`) which genuinely marks a distinct sense and must be
-/// kept. Confirmed necessary in a real run: `"abhor (verb)"`/`"thiya"`
-/// slipped past the duplicate check against an already-created
-/// `"abhor"`/`"-thiya"` card, differing only by this redundant tag.
 const POS_TAG_WORDS: &[&str] = &[
     "n",
     "v",
@@ -89,39 +81,11 @@ fn strip_redundant_pos_parenthetical(s: &str) -> String {
     result
 }
 
-/// A handful of common English function words that are never themselves a
-/// real, standalone flashcard concept in this pipeline — every real card's
-/// `english` is a dictionary headword, sense, or phrase, never a bare
-/// preposition/article/conjunction on its own. Confirmed necessary in a
-/// real run: enumerate split `"ablaze (with)"` into two items, one
-/// correctly labeled and one reduced to just `"with"`, which fill then
-/// happily gave a real-looking card — a duplicate in substance, but not
-/// in form, since "with" naturally doesn't equal "ablaze with".
 const TRIVIAL_FRAGMENT_LABELS: &[&str] = &[
     "with", "the", "a", "an", "of", "in", "on", "by", "to", "and", "or", "but", "for", "at",
 ];
 
-/// Returns a short, human-readable reason to reject a drafted card, or
-/// `None` if it should be kept. Not fully pure — a kept card's key is
-/// recorded into `seen_card_keys` so a later duplicate of it is caught too
-/// — but synchronous and needs no model/network call, so it's unit-tested
-/// on its own rather than only indirectly through a full decompose run.
-/// Strips cosmetic differences that don't change a card's real identity
-/// — a leading/trailing "-" marking a Xhosa bound stem, a redundant
-/// part-of-speech tag, and parentheses around a qualifying word — before
-/// two cards are compared. Confirmed necessary in a real run against the
-/// production model: `"ablaze with"`/`"khazimla"` slipped past the
-/// duplicate check against an already-created `"ablaze (with)"`/
-/// `"-khazimla"` card, and `"the nqa"`/`"-the nqa"` slipped past the
-/// self-referential check, both differing only by this kind of
-/// formatting, not by content.
 fn normalize_for_comparison(s: &str) -> String {
-    // Trimming hyphens can expose a space that was on the far side of
-    // one (e.g. "- 0" -> " 0") — a pre-existing bug a real proptest
-    // run caught: without the final `.trim()`, that leftover space
-    // survives the first pass but gets cleaned up as a matter of
-    // course by `split_whitespace` on any *second* pass, breaking
-    // idempotence. The plain `.trim()` here closes that gap.
     strip_redundant_pos_parenthetical(s)
         .chars()
         .filter(|c| *c != '(' && *c != ')')
@@ -134,15 +98,6 @@ fn normalize_for_comparison(s: &str) -> String {
         .to_lowercase()
 }
 
-/// Splits `english` into its base word/phrase and a trailing qualifying
-/// parenthetical, if it has one worth keeping separately — e.g. `"abate
-/// (of wind, storm, pain)"` -> (`"abate"`, `Some("of wind, storm,
-/// pain)")`. A parenthetical that's just a redundant part-of-speech tag
-/// (already handled by `strip_redundant_pos_parenthetical`) doesn't
-/// count: the whole original string is returned unsplit, with no
-/// qualifier, so it's still correctly recognized as a duplicate via
-/// `normalize_for_comparison`'s own POS-tag stripping, without a
-/// meaningless "verb"/"noun" ending up in a card's notes.
 fn split_trailing_parenthetical(english: &str) -> (&str, Option<&str>) {
     let trimmed = english.trim_end();
     let Some(before_close) = trimmed.strip_suffix(')') else {
@@ -160,13 +115,6 @@ fn split_trailing_parenthetical(english: &str) -> (&str, Option<&str>) {
     (base, Some(content))
 }
 
-/// Folds `qualifier` into `card`'s own dictionary-details notes, unless
-/// an equivalent note is already there — used both when a brand-new
-/// card's own qualifying parenthetical is moved out of `english` and
-/// into notes, and when a later near-duplicate's differently-worded
-/// qualifier (e.g. "(floods)" matching an already-kept "(of floods)")
-/// is folded into the card it duplicates, rather than discarded with
-/// the rest of that duplicate.
 fn merge_qualifier_into_notes(card: &mut Card, qualifier: &str) {
     let qualifier = qualifier.trim();
     if qualifier.is_empty() {
@@ -186,18 +134,6 @@ fn merge_qualifier_into_notes(card: &mut Card, qualifier: &str) {
     }
 }
 
-/// Two (already-normalized) translations are "the same, modulo a
-/// likely transcription variant" when one is fully contained in the
-/// other — as a prefix, suffix, or substring — and they're not
-/// wildly different in length. Confirmed necessary in a real run:
-/// chunking a long entry into two overlapping halves and enumerating
-/// each independently produced the identical underlying translation
-/// twice with a one-character spelling difference picked up across
-/// the seam ("khupha isisu" vs "ukhupha isisu", a Xhosa noun-class
-/// prefix letter) — an exact-match dedup key can't catch that on its
-/// own. The length-difference cap keeps this from firing on a short
-/// translation that's simply, legitimately, a substring of an
-/// unrelated longer phrase elsewhere in the same entry.
 fn target_text_is_a_near_duplicate(a: &str, b: &str) -> bool {
     if a == b {
         return true;
@@ -253,10 +189,6 @@ pub fn card_rejection_reason(
     let (base_english, qualifier) = split_trailing_parenthetical(&english);
     let normalized_base = normalize_for_comparison(base_english);
 
-    // Keyed on the pair actually shown to the learner (english +
-    // target_text), not the enumerated item's label — two different
-    // enumerate labels can still land on the identical card when the
-    // entry text overlaps, and that's the duplicate worth catching.
     let full_key = format!("{normalized_full}|{normalized_target}");
     let base_key = format!("{normalized_base}|{normalized_target}");
 
@@ -298,43 +230,10 @@ pub struct Item {
     pub source_excerpt: String,
 }
 
-/// Entries at or below this length are processed as a single
-/// enumerate call, exactly as always — chunking only kicks in for the
-/// genuinely long outliers this session's research found evidence for
-/// (chunk-and-merge was the one technique in that research with
-/// direct, large, measured completeness gains). Measured against this
-/// real corpus: median entry length is 95 characters, mean 140 — this
-/// threshold only affects a handful of the longest entries (e.g.
-/// "about, prep.", one of the longest in this dictionary at 562
-/// characters), not the great majority of ordinary short entries,
-/// which have no documented enumeration problem to fix.
 const CHUNK_THRESHOLD_CHARS: usize = 300;
 
-/// How far back from the split point the second chunk's own start
-/// reaches — enough that a sense or worked example straddling the
-/// midpoint stays fully visible to at least one of the two chunks,
-/// rather than being sliced in half by the split itself. Any item
-/// found independently in both chunks' overlap is a real, expected
-/// duplicate, left for this module's own existing fill-stage
-/// deduplication (`card_rejection_reason`,
-/// `target_text_reused_from_a_different_sense`) to remove — the same
-/// "completeness first, precision as a separate later stage" split
-/// this session's research found working well elsewhere, not a new
-/// mechanism built just for this.
 const CHUNK_OVERLAP_CHARS: usize = 80;
 
-/// Splits `raw_entry` into two overlapping halves at the semicolon
-/// closest to its own midpoint, or returns `None` if the entry is
-/// short enough that a single, un-chunked enumerate call already
-/// works fine. Unlike this session's earlier, reverted mechanical
-/// pre-segmentation attempt, this never tells the model what to do
-/// with the text it's given — each half still gets the exact same
-/// free-form "list every item" prompt an un-chunked entry would, just
-/// with less text to search per call, which is the one part of that
-/// reverted attempt's premise (a smaller context gets searched more
-/// completely) this session's research found direct, strong evidence
-/// for, separately from the part that actually failed (restricting
-/// what the model could do with each piece).
 fn split_into_overlapping_chunks(raw_entry: &str) -> Option<(String, String)> {
     if raw_entry.len() <= CHUNK_THRESHOLD_CHARS {
         return None;
@@ -362,40 +261,10 @@ fn split_into_overlapping_chunks(raw_entry: &str) -> Option<(String, String)> {
 /// union-merging the results — short entries (the great majority) are
 /// completely unaffected, going through `enumerate_items_single_call`
 /// exactly once just as before.
-///
-/// Tried replacing the single-call approach entirely with a mechanical
-/// pre-segmentation (split on semicolons, let the model only
-/// classify/merge each span) per this session's own research —
-/// reverted after a real run showed it backfired badly: enumeration
-/// dropped from 268 to 168 items across the real 66-entry corpus
-/// (37%), for two compounding reasons. First, a comma-separated list
-/// isn't reliably "alternative translations of one sense" the way
-/// "-yeka, -lahla, -ncama" is — "abode"'s "ikhaya (ili-ama-), umzi,
-/// indlu (in- izin-)" lists three genuinely distinct Xhosa words that
-/// this model's own free-form judgment correctly separates into 5
-/// items, but a splitter that only ever breaks at semicolons (never
-/// commas) can't recover that distinction once collapsed to one span
-/// — there's no later step that can re-split what the mechanical pass
-/// already merged. Second, even where the mechanical split was
-/// reasonable, framing the model's job as a binary "merge with
-/// previous, yes or no" per span made it *more* eager to merge than
-/// free-form generation was, compounding the loss rather than just
-/// capping it. Kept as a cautionary real finding, not reattempted
-/// without addressing both failure modes, not just the first.
-/// Part-of-speech abbreviations this dictionary uses right after a
-/// comma to introduce a derived word spelled out in full (e.g.
-/// "abusive, adj.") — one of the markers `marker_based_minimum_item_count`
-/// counts. Mirrors `schema::fill_schema`'s own part-of-speech enum
-/// (minus the empty string, which can't introduce anything).
 const DERIVED_WORD_POS_TAGS: &[&str] = &[
     "n.", "v.", "vt.", "vi.", "adj.", "adv.", "prep.", "conj.", "pron.", "interj.", "num.",
 ];
 
-/// Whether `piece` (one semicolon-delimited slice of a raw entry,
-/// already trimmed) looks like the start of a new learnable unit —
-/// an open paren, a "~" standing in for the headword, an "eg."
-/// worked example, or a spelled-out derived word with its own
-/// part-of-speech tag. See `marker_based_minimum_item_count`.
 fn starts_a_new_structural_unit(piece: &str) -> bool {
     if piece.starts_with('(') || piece.starts_with('~') {
         return true;
@@ -427,18 +296,6 @@ fn starts_a_new_structural_unit(piece: &str) -> bool {
 /// reverted attempt used to *constrain* enumeration — see
 /// `enumerate_items`'s own doc comment), with one span of safety
 /// margin subtracted.
-///
-/// Deliberately a soft, logged diagnostic — never a hard grammar
-/// constraint (e.g. a JSON-Schema `minItems`). A real run proved that
-/// risk isn't hypothetical: forcing the model's output to match a
-/// mechanical count is exactly what made the reverted attempt above
-/// collapse enumeration by 37% across this corpus, and this same
-/// count is just as unreliable a proxy in the other direction — e.g.
-/// "abode" has zero semicolons at all, yet five genuinely distinct
-/// comma-separated Xhosa words worth their own cards. This can only
-/// ever warn that an entry looks under-enumerated relative to its own
-/// visible structure, for a human to glance at — never force a fix
-/// that could just as easily force bad padding instead.
 fn marker_based_minimum_item_count(raw_entry: &str) -> usize {
     let marker_spans = raw_entry
         .split(';')
@@ -485,18 +342,7 @@ pub fn enumerate_items(
 /// A single, narrowly-targeted second pass checking specifically
 /// whether any sense above lists more than one alternative
 /// target-language translation where only some of those alternatives
-/// made it into that item's own excerpt — not a generic "did you miss
-/// anything?" self-critique. This session's own research review found
-/// essentially no positive completeness evidence for open-ended
-/// self-critique at this model's scale, and real precedent of it
-/// actively *hurting* recall by acting as a precision filter instead;
-/// the one positive signal it did find came specifically from a
-/// narrowly-named gap, checked once, not iterated (diminishing
-/// returns past a single round are well documented). This is that
-/// narrow framing, scoped to the one completeness gap this project
-/// has repeatedly confirmed in real runs — a sense's own secondary
-/// synonym getting dropped — rather than a generic invitation to
-/// second-guess everything.
+/// made it into that item's own excerpt
 fn find_missed_synonyms(
     engine: &TextEngine,
     headword: &str,
@@ -506,15 +352,6 @@ fn find_missed_synonyms(
     if items.is_empty() {
         return Ok(Vec::new());
     }
-    // Deliberately NOT a numbered list: a real run showed the model
-    // copying the list's own "1."/"2." position markers back as the
-    // item's "label" field, rather than the label text itself —
-    // which then always fails the grounding filter below (by design,
-    // since "1"/"2" never match a real label) and silently discards
-    // the whole item instead of returning the real missing
-    // alternative. Each entry is already visually self-delimited by
-    // its own label prefix, so a number added no information the
-    // model needed anyway.
     let items_so_far = items
         .iter()
         .map(|item| format!("label \"{}\" — \"{}\"", item.label, item.source_excerpt))
@@ -551,17 +388,6 @@ Items already found:\n{items_so_far}"
         .into_iter()
         .filter_map(|v| serde_json::from_value::<Item>(v).ok())
         .filter(|i| !i.label.is_empty() && !i.source_excerpt.is_empty())
-        // The prompt above explicitly instructs the model to reuse the
-        // SAME label as the sense an alternative belongs to — a label
-        // that doesn't match anything already found means the model
-        // either ignored that instruction or reached beyond this
-        // pass's own deliberately narrow scope (finding a missing
-        // alternative for an *existing* sense, never a whole new
-        // sense). Confirmed necessary in a real run: this check is
-        // what catches "abash" getting a fabricated "abashment" item
-        // (translation "ukuthotywa") that appears nowhere in that
-        // entry's real raw text at all, under a label the original
-        // enumeration never produced.
         .filter(|i| existing_labels.contains(&i.label.trim().to_lowercase()))
         .collect())
 }
@@ -620,43 +446,13 @@ Entry (headword: \"{headword}\"):\n{raw_entry}"
 /// qualifier like "(noun)" is set aside — turns out to just BE a chunk
 /// of its own `source_excerpt` is a reliable sign of exactly this
 /// failure.
-///
-/// This used to be grounds to drop the item outright at enumeration —
-/// reverted after a later real run showed that was far too blunt: it's
-/// *also* the normal shape of a perfectly good item whenever the
-/// dictionary happens to spell a derived word out in full right in its
-/// own excerpt ("accelerator, n. …"), or whenever an item's only real
-/// content *is* an untranslated worked example the model labeled
-/// lazily instead of reconstructing ("he goes, ~ a ship: ukhwela
-/// enqanaweni" for "aboard") — both real cases where dropping the item
-/// threw away the entry's only genuinely learnable content for that
-/// sense. This is now just a "suspect" signal, checked at the fill
-/// stage (see `run_decompose`) against the one thing that actually
-/// distinguishes the original bug — the same translation getting
-/// reused for a second, different sense — rather than against the
-/// label's wording alone.
 fn label_is_not_copied_from_its_own_excerpt(item: &Item) -> bool {
     let (base_label, _) = split_trailing_parenthetical(&item.label);
     let normalized_label = normalize_for_comparison(base_label);
-    // Too short a label risks coincidental overlap with unrelated
-    // excerpt text; the real case this guards against is a whole word,
-    // not a short fragment, so there's no real precision cost in only
-    // checking labels long enough for the overlap to be meaningful.
     normalized_label.chars().count() < 4
         || !normalize_for_comparison(&item.source_excerpt).contains(&normalized_label)
 }
 
-/// The one thing that actually distinguishes the real bug
-/// `label_is_not_copied_from_its_own_excerpt` flags as suspect from the
-/// far more common legitimate case that signal alone can't tell apart
-/// from it: a dictionary entry reusing the identical translation for
-/// two genuinely *different* senses, by coincidence, within its own
-/// few lines is essentially never real — confirmed real case: the
-/// bogus "abruptness" card reused "ngequbuliso" from the entry's own
-/// already-accepted "abruptly" card. `cards_this_entry` must only be
-/// cards already accepted from the *same* entry — a translation
-/// legitimately recurring across two unrelated entries elsewhere in
-/// the dictionary is not this bug.
 fn target_text_reused_from_a_different_sense(card: &Card, cards_this_entry: &[Card]) -> bool {
     let target = normalize_for_comparison(&card.target_text);
     let english = normalize_for_comparison(&card.english);
@@ -719,11 +515,6 @@ The one item to fill in:\nLabel: {}\nExcerpt: {}",
     serde_json::from_value(Value::Object(obj)).map_err(|e| e.to_string())
 }
 
-/// A card or whole entry that didn't make it into the final output,
-/// kept around for a human to glance at rather than only a line in a
-/// console that's long since scrolled past by the time anyone looks —
-/// every skip reason already printed during a run was, before this,
-/// otherwise unrecoverable the moment the process exited.
 #[derive(serde::Serialize)]
 struct SkippedItem {
     headword: String,
@@ -733,11 +524,6 @@ struct SkippedItem {
     reason: String,
 }
 
-/// The sidecar path a run's skipped items (if any) are written to —
-/// see `segment::needs_review_path`, which this mirrors; kept as its
-/// own small copy rather than a shared helper, since the two run on
-/// different data shapes (entries vs. cards) and the path logic itself
-/// is only a couple of lines.
 fn needs_review_path(cards_out_file: &Path) -> std::path::PathBuf {
     let stem = cards_out_file
         .file_stem()
@@ -747,12 +533,6 @@ fn needs_review_path(cards_out_file: &Path) -> std::path::PathBuf {
     dir.join(format!("{stem}.needs-review.json"))
 }
 
-/// Fills in and accepts (or rejects, with a reason) one previously
-/// enumerated item — the per-item body of `run_decompose`'s own loop,
-/// pulled out only to stay under clippy's line-count lint.
-/// `entry_start_idx` is where `cards` stood before this entry's own
-/// items started being processed, so `target_text_reused_from_a_different_sense`
-/// only ever compares against cards from the *same* entry.
 fn process_item(
     engine: &TextEngine,
     entry: &crate::segment::Entry,
@@ -889,10 +669,6 @@ mod tests {
         }
     }
 
-    /// Mirrors `run_decompose`'s own usage exactly: builds a card,
-    /// checks it, and pushes it onto `cards` only if kept — so a test
-    /// can inspect a kept card's own (possibly-mutated) fields
-    /// afterward via `cards[..]`, not just the rejection reason.
     fn check(
         cards: &mut Vec<Card>,
         seen: &mut HashMap<String, usize>,
@@ -966,9 +742,6 @@ mod tests {
 
     #[test]
     fn target_text_is_a_near_duplicate_catches_a_one_character_prefix_variant() {
-        // Real case: chunking split "abort" into two overlapping
-        // halves, each independently enumerating the same translation
-        // with a one-letter spelling difference across the seam.
         assert!(target_text_is_a_near_duplicate(
             "khupha isisu",
             "ukhupha isisu"
@@ -977,10 +750,6 @@ mod tests {
 
     #[test]
     fn target_text_is_a_near_duplicate_rejects_a_short_stem_inside_an_unrelated_longer_phrase() {
-        // The length-difference cap exists specifically so a short,
-        // legitimately-reused Xhosa stem elsewhere in the same entry
-        // isn't treated as "the same card" just because one string
-        // contains the other.
         assert!(!target_text_is_a_near_duplicate(
             "kho",
             "kukho iinyoka ezininzi"
@@ -1001,10 +770,6 @@ mod tests {
 
     #[test]
     fn keeps_a_near_duplicate_target_text_under_a_different_english() {
-        // The near-duplicate fallback is gated on the English side
-        // matching first — a short Xhosa stem legitimately recurring
-        // under a genuinely different English sense within the same
-        // entry must not be merged away.
         let mut cards = Vec::new();
         let mut seen = HashMap::new();
         assert_eq!(check(&mut cards, &mut seen, "abort", "khupha isisu"), None);
@@ -1063,12 +828,6 @@ mod tests {
 
     #[test]
     fn a_qualifying_parenthetical_is_treated_as_the_same_card_with_the_qualifier_moved_to_notes() {
-        // Confirmed necessary in a real run against the production
-        // model (the "abate" entry): a bare sense and a parenthetical-
-        // qualified alternate of the *same* word and the *same*
-        // translation are the same card, not two different ones — the
-        // qualifier is usage-context, not a distinct meaning, so it's
-        // preserved in the dictionary-details notes rather than lost.
         let mut cards = Vec::new();
         let mut seen = HashMap::new();
         assert_eq!(check(&mut cards, &mut seen, "ablaze", "-vutha"), None);
@@ -1101,10 +860,6 @@ mod tests {
 
     #[test]
     fn a_differently_worded_qualifier_on_a_later_duplicate_is_folded_into_the_kept_cards_notes() {
-        // The exact pair reported from a real run: "abate (floods)" and
-        // "abate (of floods)" are the same card with cosmetically
-        // different qualifier wording — both should survive in notes
-        // rather than the second one's wording being silently dropped.
         let mut cards = Vec::new();
         let mut seen = HashMap::new();
         assert_eq!(
@@ -1165,15 +920,6 @@ mod tests {
 
     #[test]
     fn marker_count_matches_abuse_real_sense_count_conservatively() {
-        // Real entry: the base verb sense plus 5 more marker-
-        // introduced spans — 3 more "(...)" verb senses, the "~, n."
-        // noun sense, and "abusively, adv." (its own two noun-sense
-        // alternate translations, "impatho embi"/"isithuko,
-        // isinyeliso", have no marker of their own and don't add to
-        // the count, same as the real, confirmed enumeration gap this
-        // session already found and fixed a different way via
-        // chunking) — 6 marker spans total, so a floor of 5 (one
-        // below that).
         let raw_entry = "abuse, vt. (of authority, confidence, etc.) -sebenzisa kakubi; \
             (in words) -thuka, -tshabisa; (old use) -phatha kakubi; ~, n. ukusebenzisa \
             kakubi; impatho embi (im- iim-); isithuko, isinyeliso; abusive, adj. \
@@ -1183,10 +929,6 @@ mod tests {
 
     #[test]
     fn marker_count_never_overestimates_abode_which_has_no_semicolons_at_all() {
-        // Real entry this check *can't* help with — three genuinely
-        // distinct Xhosa words separated only by commas, not
-        // semicolons — but it must never overestimate it as "needing"
-        // more items than the floor logic can actually see.
         let raw_entry = "abode, n. (old or liter. use) ikhaya (ili- ama-), umzi, \
             indlu (in- izin-).";
         assert_eq!(marker_based_minimum_item_count(raw_entry), 0);
@@ -1199,9 +941,6 @@ mod tests {
 
     #[test]
     fn splits_the_real_about_prep_entry_without_cutting_any_sense_in_half() {
-        // Real entry, 562 characters — one of the longest in this
-        // dictionary, and the one that originally motivated this
-        // change.
         let raw_entry = "about, prep. (with verbs of movement) apha naphaya (plus \
             locative); eg. he was walking ~ the town; wayehamba-hamba apha naphaya \
             edolphini; (indicating position or state) alpha naphaya (plus locative); \
@@ -1211,31 +950,22 @@ mod tests {
             akazikha-thazi ngempahla yakhe; what are you talking ~?: nithetha \
             ngantoni?; go/set ~ something: -enza.";
         let (first_half, second_half) = split_into_overlapping_chunks(raw_entry).unwrap();
-        // Every real sense/example must be fully contained in at least
-        // one half, not torn across the split point.
         assert!(first_half.contains("(with verbs of movement) apha naphaya (plus locative)"));
         assert!(first_half.contains("he was walking ~ the town"));
         assert!(second_half.contains("(near to) kufuphi na-"));
         assert!(second_half.contains("go/set ~ something: -enza."));
-        // The overlap must give both halves a real seam to dedup
-        // against, not just abut exactly at the split.
         assert!(first_half.len() + second_half.len() > raw_entry.len());
     }
 
     #[test]
     fn split_into_overlapping_chunks_never_panics_on_short_or_delimiter_free_long_text() {
         assert_eq!(split_into_overlapping_chunks(""), None);
-        // Long enough to pass the threshold, but with no semicolon at
-        // all to split on.
         let no_semicolons = "a".repeat(400);
         assert_eq!(split_into_overlapping_chunks(&no_semicolons), None);
     }
 
     #[test]
     fn split_into_overlapping_chunks_is_safe_on_multi_byte_utf8_near_the_midpoint() {
-        // "é" and "·" are both real characters this dictionary's own
-        // headwords and derived-word markers use — the midpoint/overlap
-        // char-boundary search must never panic on them.
         let raw_entry = format!(
             "abbé, n. {}; eg. umfundisi waseFransi ~·té: something; {}",
             "x".repeat(140),
@@ -1247,10 +977,6 @@ mod tests {
 
     #[test]
     fn rejects_an_enumerated_item_whose_label_is_copied_from_its_own_excerpt() {
-        // Real failure: enumerate_items split one alternative
-        // target-language translation, among several listed for
-        // "abruptly", off into its own fake item — labeling it with
-        // the Xhosa word itself, copied straight into English position.
         assert!(!label_is_not_copied_from_its_own_excerpt(&item(
             "ngequbuliso (noun)",
             "ngequbuliso, ngebhaqo"
@@ -1279,8 +1005,6 @@ mod tests {
 
     #[test]
     fn detects_the_real_ngequbuliso_reuse_across_two_different_senses() {
-        // Real failure: the bogus "abruptness" card reused "ngequbuliso"
-        // from the entry's own already-accepted "abruptly" card.
         let already_accepted = vec![card("abruptly", "ngequbuliso")];
         let bogus = card("abruptness", "ngequbuliso");
         assert!(target_text_reused_from_a_different_sense(
@@ -1291,9 +1015,6 @@ mod tests {
 
     #[test]
     fn a_unique_translation_is_not_flagged_as_reused() {
-        // Real case this must NOT catch: "accelerator" legitimately has
-        // its own, unique translation — nothing else in the entry uses
-        // "umcephe".
         let already_accepted = vec![card("accelerate", "khawulezisa")];
         let legit = card("accelerator", "umcephe");
         assert!(!target_text_reused_from_a_different_sense(
@@ -1304,9 +1025,6 @@ mod tests {
 
     #[test]
     fn an_exact_repeat_of_the_same_card_is_not_flagged_as_reused() {
-        // Exact (english, target_text) duplicates are `card_rejection_reason`'s
-        // own job — this check is specifically for the *same* translation
-        // attached to a *different* sense, not a plain repeat.
         let already_accepted = vec![card("abrupt", "krwada")];
         let repeat = card("abrupt", "krwada");
         assert!(!target_text_reused_from_a_different_sense(
@@ -1327,10 +1045,6 @@ mod tests {
 
     #[test]
     fn reuse_in_an_unrelated_earlier_entry_is_not_flagged() {
-        // `cards_this_entry` must only ever be passed cards from the
-        // *same* entry — a coincidental match against an unrelated
-        // entry elsewhere in the dictionary isn't this bug, and this
-        // function trusts its caller to have already scoped the slice.
         let other_entrys_cards: Vec<Card> = vec![];
         let card_here = card("abruptness", "ngequbuliso");
         assert!(!target_text_reused_from_a_different_sense(
@@ -1340,31 +1054,17 @@ mod tests {
     }
 
     proptest::proptest! {
-        /// Everything `normalize_for_comparison` does — stripping a
-        /// redundant pos-tag parenthetical, dropping parens, collapsing
-        /// whitespace, trimming hyphens, lowercasing — produces a form
-        /// that's already fully normalized: running it again on its
-        /// own output must always be a no-op, for any input whatsoever.
         #[test]
         fn normalize_for_comparison_is_idempotent(s in ".*") {
             let once = normalize_for_comparison(&s);
             let twice = normalize_for_comparison(&once);
             proptest::prop_assert_eq!(once, twice);
         }
-
-        /// This runs on real, possibly-garbled model output — it must
-        /// never panic, no matter how adversarial the input (empty,
-        /// all parens, unmatched parens, arbitrary Unicode).
         #[test]
         fn normalize_for_comparison_never_panics(s in ".*") {
             let _ = normalize_for_comparison(&s);
         }
 
-        /// The whole point of `seen_card_keys`: once a genuinely new
-        /// card has been accepted, checking the *exact same* card again
-        /// must always report it as a duplicate — never silently
-        /// accepted twice, for any non-degenerate (english, target_text)
-        /// pair.
         #[test]
         fn accepting_a_card_then_rechecking_it_always_reports_a_duplicate(
             english in "[a-zA-Z]{2,10}",
