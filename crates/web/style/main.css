@@ -5,22 +5,25 @@
    self-contained and Docker-emulatable offline. */
 
 :root {
-    --wall: #2b2420;
-    --wall-dark: #1d1814;
-    --wood-dark: #4a3728;
-    --wood-medium: #6b4f3a;
-    --wood-light: #8a6b4e;
-    --brass: #c9a227;
-    --brass-dim: #9c7f2e;
-    --brass-bright: #e0c158;
-    --paper: #f2e8d5;
-    --paper-aged: #e8dbc0;
-    --paper-dark: #ddcdac;
-    --ink: #2b2015;
-    --ink-faded: #6b5a44;
-    --rule-red: #8b3a3a;
-    --shadow: rgba(20, 14, 8, 0.45);
-    --shadow-soft: rgba(20, 14, 8, 0.25);
+    /* Refined pass: same wood/brass/paper family, flattened and desaturated
+       slightly so it reads as considered rather than default-gradient —
+       values chosen together, not swapped independently. */
+    --wall: #221d18;
+    --wall-dark: #16120e;
+    --wood-dark: #3c2e22;
+    --wood-medium: #5e4834;
+    --wood-light: #7a5f45;
+    --brass: #ad8b49;
+    --brass-dim: #8a6f3c;
+    --brass-bright: #d1b06e;
+    --paper: #f3edde;
+    --paper-aged: #e7dcc2;
+    --paper-dark: #ded0b0;
+    --ink: #2a2117;
+    --ink-faded: #685a45;
+    --rule-red: #7d4138;
+    --shadow: rgba(10, 7, 4, 0.45);
+    --shadow-soft: rgba(10, 7, 4, 0.25);
 
     --font-serif: Georgia, "Palatino Linotype", "Book Antiqua", Palatino, "Times New Roman", serif;
     --font-type: "Courier New", Courier, monospace;
@@ -82,7 +85,7 @@ a:hover {
 /* --- Nav: a brass-trimmed plaque along the top of the cabinet room --- */
 
 nav {
-    background: linear-gradient(var(--wood-dark), var(--wood-medium) 90%, var(--brass-dim));
+    background: var(--wood-dark);
     border-bottom: 3px solid var(--brass);
     padding: 0.9rem 1.5rem;
     font-size: 0.95rem;
@@ -733,6 +736,122 @@ form p,
     text-transform: uppercase;
     letter-spacing: 0.05em;
     margin: 0 0 0.8rem;
+}
+
+/* Dictionary details: sets the example sentence + its gloss apart from the
+   plain field list above, like an indented citation on a dictionary slip. */
+.dict-example {
+    border-left: 2px solid var(--brass-dim);
+    padding-left: 0.9rem;
+    margin: 0.75rem 0;
+}
+
+.dict-example input[type="text"] {
+    font-style: italic;
+}
+
+/* Related cards (CardLinksSection): a counts-by-type legend plus the list
+   restyled as badged rows, so the three link types (see cards.rs'
+   LINK_TYPES) are legible at a glance instead of a flat line of text. */
+.card-links-legend {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.75rem;
+}
+
+.link-type-count {
+    font-size: 0.68rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--rule-red);
+    border: 1px solid var(--rule-red);
+    border-radius: 1px;
+    padding: 0.15rem 0.45rem;
+}
+
+.link-type-count em {
+    font-style: normal;
+    font-family: var(--font-type);
+    margin-left: 0.35rem;
+    color: var(--ink-faded);
+}
+
+.card-links-list {
+    list-style: none;
+    margin: 0 0 1rem;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+}
+
+.card-links-list li {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.45rem 0.6rem;
+    border: 1px solid var(--paper-dark);
+    border-radius: 1px;
+}
+
+.link-arrow {
+    font-family: var(--font-type);
+    color: var(--brass-dim);
+}
+
+.link-word {
+    font-family: var(--font-type);
+    flex: 1 1 auto;
+}
+
+.link-type-badge {
+    font-size: 0.65rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--rule-red);
+    border: 1px solid var(--rule-red);
+    border-radius: 1px;
+    padding: 0.12rem 0.4rem;
+    flex-shrink: 0;
+}
+
+.card-links-empty {
+    font-style: italic;
+    color: var(--ink-faded);
+}
+
+.card-links-add {
+    padding-top: 0.9rem;
+    margin-top: 0.4rem;
+    border-top: 1px solid var(--paper-dark);
+}
+
+/* NewCardPage's non-functional discoverability hint — there's no card_id
+   to link against before the first save, so this previews the three
+   LINK_TYPES as inert pills rather than offering a control with nothing
+   to do yet. */
+.xref-teaser p {
+    font-style: italic;
+    color: var(--ink-faded);
+    line-height: 1.5;
+}
+
+.xref-ghost-row {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.xref-ghost {
+    font-size: 0.68rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-faded);
+    border: 1px dashed var(--paper-dark);
+    border-radius: 1px;
+    padding: 0.25rem 0.55rem;
+    opacity: 0.8;
 }
 
 /* --- Grammar wiki: deliberately NOT the card-catalog palette (see the

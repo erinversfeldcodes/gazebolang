@@ -237,14 +237,16 @@ pub fn DictionaryDetailsEditor(
                 "Notes"
                 <textarea node_ref=notes>{notes_initial}</textarea>
             </label>
-            <label>
-                "Example sentence (target language)"
-                <input type="text" node_ref=example_target value=example_target_initial />
-            </label>
-            <label>
-                "Example sentence gloss (English/source — shown only in the lookup popup, never during review)"
-                <input type="text" node_ref=example_gloss value=example_gloss_initial />
-            </label>
+            <div class="dict-example">
+                <label>
+                    "Example sentence (target language)"
+                    <input type="text" node_ref=example_target value=example_target_initial />
+                </label>
+                <label>
+                    "Example sentence gloss (English/source — shown only in the lookup popup, never during review)"
+                    <input type="text" node_ref=example_gloss value=example_gloss_initial />
+                </label>
+            </div>
             <label>
                 "Related words (comma separated)"
                 <input type="text" node_ref=linked_words value=linked_words_initial />

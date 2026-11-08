@@ -392,16 +392,24 @@ pub fn App() -> impl IntoView {
                         Suspend::new(async move {
                         match auth.await.ok().flatten() {
                             Some(_) => view! {
-                                " · "<A href="/review">"Review"</A>
                                 " · "
-                                // Opens on hover (see .nav-menu in main.css),
-                                // same as the Cards/Account menus — minimal
-                                // pairs and the spelling test both need an
-                                // account (their attempts are per-user), so
-                                // this dropdown lives in the signed-in-only
-                                // branch, unlike Back-chain above.
+                                // Review and the other drills used to be two
+                                // separate top-level items ("Review" plus a
+                                // "Practice" dropdown); folded into one since
+                                // they're all study activities and a user
+                                // reaching for one is usually open to the
+                                // others. Opens on hover (see .nav-menu in
+                                // main.css), same as the Cards/Account
+                                // menus — minimal pairs and the spelling test
+                                // both need an account (their attempts are
+                                // per-user), so this dropdown lives in the
+                                // signed-in-only branch, unlike Back-chain
+                                // above, which stays a separate, public,
+                                // standalone link rather than joining this
+                                // menu, since folding it in here would hide
+                                // it from signed-out visitors.
                                 <div class="nav-menu">
-                                    <A href="/train/minimal-pairs" exact=true>"Practice"</A>
+                                    <A href="/review" exact=true>"Review"</A>
                                     <div class="nav-menu-items">
                                         <A href="/train/minimal-pairs">"Minimal pairs"</A>
                                         <A href="/train/spelling">"Spelling test"</A>
@@ -862,6 +870,23 @@ fn NewCardPage() -> impl IntoView {
                         <button type="submit">"Add"</button>
                     </Form>
                     <DictionaryDetailsEditor target_text=target_text_signal.into() />
+                    // No card_id exists until this form is submitted, so
+                    // there's nothing a link control could attach to yet —
+                    // this previews the three LINK_TYPES as inert pills
+                    // rather than a control with nothing to do. The real
+                    // "Related cards" UI lives on EditCardPage, once a
+                    // card_id exists (see CardLinksSection).
+                    <div class="card-section xref-teaser">
+                        <p class="card-section-heading">"Cross-references"</p>
+                        <p>
+                            "Minimal pairs, sound-spelling correspondences, and back-chain steps are linked once this card has been saved and filed — from its own page."
+                        </p>
+                        <div class="xref-ghost-row">
+                            {LINK_TYPES.iter().map(|(_, label, _)| {
+                                view! { <span class="xref-ghost">{*label}</span> }
+                            }).collect_view()}
+                        </div>
+                    </div>
                 }
                 .into_any()
             })}
@@ -1418,11 +1443,25 @@ fn CardLinksSection(
         },
     );
 
+    // Computed from linked_cards by reference before the list below
+    // consumes it, so the legend reflects exactly what's in the list —
+    // not a separate query that could drift from it.
+    let legend = LINK_TYPES
+        .iter()
+        .map(|(value, label, _)| {
+            let count = linked_cards
+                .iter()
+                .filter(|l| l.link_type == *value)
+                .count();
+            view! { <span class="link-type-count">{*label}" "<em>{count}</em></span> }
+        })
+        .collect_view();
+
     let links_list = if linked_cards.is_empty() {
-        view! { <p>"Not linked to any other card."</p> }.into_any()
+        view! { <p class="card-links-empty">"Not linked to any other card."</p> }.into_any()
     } else {
         view! {
-            <ul>
+            <ul class="card-links-list">
                 {linked_cards
                     .into_iter()
                     .map(|link| {
@@ -1436,7 +1475,9 @@ fn CardLinksSection(
                         let remove_link_type = link.link_type.clone();
                         view! {
                             <li>
-                                {arrow}{link.target_text}" (" {label} ")"
+                                <span class="link-arrow">{arrow}</span>
+                                <span class="link-word">{link.target_text}</span>
+                                <span class="link-type-badge">{label}</span>
                                 {signed_in.then(|| {
                                     let remove_link_type = remove_link_type.clone();
                                     view! {
@@ -1549,6 +1590,7 @@ fn CardLinksSection(
     view! {
         <div class="card-section">
             <p class="card-section-heading">"Related cards"</p>
+            <div class="card-links-legend">{legend}</div>
             {links_list}
             {add_form}
         </div>
