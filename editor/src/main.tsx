@@ -1,6 +1,6 @@
 import { createRoot, type Root } from "react-dom/client";
 import { useMemo, useState, useCallback, useRef, useEffect, type ReactElement, type KeyboardEvent } from "react";
-import { type Block, type BlockNoteEditor, BlockNoteSchema, COLORS_DEFAULT, createBlockSpec, defaultBlockSpecs, getDefaultBlockTypeItems } from "@blocknote/core";
+import { type Block, type BlockNoteEditor, BlockNoteSchema, COLORS_DEFAULT, createBlockSpec, defaultBlockSpecs, defaultInlineContentSpecs, getColspan, getDefaultBlockTypeItems, getRowspan, isTableCell } from "@blocknote/core";
 // The exact logic BlockNote's own "/" menu uses to insert each media type
 // (including opening the upload panel immediately after) — reused as-is
 // rather than reimplemented, so Image/Video/Audio/File/Emoji behave
@@ -8,8 +8,8 @@ import { type Block, type BlockNoteEditor, BlockNoteSchema, COLORS_DEFAULT, crea
 // (a flat list on the toolbar, not a nested/scrolling category menu)
 // changes. Public API: @blocknote/core/extensions is a real subpath
 // export (see its package.json), not an internal path.
-import { getDefaultSlashMenuItems, type DefaultSuggestionItem } from "@blocknote/core/extensions";
-import { useCreateBlockNote } from "@blocknote/react";
+import { getDefaultSlashMenuItems, TableHandlesExtension, type DefaultSuggestionItem } from "@blocknote/core/extensions";
+import { createReactInlineContentSpec, useCreateBlockNote } from "@blocknote/react";
 import { BlockNoteView } from "@blocknote/mantine";
 import { withMultiColumn } from "@blocknote/xl-multi-column";
 import "@blocknote/core/fonts/inter.css";
@@ -72,17 +72,231 @@ const TableOfContentsBlock = createBlockSpec(
   },
 )();
 
+// Walks `blocks` (the document, or any block's `children`) collecting every
+// footnoteRef's `noteId`, document-order depth-first — table cells included,
+// since a table cell's `content` is plain inline content same as a
+// paragraph's, just reached through `content.rows[].cells[]` instead of
+// directly. This is purely a client-side numbering aid: `noteId` itself
+// never has to mean anything to crates/web/src/wiki.rs's read-view
+// renderer, which assigns its own numbers the same way — just counting
+// occurrences as it walks the saved content_json, server-side.
+function collectFootnoteIds(blocks: Block<any, any, any>[], ids: string[]) {
+  for (const block of blocks) {
+    const content = block.content as unknown;
+    if (Array.isArray(content)) {
+      for (const item of content as { type?: string; props?: { noteId?: string } }[]) {
+        if (item.type === "footnoteRef" && item.props?.noteId) {
+          ids.push(item.props.noteId);
+        }
+      }
+    } else if (content && typeof content === "object" && "rows" in content) {
+      for (const row of (content as { rows: { cells: unknown[] }[] }).rows) {
+        for (const cell of row.cells as { content?: unknown }[]) {
+          if (Array.isArray(cell.content)) {
+            for (const item of cell.content as { type?: string; props?: { noteId?: string } }[]) {
+              if (item.type === "footnoteRef" && item.props?.noteId) {
+                ids.push(item.props.noteId);
+              }
+            }
+          }
+        }
+      }
+    }
+    if (block.children?.length) {
+      collectFootnoteIds(block.children, ids);
+    }
+  }
+}
+
+// Falls back to "one past the end" rather than 0 for a noteId not found yet
+// (the brief moment between insertCFootnote's editor.insertInlineContent
+// call and this component's own first render of the freshly-inserted node)
+// — a transient, too-high number beats a transient "0th footnote", neither
+// being what the saved document will actually show once this settles.
+function footnoteNumber(document: Block<any, any, any>[], noteId: string): number {
+  const ids: string[] = [];
+  collectFootnoteIds(document, ids);
+  const index = ids.indexOf(noteId);
+  return index === -1 ? ids.length + 1 : index + 1;
+}
+
+// A plain-text annotation, not rich content — content: "none" (an atomic
+// node storing its text as a prop, like a mention) rather than "styled"
+// (nested editable inline content): BlockNote's own content model would
+// let a "styled" footnote hold bold/links/etc., but there's nowhere for
+// that richness to go once it reaches wiki.rs's render_inline_item, which
+// reads this same text back out of a plain HTML attribute for both the
+// inline marker's tooltip-free click target and the generated footnotes
+// list — matching what's actually renderable server-side rather than
+// promising formatting that would silently flatten to plain text on save.
+const FootnoteRef = createReactInlineContentSpec(
+  {
+    type: "footnoteRef",
+    propSchema: {
+      // Assigned once, at insert time (see the toolbar's insertFootnote
+      // below) — this component's own identity for footnoteNumber above,
+      // stable across reorders/edits elsewhere in the document. Never
+      // read by wiki.rs: the read view numbers footnotes purely by the
+      // order it encounters them while walking the saved content, same
+      // as this component does for its own live preview, just without
+      // needing a stable id of its own (nothing there persists across a
+      // re-render the way a mounted React node does).
+      noteId: { default: "" },
+      text: { default: "" },
+    },
+    content: "none",
+  },
+  {
+    render: (props) => <FootnoteRefView {...props} />,
+  },
+);
+
+// Narrowly typed to just what this component actually reads/calls, rather
+// than fighting ReactCustomInlineContentRenderProps's own generics down to
+// the literal "footnoteRef" config — `any` for `editor`, matching how the
+// rest of this file already routes around BlockNote's heavily-generic
+// types (see stripBlockIds above).
+function FootnoteRefView({
+  inlineContent,
+  updateInlineContent,
+  editor,
+  contentRef,
+}: {
+  inlineContent: { props: { noteId: string; text: string } };
+  updateInlineContent: (update: {
+    type: "footnoteRef";
+    props: { noteId: string; text: string };
+  }) => void;
+  editor: BlockNoteEditor<any, any, any>;
+  contentRef: (node: HTMLElement | null) => void;
+}) {
+  // Opens immediately for a just-inserted (still-empty) footnote, so
+  // inserting one and typing its text is a single motion — not for an
+  // existing one being merely clicked past/through while editing
+  // elsewhere on the page.
+  const [open, setOpen] = useState(inlineContent.props.text === "");
+  const [text, setText] = useState(inlineContent.props.text);
+  const [number, setNumber] = useState(() => footnoteNumber(editor.document, inlineContent.props.noteId));
+  // Wraps the marker *and* the popover together — not just the popover —
+  // for the same reason the toolbar's own click-away popovers (e.g.
+  // wiki-toolbar-table's tableRef) wrap their trigger button too: confirmed
+  // live that scoping this ref to the popover alone closes the popover the
+  // instant it opens, every time, on a real click (though not import a
+  // synthetic one dispatched directly via JS) — the click that opens it
+  // bubbles to this effect's own freshly-attached document listener before
+  // finishing propagation, and since that click's target (the button)
+  // wasn't "inside" a ref scoped to the popover alone, it read as an
+  // outside click closing what it had just opened.
+  const containerRef = useRef<HTMLElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => setText(inlineContent.props.text), [inlineContent.props.text]);
+
+  useEffect(() => {
+    const recompute = () => setNumber(footnoteNumber(editor.document, inlineContent.props.noteId));
+    recompute();
+    return editor.onChange(recompute);
+  }, [editor, inlineContent.props.noteId]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (ev: MouseEvent) => {
+      if (!containerRef.current?.contains(ev.target as Node)) setOpen(false);
+    };
+    // Both the focus call and the listener registration below are
+    // deferred to the next macrotask, not run inline on mount/open.
+    // Confirmed live, two separate symptoms, one cause: run synchronously,
+    // textareaRef.current.focus() lost a race against BlockNote's own
+    // post-transaction editor.focus() (every insertFootnote-style
+    // transaction refocuses the ProseMirror view right after running,
+    // stealing it back from a plain `autoFocus` or an inline .focus()
+    // call), and the mousedown listener lost a race against the very
+    // click that caused `open` to become true in the first place — still
+    // bubbling at the moment a synchronously-attached listener would have
+    // fired (containerRef above only exempts a click on this footnote's
+    // own marker from that; it does nothing for insertFootnote's
+    // auto-open, whose triggering click is the *toolbar's* button,
+    // legitimately outside this footnote's own container). Both finish
+    // before this timer's callback runs, so deferring past them — rather
+    // than trying to win by running earlier — is what actually works.
+    const timer = setTimeout(() => {
+      textareaRef.current?.focus();
+      document.addEventListener("mousedown", onPointerDown);
+    }, 0);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener("mousedown", onPointerDown);
+    };
+  }, [open]);
+
+  const commit = () => {
+    if (text !== inlineContent.props.text) {
+      updateInlineContent({
+        type: "footnoteRef",
+        props: { ...inlineContent.props, text },
+      });
+    }
+  };
+
+  return (
+    <sup
+      className="wiki-footnote-ref"
+      ref={(el) => {
+        contentRef(el);
+        containerRef.current = el;
+      }}
+    >
+      <button
+        type="button"
+        className="wiki-footnote-marker"
+        title={text || "Empty footnote"}
+        onMouseDown={(ev) => {
+          ev.preventDefault();
+          setOpen((o) => !o);
+        }}
+      >
+        {number}
+      </button>
+      {open && (
+        <span className="wiki-footnote-popover">
+          <textarea
+            ref={textareaRef}
+            placeholder="Footnote text"
+            value={text}
+            onChange={(ev) => setText(ev.target.value)}
+            onBlur={commit}
+            onKeyDown={(ev) => {
+              if (ev.key === "Escape") {
+                setText(inlineContent.props.text);
+                setOpen(false);
+              } else if (ev.key === "Enter" && !ev.shiftKey) {
+                ev.preventDefault();
+                commit();
+                setOpen(false);
+              }
+            }}
+          />
+        </span>
+      )}
+    </sup>
+  );
+}
+
 // The default schema (every block/style/inline-content type `BlockNoteSchema.create()`
 // ships with no arguments — confirmed in its own source) plus `column`/
-// `columnList` (side-by-side layout, from `@blocknote/xl-multi-column`) and
-// `tableOfContents` above. Module-level and singular: every editor instance
-// this island ever mounts shares the same schema, same as before this had
-// a name at all.
+// `columnList` (side-by-side layout, from `@blocknote/xl-multi-column`),
+// `tableOfContents` above, and `footnoteRef` above. Module-level and
+// singular: every editor instance this island ever mounts shares the same
+// schema, same as before this had a name at all.
 const wikiSchema = withMultiColumn(
   BlockNoteSchema.create({
     blockSpecs: {
       ...defaultBlockSpecs,
       tableOfContents: TableOfContentsBlock,
+    },
+    inlineContentSpecs: {
+      ...defaultInlineContentSpecs,
+      footnoteRef: FootnoteRef,
     },
   }),
 );
@@ -258,6 +472,29 @@ function IconTable() {
   );
 }
 
+function IconMergeCells() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="16" rx="1.5" />
+      <line x1="12" y1="4" x2="12" y2="9" />
+      <line x1="12" y1="15" x2="12" y2="20" />
+      <polyline points="9,10 12,13 15,10" />
+      <polyline points="9,14 12,11 15,14" />
+    </svg>
+  );
+}
+
+function IconSplitCells() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="16" rx="1.5" />
+      <line x1="12" y1="4" x2="12" y2="20" />
+      <polyline points="9,9 6,12 9,15" />
+      <polyline points="15,9 18,12 15,15" />
+    </svg>
+  );
+}
+
 function IconPlus() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -398,6 +635,16 @@ function IconTableOfContents() {
       <line x1="4" y1="6" x2="20" y2="6" />
       <line x1="4" y1="12" x2="15" y2="12" />
       <line x1="4" y1="18" x2="17" y2="18" />
+    </svg>
+  );
+}
+
+function IconFootnote() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="4" y1="7" x2="16" y2="7" />
+      <line x1="4" y1="13" x2="12" y2="13" />
+      <path d="M17 15 L21 19 M21 15 L17 19" />
     </svg>
   );
 }
@@ -671,12 +918,51 @@ function Toolbar({ editor }: { editor: WikiBlockNoteEditor }) {
   // as hasColumnSelection rather than a second one: both only need to
   // recompute when the cursor/selection actually moves.
   const [enclosingColumnList, setEnclosingColumnList] = useState<any | null>(null);
+  // Mirrors what BlockNote's own (unused here — see formattingToolbar={false}
+  // below) TableCellMergeButton/SplitButton compute internally, just read
+  // directly off the editor instead of through their context-bound hooks,
+  // since this toolbar is a sibling of <BlockNoteView>, not a child of it,
+  // and so sits outside BlockNoteContext. getCellSelection() resolves a cell
+  // from a plain cursor position, not just a real multi-cell drag-selection
+  // (confirmed in its own source), so "canSplit" reflects whichever single
+  // cell the cursor is currently in, and "mergeDirection" stays undefined
+  // until that selection actually spans more than one cell.
+  const [tableCellAction, setTableCellAction] = useState<{
+    mergeDirection: "horizontal" | "vertical" | undefined;
+    canSplit: boolean;
+  } | null>(null);
+  // Drives the pressed look on MARK_BUTTONS below — confirmed live this
+  // toolbar had no active-state feedback at all for Bold/Italic/etc.,
+  // unlike the block-type <select> (which already reflects the current
+  // block) or BlockNote's own default formatting toolbar (unused here,
+  // see formattingToolbar={false} below, but it does this too). Keyed by
+  // BlockNote's own style name ("bold", "italic", ...), same names
+  // MARK_BUTTONS already uses — getActiveStyles() reads the cursor's
+  // stored marks when the selection is collapsed (so toggling Bold with
+  // nothing selected still shows pressed immediately, before any text
+  // exists to carry the mark) and the selection's own marks otherwise.
+  const [activeStyles, setActiveStyles] = useState<Record<string, boolean | string>>({});
   useEffect(
     () =>
       editor.onSelectionChange(() => {
         setHasColumnSelection((editor.getSelection()?.blocks.length ?? 0) >= 1);
         const { block } = editor.getTextCursorPosition();
         setEnclosingColumnList(findEnclosingColumnList(editor.document, block.id) ?? null);
+        setActiveStyles(editor.getActiveStyles());
+
+        const selectedBlocks = editor.getSelection()?.blocks ?? [block];
+        const tableHandles = editor.getExtension(TableHandlesExtension);
+        if (selectedBlocks.length !== 1 || selectedBlocks[0].type !== "table" || !tableHandles) {
+          setTableCellAction(null);
+          return;
+        }
+        const tableBlock = selectedBlocks[0] as Parameters<typeof tableHandles.getMergeDirection>[0];
+        const cellSelection = tableHandles.getCellSelection();
+        const cell = cellSelection && tableBlock?.content.rows[cellSelection.from.row]?.cells[cellSelection.from.col];
+        setTableCellAction({
+          mergeDirection: tableHandles.getMergeDirection(tableBlock),
+          canSplit: Boolean(cell && isTableCell(cell) && (getRowspan(cell) > 1 || getColspan(cell) > 1)),
+        });
       }),
     [editor],
   );
@@ -906,6 +1192,15 @@ function Toolbar({ editor }: { editor: WikiBlockNoteEditor }) {
     editor.insertBlocks([{ type: "tableOfContents" }], block, "after");
   };
 
+  // Starts empty — FootnoteRefView opens its own popover immediately for an
+  // empty footnote (see its own `open` initial state), so this is "insert,
+  // then type," one motion, not insert-then-separately-click-to-open.
+  const insertFootnote = () => {
+    editor.insertInlineContent([
+      { type: "footnoteRef", props: { noteId: crypto.randomUUID(), text: "" } },
+    ]);
+  };
+
   // Image/Video/Audio/File/Emoji — the handful of "/" menu items that
   // aren't simple block-type swaps (those live in the <select> above) or
   // already have their own toolbar button (Table). Reuses BlockNote's own
@@ -966,6 +1261,17 @@ function Toolbar({ editor }: { editor: WikiBlockNoteEditor }) {
               <IconTableOfContents />
               Table of contents
             </button>
+            <button
+              type="button"
+              onMouseDown={(ev) => {
+                ev.preventDefault();
+                insertFootnote();
+                setInsertOpen(false);
+              }}
+            >
+              <IconFootnote />
+              Footnote
+            </button>
           </span>
         )}
       </span>
@@ -1008,7 +1314,8 @@ function Toolbar({ editor }: { editor: WikiBlockNoteEditor }) {
           key={style}
           type="button"
           title={title}
-          className="wiki-toolbar-btn"
+          className={activeStyles[style] ? "wiki-toolbar-btn active" : "wiki-toolbar-btn"}
+          aria-pressed={Boolean(activeStyles[style])}
           onMouseDown={(ev) => {
             ev.preventDefault();
             editor.toggleStyles({ [style]: true });
@@ -1310,6 +1617,38 @@ function Toolbar({ editor }: { editor: WikiBlockNoteEditor }) {
           </span>
         )}
       </span>
+      <button
+        type="button"
+        title={
+          tableCellAction?.mergeDirection
+            ? `Merge cells (${tableCellAction.mergeDirection})`
+            : "Merge cells — select more than one cell first"
+        }
+        className="wiki-toolbar-btn"
+        disabled={!tableCellAction?.mergeDirection}
+        onMouseDown={(ev) => {
+          ev.preventDefault();
+          editor.getExtension(TableHandlesExtension)?.mergeCells();
+        }}
+      >
+        <IconMergeCells />
+      </button>
+      <button
+        type="button"
+        title={
+          tableCellAction?.canSplit
+            ? "Split cell"
+            : "Split cell — place the cursor in a merged cell first"
+        }
+        className="wiki-toolbar-btn"
+        disabled={!tableCellAction?.canSplit}
+        onMouseDown={(ev) => {
+          ev.preventDefault();
+          editor.getExtension(TableHandlesExtension)?.splitCell();
+        }}
+      >
+        <IconSplitCells />
+      </button>
     </div>
   );
 }
@@ -1409,6 +1748,14 @@ function WikiEditorApp({
   const editor = useCreateBlockNote({
     schema: wikiSchema,
     initialContent,
+    // Only splitCells — not headers/cellBackgroundColor/cellTextColor,
+    // BlockNote's other opt-in table features: this app only asked for
+    // merge/split parity with Confluence/Google Docs, not those. Split
+    // itself is already reachable from each cell's own hover handle (see
+    // TableHandles, on by default); this flag is what turns that on and
+    // what the Toolbar's Merge/Split buttons below check via
+    // editor.settings.tables.splitCells.
+    tables: { splitCells: true },
   });
 
   const handleReadyRef = useRef(onReady);

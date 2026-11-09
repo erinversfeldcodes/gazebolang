@@ -33,6 +33,18 @@ pub fn WikiEditor(
     /// `parseInitialContent`).
     initial_document_json: String,
     read_only: bool,
+    /// Called once, right as this editor unmounts, with its final
+    /// (content_json, content_markdown) — only when `!read_only`. Every
+    /// path that tears this editor down without going through `WikiPage`'s
+    /// own explicit "Done" save (right now: navigating to a different page
+    /// mid-edit, which never calls Done at all) needs this to avoid
+    /// silently dropping whatever was typed since the last autosave tick;
+    /// `WikiPage`'s callback is the one that actually decides whether
+    /// there's anything worth saving (comparing against its own
+    /// last-saved baseline) and whether to leave edit mode — this
+    /// component has no opinion on either, it just reports what it had.
+    #[prop(optional, into)]
+    on_unmount_snapshot: Option<Callback<(String, String)>>,
 ) -> impl IntoView {
     let mount_id = wiki_editor_mount_id(page_id);
 
@@ -53,9 +65,23 @@ pub fn WikiEditor(
         let mount_id = mount_id.clone();
         on_cleanup(move || {
             #[cfg(feature = "hydrate")]
-            browser::unmount(&mount_id);
+            {
+                match (read_only, on_unmount_snapshot) {
+                    (false, Some(cb)) => {
+                        browser::unmount_with_snapshot(
+                            &mount_id,
+                            move |content_json, content_markdown| {
+                                cb.run((content_json, content_markdown));
+                            },
+                        );
+                    }
+                    _ => browser::unmount(&mount_id),
+                }
+            }
             #[cfg(not(feature = "hydrate"))]
-            let _ = &mount_id;
+            {
+                let _ = (&mount_id, read_only, &on_unmount_snapshot);
+            }
         });
     }
 
@@ -170,6 +196,43 @@ mod browser {
         }
     }
 
+    /// Unmounts like `unmount` above, but first captures this editor's
+    /// final document and hands it to `on_snapshot`, resolved to plain
+    /// strings — the one piece `WikiPage` needs to flush a pending edit on
+    /// paths that don't go through its own explicit "Done" save (right
+    /// now: navigating to a different page while editing).
+    ///
+    /// The capture itself — both `get_wiki_editor_document` and the
+    /// `get_wiki_editor_markdown` call that *starts* its Promise — happens
+    /// synchronously, strictly before `unmount` below deletes this
+    /// element's entry in `window.__wikiEditors`. Doing this from a task
+    /// spawned by some *other* effect reacting to the same navigation
+    /// (tried first) doesn't work: `wasm_bindgen_futures::spawn_local`
+    /// only polls its future on the next microtask, by which point this
+    /// same synchronous `on_cleanup` — the one that deletes the handle —
+    /// has already finished. Only *awaiting* the already-started markdown
+    /// Promise is deferred to that later microtask, which is fine: once
+    /// obtained, a Promise is a value in its own right, independent of
+    /// whether the JS object it came from still exists.
+    pub(super) fn unmount_with_snapshot(
+        element_id: &str,
+        on_snapshot: impl FnOnce(String, String) + 'static,
+    ) {
+        let snapshot = get_wiki_editor_document(element_id)
+            .ok()
+            .zip(get_wiki_editor_markdown(element_id).ok());
+        unmount(element_id);
+        if let Some((content_json, markdown_promise)) = snapshot {
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(value) = JsFuture::from(markdown_promise).await
+                    && let Some(content_markdown) = value.as_string()
+                {
+                    on_snapshot(content_json, content_markdown);
+                }
+            });
+        }
+    }
+
     /// Current document, serialized as JSON — what `save_page_revision`
     /// stores as `content_json`.
     ///
@@ -196,8 +259,15 @@ mod browser {
             .ok_or_else(|| "markdown export wasn't a string".to_string())
     }
 
+    /// 30s, not the 5s `wait_for_mount_element` below gets away with: unlike
+    /// that one (which just waits on DOM Leptos already rendered), this
+    /// waits on a ~1.6MB network fetch of `wiki-editor.js` — on a cold Fly
+    /// machine (`min_machines_running = 0` in `fly.toml`), the whole app is
+    /// still warming up and 5s wasn't always enough, stranding the editor
+    /// mount point blank with nothing in the console but this function's
+    /// own timeout error.
     async fn wait_for_editor_script() -> bool {
-        for _ in 0..100 {
+        for _ in 0..600 {
             if has_global("mountWikiEditor") {
                 return true;
             }

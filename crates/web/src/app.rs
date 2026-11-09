@@ -24,7 +24,7 @@ use crate::trainer_sound_spelling::SoundSpellingTrainerPage;
 use crate::trainer_spelling::SpellingTestPage;
 use crate::wiki::{
     AddPageToCard, CreatePage, DeletePage, MovePage, PageRevisionSummary, PageTreeNode,
-    RemovePageFromCard, RenamePage, RestoreRevision, RevisionDiff, SavePageRevision,
+    RemovePageFromCard, RenamePage, ReorderPage, RestoreRevision, RevisionDiff, SavePageRevision,
     cards_for_page, get_page, get_revision_diff, list_page_revisions, list_page_tree, search_pages,
 };
 // Only called from the Done handler's #[cfg(feature = "hydrate")] branch
@@ -1938,17 +1938,57 @@ fn DecksPage() -> impl IntoView {
 /// shared signal is simpler than threading per-node state through the
 /// recursion.
 #[allow(clippy::needless_pass_by_value)]
+/// Where a page being dragged in the sidebar tree would land if dropped
+/// right now — `Before` a specific sibling, or `EndOf` a parent's children
+/// (the synthetic drop zone after the last sibling, since "before row K"
+/// alone can't express "after the last one"). Together these two cover
+/// every possible insertion point among a set of siblings without needing
+/// to split each row into a top/bottom half (which would need
+/// `getBoundingClientRect()`, a `web_sys` call this file otherwise avoids
+/// outside the one `#[cfg(feature = "hydrate")]`-gated spot it already
+/// has, in `wiki_page_actions_menu` below.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DragTarget {
+    Before(Uuid),
+    EndOf(Option<Uuid>),
+}
+
+/// `wiki_tree_level`'s own drag-in-progress state — grouped the same way
+/// `WikiPageActions` above groups `wiki_page_actions_menu`'s params, to
+/// keep this (and the function's other params) under clippy's
+/// `too_many_arguments`.
+#[derive(Clone, Copy)]
+struct TreeDragState {
+    dragging_page: RwSignal<Option<Uuid>>,
+    drag_over: RwSignal<Option<DragTarget>>,
+}
+
+// A dense, cohesive recursive view-builder — splitting it further would
+// scatter state that's only meaningful read together (see TreeDragState's
+// own doc comment on why that state is already grouped as far as it
+// usefully can be).
+#[allow(clippy::too_many_lines)]
 fn wiki_tree_level(
-    pages: std::sync::Arc<Vec<crate::wiki::PageTreeNode>>,
+    pages: &std::sync::Arc<Vec<crate::wiki::PageTreeNode>>,
     parent_id: Option<Uuid>,
     signed_in: bool,
     create: ServerAction<CreatePage>,
+    reorder: ServerAction<ReorderPage>,
     adding_child_to: RwSignal<Option<Uuid>>,
+    drag: TreeDragState,
 ) -> AnyView {
     let children: Vec<_> = pages.iter().filter(|p| p.parent_id == parent_id).collect();
     if children.is_empty() {
         return ().into_any();
     }
+    // Scopes drag-and-drop to siblings only (same parent_id) — every row
+    // built below shares that same parent, so this one list gates all of
+    // them. Reparenting via drag isn't handled here; the "Move" picker
+    // elsewhere still owns that.
+    let sibling_ids: Vec<Uuid> = children.iter().map(|p| p.id).collect();
+    let last_sibling_id = *sibling_ids
+        .last()
+        .expect("children is non-empty, checked above");
     let rows: Vec<_> = children
         .into_iter()
         .map(|page| {
@@ -1956,11 +1996,13 @@ fn wiki_tree_level(
             let href = format!("/wiki/{}/{}", page.id, page.slug);
             let title = page.title.clone();
             let sub = wiki_tree_level(
-                pages.clone(),
+                pages,
                 Some(page_id),
                 signed_in,
                 create,
+                reorder,
                 adding_child_to,
+                drag,
             );
             (page_id, href, title, sub)
         })
@@ -1971,11 +2013,53 @@ fn wiki_tree_level(
                 .into_iter()
                 .map(|(page_id, href, title, sub)| {
                     let new_child_title = RwSignal::new(String::new());
+                    let siblings_for_dragover = sibling_ids.clone();
+                    let siblings_for_drop = sibling_ids.clone();
                     view! {
                         <li>
                             <details open>
-                                <summary>
-                                    <A href=href>{title}</A>
+                                <summary
+                                    draggable=signed_in.then_some("true")
+                                    class:wiki-tree-dragging=move || {
+                                        signed_in && drag.dragging_page.get() == Some(page_id)
+                                    }
+                                    class:wiki-tree-drag-over=move || {
+                                        signed_in
+                                            && drag.drag_over.get() == Some(DragTarget::Before(page_id))
+                                    }
+                                    on:dragstart=move |_| drag.dragging_page.set(Some(page_id))
+                                    on:dragend=move |_| {
+                                        drag.dragging_page.set(None);
+                                        drag.drag_over.set(None);
+                                    }
+                                    on:dragover=move |ev| {
+                                        let valid = drag.dragging_page.get().is_some_and(|dragged| {
+                                            dragged != page_id
+                                                && siblings_for_dragover.contains(&dragged)
+                                        });
+                                        if valid {
+                                            ev.prevent_default();
+                                            drag.drag_over.set(Some(DragTarget::Before(page_id)));
+                                        }
+                                    }
+                                    on:drop=move |ev| {
+                                        ev.prevent_default();
+                                        if let Some(dragged) = drag.dragging_page.get()
+                                            && dragged != page_id
+                                            && siblings_for_drop.contains(&dragged)
+                                        {
+                                            reorder
+                                                .dispatch(ReorderPage {
+                                                    page_id: dragged,
+                                                    relative_to: page_id,
+                                                    insert_after: false,
+                                                });
+                                        }
+                                        drag.dragging_page.set(None);
+                                        drag.drag_over.set(None);
+                                    }
+                                >
+                                    <A attr:draggable="false" href=href>{title}</A>
                                     {signed_in.then(|| view! {
                                         // prevent_default so this click adds a
                                         // child instead of toggling the
@@ -1986,6 +2070,7 @@ fn wiki_tree_level(
                                             type="button"
                                             class="wiki-tree-add"
                                             title="Add a child page here"
+                                            draggable="false"
                                             on:click=move |ev| {
                                                 ev.prevent_default();
                                                 adding_child_to.update(|cur| {
@@ -2038,6 +2123,56 @@ fn wiki_tree_level(
                     }
                 })
                 .collect_view()}
+            {signed_in
+                .then(|| {
+                    let siblings = sibling_ids.clone();
+                    let siblings_for_dragover = sibling_ids.clone();
+                    let siblings_for_drop = sibling_ids.clone();
+                    view! {
+                        // "Before row K" alone can't express "after the very
+                        // last sibling" — this is that missing drop target.
+                        // Zero-height and invisible to the drop-detection
+                        // logic unless a sibling of this exact list is
+                        // actively being dragged, so it doesn't clutter the
+                        // tree or intercept drops the rest of the time.
+                        <li
+                            class="wiki-tree-drop-end"
+                            class:wiki-tree-drag-over=move || {
+                                drag.drag_over.get() == Some(DragTarget::EndOf(parent_id))
+                            }
+                            style:display=move || {
+                                let active = drag
+                                    .dragging_page
+                                    .get()
+                                    .is_some_and(|dragged| siblings.contains(&dragged));
+                                if active { "block" } else { "none" }
+                            }
+                            on:dragover=move |ev| {
+                                if drag.dragging_page.get().is_some_and(|dragged| siblings_for_dragover.contains(&dragged))
+                                {
+                                    ev.prevent_default();
+                                    drag.drag_over.set(Some(DragTarget::EndOf(parent_id)));
+                                }
+                            }
+                            on:drop=move |ev| {
+                                ev.prevent_default();
+                                if let Some(dragged) = drag.dragging_page.get()
+                                    && dragged != last_sibling_id
+                                    && siblings_for_drop.contains(&dragged)
+                                {
+                                    reorder
+                                        .dispatch(ReorderPage {
+                                            page_id: dragged,
+                                            relative_to: last_sibling_id,
+                                            insert_after: true,
+                                        });
+                                }
+                                drag.dragging_page.set(None);
+                                drag.drag_over.set(None);
+                            }
+                        ></li>
+                    }
+                })}
         </ul>
     }
     .into_any()
@@ -2057,9 +2192,10 @@ fn wiki_tree_level(
 /// `recursion_limit` alone wasn't enough to stop `cargo leptos build
 /// --release` overflowing rustc's query-depth limit.
 fn wiki_sidebar(
-    pages: std::sync::Arc<Vec<PageTreeNode>>,
+    pages: &std::sync::Arc<Vec<PageTreeNode>>,
     signed_in: bool,
     create: ServerAction<CreatePage>,
+    reorder: ServerAction<ReorderPage>,
     new_title: RwSignal<String>,
 ) -> AnyView {
     let create_form = signed_in.then(|| {
@@ -2087,10 +2223,22 @@ fn wiki_sidebar(
         }
     });
     let adding_child_to = RwSignal::new(None::<Uuid>);
+    let drag = TreeDragState {
+        dragging_page: RwSignal::new(None::<Uuid>),
+        drag_over: RwSignal::new(None::<DragTarget>),
+    };
     let tree_view = if pages.is_empty() {
         view! { <p class="wiki-sidebar-empty">"No pages yet."</p> }.into_any()
     } else {
-        wiki_tree_level(pages, None, signed_in, create, adding_child_to)
+        wiki_tree_level(
+            pages,
+            None,
+            signed_in,
+            create,
+            reorder,
+            adding_child_to,
+            drag,
+        )
     };
 
     // Full-text search over `search_pages` (Postgres tsvector, already built
@@ -2531,8 +2679,12 @@ fn wiki_history_panel(
 fn WikiListPage() -> impl IntoView {
     let auth = Resource::new(|| (), |()| current_user_name());
     let create = ServerAction::<CreatePage>::new();
+    let reorder = ServerAction::<ReorderPage>::new();
     let new_title = RwSignal::new(String::new());
-    let tree = Resource::new(move || create.version().get(), |_| list_page_tree());
+    let tree = Resource::new(
+        move || (create.version().get(), reorder.version().get()),
+        |_| list_page_tree(),
+    );
 
     // Creating a page and then leaving the writer to go find it themselves
     // in the tree was the whole "terrible UX" complaint — jump straight
@@ -2558,8 +2710,13 @@ fn WikiListPage() -> impl IntoView {
                 match tree.await {
                     Err(e) => view! { <p>"Error: " {e.to_string()}</p> }.into_any(),
                     Ok(pages) => {
-                        let sidebar =
-                            wiki_sidebar(std::sync::Arc::new(pages), signed_in, create, new_title);
+                        let sidebar = wiki_sidebar(
+                            &std::sync::Arc::new(pages),
+                            signed_in,
+                            create,
+                            reorder,
+                            new_title,
+                        );
                         view! {
                             <div class="wiki-shell">
                                 {sidebar}
@@ -2595,6 +2752,7 @@ fn WikiPage() -> impl IntoView {
     let delete = ServerAction::<DeletePage>::new();
     let restore = ServerAction::<RestoreRevision>::new();
     let move_page = ServerAction::<MovePage>::new();
+    let reorder = ServerAction::<ReorderPage>::new();
 
     // Same as WikiListPage: jump straight into a newly created page (root
     // or child, via either "New page" form or the tree's inline "+")
@@ -2619,6 +2777,14 @@ fn WikiPage() -> impl IntoView {
     // live feedback against real Confluence screenshots; see the "Edit"/
     // "Done" button below.
     let editing = RwSignal::new(false);
+    // Set true for exactly one unmount by the "Discard" handler below, so
+    // <WikiEditor>'s on_unmount_snapshot (see its own call site) knows to
+    // skip its usual flush-save for this one exit — otherwise discarding
+    // would just get silently overwritten by the very save it was trying
+    // to avoid. Reset back to false by that same callback once read, not
+    // left armed for the next, unrelated edit session on whatever page
+    // comes next.
+    let discard_requested = RwSignal::new(false);
     // Bumped exactly once, by the "Done" handler below, when leaving edit
     // mode — the one explicit signal that forces `page` to refetch (see its
     // own comment: it deliberately ignores save.version(), since refetching
@@ -2652,6 +2818,7 @@ fn WikiPage() -> impl IntoView {
                 rename.version().get(),
                 delete.version().get(),
                 move_page.version().get(),
+                reorder.version().get(),
             )
         },
         |_| list_page_tree(),
@@ -2822,7 +2989,7 @@ fn WikiPage() -> impl IntoView {
                 let pages = tree.await.unwrap_or_default();
                 let pages = std::sync::Arc::new(pages);
                 let sidebar =
-                    wiki_sidebar(pages.clone(), signed_in, create, new_root_title);
+                    wiki_sidebar(&pages, signed_in, create, reorder, new_root_title);
 
                 let body = match page.await {
                     Err(e) => view! { <p>"Error: " {e.to_string()}</p> }.into_any(),
@@ -2912,6 +3079,25 @@ fn WikiPage() -> impl IntoView {
                         let edit_toggle = signed_in.then(|| {
                             if is_editing {
                                 view! {
+                                    // No "are you sure" step, unlike delete (delete_armed)
+                                    // below — the worst a discard can lose is whatever was
+                                    // typed since the last autosave tick (at most 6s, see the
+                                    // autosave loop above), and the page's full revision
+                                    // history already covers wanting an older version back.
+                                    // <WikiEditor>'s on_unmount_snapshot is what actually
+                                    // skips the flush-save for this exit (see
+                                    // discard_requested's own comment) — this handler's only
+                                    // job is to arm that flag before leaving edit mode.
+                                    <button
+                                        type="button"
+                                        class="wiki-edit-discard"
+                                        on:click=move |_| {
+                                            discard_requested.set(true);
+                                            editing.set(false);
+                                        }
+                                    >
+                                        "Discard"
+                                    </button>
                                     <button
                                         type="button"
                                         class="wiki-edit-toggle"
@@ -3020,6 +3206,57 @@ fn WikiPage() -> impl IntoView {
                                             page_id=id
                                             initial_document_json=content_json.clone()
                                             read_only=false
+                                            // Covers every way this editor can unmount without
+                                            // going through the explicit "Done" button above —
+                                            // right now, specifically, navigating to a different
+                                            // wiki page mid-edit: `editing` is one signal shared
+                                            // across every /wiki/:id route (this whole component
+                                            // is reused across them, not remounted per page), so
+                                            // without resetting it here too, the next page you
+                                            // land on rendered straight into edit mode instead of
+                                            // its read view — reported live as "one continuous
+                                            // editing session" across unrelated pages. The dirty-
+                                            // check mirrors "Done"'s own (content_json against
+                                            // last_saved_content_json); id/title_signal are safe
+                                            // to read here (not stale) because WikiEditor's own
+                                            // on_cleanup captures its snapshot synchronously,
+                                            // before `page_id`/`title_signal` have had any chance
+                                            // to move on to a different page — see its own
+                                            // comment for why that ordering matters.
+                                            on_unmount_snapshot=move |content_json: String, content_markdown: String| {
+                                                // discard_requested, not a plain bool check —
+                                                // this callback is the one place that would
+                                                // otherwise silently re-save a discarded edit
+                                                // out from under the "Discard" button above
+                                                // (its own click handler can't just skip its own
+                                                // save: it never had one, the save only ever
+                                                // happens here, on unmount — see this prop's own
+                                                // doc comment).
+                                                let discarding = discard_requested.get_untracked();
+                                                if discarding {
+                                                    discard_requested.set(false);
+                                                }
+                                                #[cfg(feature = "hydrate")]
+                                                {
+                                                    if !discarding && content_json != last_saved_content_json.get_untracked() {
+                                                        let title = title_signal.get_untracked();
+                                                        wasm_bindgen_futures::spawn_local(async move {
+                                                            let _ = save_page_revision(
+                                                                id,
+                                                                title,
+                                                                content_json,
+                                                                content_markdown,
+                                                            )
+                                                            .await;
+                                                        });
+                                                    }
+                                                }
+                                                #[cfg(not(feature = "hydrate"))]
+                                                {
+                                                    let _ = (&content_json, &content_markdown, discarding);
+                                                }
+                                                editing.set(false);
+                                            }
                                         />
                                     }
                                         .into_any()

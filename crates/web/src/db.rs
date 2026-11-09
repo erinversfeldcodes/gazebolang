@@ -1179,18 +1179,53 @@ pub async fn rename_page(
     Ok(())
 }
 
-pub async fn move_page(
+/// Reorders a page among its own current siblings (`parent_id` untouched) —
+/// `relative_to` names another sibling to land next to, rather than a raw
+/// numeric index, so there's no off-by-one to work out when the page being
+/// moved is pulled out of a list it also appears later (or earlier) in:
+/// the sibling order is re-fetched fresh, `page_id` removed from it, then
+/// reinserted next to `relative_to` wherever that now sits — correct
+/// regardless of which direction the drag went. Every sibling gets
+/// renumbered 0..N to match, same as `create_page`/`move_page_to_end`'s
+/// own position bookkeeping, rather than attempting fractional positions —
+/// this is a rare, single-user-at-a-time action, not a hot path.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // sibling counts are nowhere near i32::MAX
+pub async fn reorder_page(
     pool: &PgPool,
     page_id: Uuid,
-    new_parent_id: Option<Uuid>,
-    new_position: i32,
+    relative_to: Uuid,
+    insert_after: bool,
 ) -> sqlx::Result<()> {
-    sqlx::query("UPDATE pages SET parent_id = $1, position = $2 WHERE id = $3")
-        .bind(new_parent_id)
-        .bind(new_position)
+    let mut tx = pool.begin().await?;
+    let parent_id: Option<Uuid> = sqlx::query_scalar("SELECT parent_id FROM pages WHERE id = $1")
         .bind(page_id)
-        .execute(pool)
+        .fetch_one(&mut *tx)
         .await?;
+    let mut sibling_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM pages WHERE parent_id IS NOT DISTINCT FROM $1 ORDER BY position",
+    )
+    .bind(parent_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    sibling_ids.retain(|&id| id != page_id);
+    let target_index = sibling_ids
+        .iter()
+        .position(|&id| id == relative_to)
+        .unwrap_or(sibling_ids.len());
+    let insert_at = if insert_after {
+        target_index + 1
+    } else {
+        target_index
+    };
+    sibling_ids.insert(insert_at.min(sibling_ids.len()), page_id);
+    for (position, id) in sibling_ids.iter().enumerate() {
+        sqlx::query("UPDATE pages SET position = $1 WHERE id = $2")
+            .bind(position as i32)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
