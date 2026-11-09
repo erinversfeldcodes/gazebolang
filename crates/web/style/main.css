@@ -1082,9 +1082,11 @@ main:has(> .wiki-shell) {
 }
 
 /* A leading, rotating chevron — Confluence's own tree disclosure, not a
-   trailing marker. Every page gets one (even childless ones, where
-   toggling it does nothing) rather than conditionally showing it, which
-   would need knowing ahead of render whether children exist. */
+   trailing marker. app.rs's wiki_tree_level always wraps every row in
+   <details open>, childless or not (recursing into child pages, if any,
+   is what fills the <ul> below the <summary>) — rather than branching in
+   Rust on whether children exist, :has() does the same check here, since
+   a childless page's <details> has nothing past its own <summary>. */
 .wiki-tree summary::before {
     content: "";
     width: 0;
@@ -1096,8 +1098,45 @@ main:has(> .wiki-shell) {
     transition: transform 0.1s ease;
 }
 
+.wiki-tree details:not(:has(> ul)) > summary::before {
+    visibility: hidden;
+}
+
 .wiki-tree details[open] > summary::before {
     transform: rotate(90deg);
+}
+
+/* Drag-to-reorder among siblings (app.rs's wiki_tree_level/DragTarget) — a
+   summary is only draggable when signed in, so this never shows a grab
+   cursor to a read-only visitor. */
+.wiki-tree summary[draggable="true"] {
+    cursor: grab;
+}
+
+.wiki-tree summary.wiki-tree-dragging {
+    opacity: 0.4;
+}
+
+/* The row a drag is currently over, showing "drop here to land right
+   above this page" — a top rule rather than re-tinting the whole row
+   (already used by :hover and the current-page highlight) keeps drag and
+   hover/current state visually distinct when they overlap. */
+.wiki-tree summary.wiki-tree-drag-over {
+    box-shadow: inset 0 2px 0 var(--wiki-accent);
+}
+
+/* The synthetic "after the last sibling" drop target (DragTarget::EndOf)
+   — zero-height and invisible until app.rs's style:display shows it mid-
+   drag, so it never adds visible clutter to the tree the rest of the
+   time. */
+.wiki-tree-drop-end {
+    display: none;
+    height: 0.5rem;
+    margin: -0.25rem 0;
+}
+
+.wiki-tree-drop-end.wiki-tree-drag-over {
+    box-shadow: inset 0 2px 0 var(--wiki-accent);
 }
 
 .wiki-tree a {
@@ -1672,6 +1711,36 @@ main:has(> .wiki-shell) {
     text-decoration: underline;
 }
 
+/* The global button/input[type="submit"] rule near the top of this file is
+   a bare element selector, so it applies no matter where in the DOM a
+   <button> lives — including BlockNote's own buttons, which this app never
+   styled on purpose. Most of the time that's invisible (BlockNote's own
+   class-based styles are more specific and win on every property they set),
+   but confirmed live it broke the table row/column handle's dropdown menu:
+   Mantine's own menu-item text color (dark grey, meant for its own white
+   dropdown background) survived, while this app's dark-wood gradient
+   background won instead, since Mantine doesn't set a background on each
+   item individually — illegible dark-on-dark. .bn-container is BlockNote's
+   own top-level wrapper class (confirmed via its own source), so this stays
+   scoped to BlockNote's rendered tree, including portaled menus like this
+   one, which are DOM descendants of it despite rendering elsewhere on
+   screen. It does NOT reach this app's own Toolbar component (editor/src/
+   main.tsx), which is a sibling of <BlockNoteView>, not a child of it.
+   `all: revert` rolls back only what the bare `button` selector set, so
+   BlockNote's own class-based styles (strictly higher specificity, and
+   unaffected by reverting a *different* selector's declarations) still
+   apply normally afterward — this doesn't disable BlockNote's styling, it
+   just stops this app's unrelated rule from fighting it. Buttons the
+   editor's own content renders with a specific purpose-built class, like
+   .wiki-footnote-marker above, are unaffected either way: they already
+   fully override every property this touches via their own higher-
+   specificity selectors. */
+.bn-container button,
+.bn-container input[type="submit"] {
+    all: revert;
+    cursor: pointer;
+}
+
 .wiki-footnote-popover {
     position: absolute;
     left: 0;
@@ -1996,6 +2065,21 @@ main:has(> .wiki-shell) {
     color: var(--wiki-ink-muted);
     opacity: 0.35;
     cursor: default;
+}
+
+/* The one state .wiki-toolbar-btn had no feedback for at all — confirmed
+   live typing bold text with nothing on the Bold button showing it was
+   active (see editor/src/main.tsx's activeStyles, which this reflects:
+   bold/italic/underline/strike/code at the cursor, not any toggled-on
+   block-level control elsewhere in this toolbar). */
+.wiki-toolbar-btn.active {
+    background: var(--wiki-accent-bg);
+    color: var(--wiki-accent);
+}
+
+.wiki-toolbar-btn.active:hover {
+    background: var(--wiki-accent-bg);
+    color: var(--wiki-accent-hover);
 }
 
 .wiki-toolbar-btn svg {

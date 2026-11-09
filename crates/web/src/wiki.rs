@@ -246,6 +246,27 @@ pub async fn move_page(page_id: Uuid, new_parent_id: Option<Uuid>) -> Result<(),
         .map_err(|e| ServerFnError::new(e.to_string()))
 }
 
+/// Drag-to-reorder among the page's own current siblings — `relative_to`
+/// is the id of another sibling it was dropped on, not a raw index: an
+/// index would need the client to account for the list shifting once the
+/// dragged page is pulled out of it, which `db::reorder_page` already
+/// does server-side by re-deriving the sibling order from the database
+/// rather than trusting a client-computed number. Reparenting (dragging
+/// onto a page with a *different* parent) isn't handled here — that's
+/// still the "Move" picker's job, same as before this existed.
+#[server]
+pub async fn reorder_page(
+    page_id: Uuid,
+    relative_to: Uuid,
+    insert_after: bool,
+) -> Result<(), ServerFnError> {
+    require_user().await?;
+    let state = expect_context::<crate::state::AppState>();
+    crate::db::reorder_page(&state.db_pool, page_id, relative_to, insert_after)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))
+}
+
 #[server]
 pub async fn delete_page(page_id: Uuid) -> Result<(), ServerFnError> {
     require_user().await?;

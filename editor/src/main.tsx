@@ -931,12 +931,24 @@ function Toolbar({ editor }: { editor: WikiBlockNoteEditor }) {
     mergeDirection: "horizontal" | "vertical" | undefined;
     canSplit: boolean;
   } | null>(null);
+  // Drives the pressed look on MARK_BUTTONS below — confirmed live this
+  // toolbar had no active-state feedback at all for Bold/Italic/etc.,
+  // unlike the block-type <select> (which already reflects the current
+  // block) or BlockNote's own default formatting toolbar (unused here,
+  // see formattingToolbar={false} below, but it does this too). Keyed by
+  // BlockNote's own style name ("bold", "italic", ...), same names
+  // MARK_BUTTONS already uses — getActiveStyles() reads the cursor's
+  // stored marks when the selection is collapsed (so toggling Bold with
+  // nothing selected still shows pressed immediately, before any text
+  // exists to carry the mark) and the selection's own marks otherwise.
+  const [activeStyles, setActiveStyles] = useState<Record<string, boolean | string>>({});
   useEffect(
     () =>
       editor.onSelectionChange(() => {
         setHasColumnSelection((editor.getSelection()?.blocks.length ?? 0) >= 1);
         const { block } = editor.getTextCursorPosition();
         setEnclosingColumnList(findEnclosingColumnList(editor.document, block.id) ?? null);
+        setActiveStyles(editor.getActiveStyles());
 
         const selectedBlocks = editor.getSelection()?.blocks ?? [block];
         const tableHandles = editor.getExtension(TableHandlesExtension);
@@ -1302,7 +1314,8 @@ function Toolbar({ editor }: { editor: WikiBlockNoteEditor }) {
           key={style}
           type="button"
           title={title}
-          className="wiki-toolbar-btn"
+          className={activeStyles[style] ? "wiki-toolbar-btn active" : "wiki-toolbar-btn"}
+          aria-pressed={Boolean(activeStyles[style])}
           onMouseDown={(ev) => {
             ev.preventDefault();
             editor.toggleStyles({ [style]: true });
