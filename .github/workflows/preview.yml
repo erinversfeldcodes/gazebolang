@@ -47,6 +47,21 @@ jobs:
       # consumer decrypts it and re-masks the plaintext locally before use
       # (see `deploy-preview` and `e2e`).
       db_host: ${{ steps.reset.outputs.host }}
+      # Used for the deployed preview app's own DATABASE_URL and the e2e
+      # harness's direct queries (see `deploy-preview`/`e2e` below) — not
+      # `db_host` above, which is the direct/unpooled endpoint and is kept
+      # only for the single one-off verification query right below this
+      # job's own password rotation, where connection overhead doesn't
+      # matter. Confirmed live: the app's own sqlx pool opens up to 20
+      # connections (see its own comment in main.rs on why — a single
+      # EditCardPage load alone fires 4-5 concurrent pooled-connection
+      # queries), and every one of those was landing as a full, direct
+      # Postgres backend connection rather than multiplexing through
+      # Neon's own pooler — real overhead on both the tiny preview Fly
+      # machine and the Neon branch's compute, compounding exactly the
+      # pool-exhaustion-under-Playwright-concurrency problem that other
+      # comment already describes, not a separate issue from it.
+      db_host_pooled: ${{ steps.reset.outputs.host_with_pooler }}
       db_password_enc: ${{ steps.rotate.outputs.password_enc }}
     steps:
       - name: Create Neon branch (copy-on-write child of `staging`, never prod)
@@ -197,7 +212,7 @@ jobs:
         with:
           name: gazebo-pr-${{ github.event.number }}
           secrets: >
-            DATABASE_URL=postgresql://neondb_owner:${{ steps.dbpass.outputs.password }}@${{ needs.neon-branch.outputs.db_host }}/neondb?sslmode=require
+            DATABASE_URL=postgresql://neondb_owner:${{ steps.dbpass.outputs.password }}@${{ needs.neon-branch.outputs.db_host_pooled }}/neondb?sslmode=require
             PIXABAY_API_KEY=${{ secrets.PIXABAY_API_KEY }}
             RESEND_API_KEY=${{ secrets.RESEND_API_KEY }}
             TEST_EMAIL_RECIPIENT=${{ vars.TEST_EMAIL_RECIPIENT }}
@@ -301,7 +316,7 @@ jobs:
         run: |
           password=$(printf '%s' "${{ needs.neon-branch.outputs.db_password_enc }}" | openssl enc -d -aes-256-cbc -a -A -pbkdf2 -iter 100000 -pass env:NEON_API_KEY)
           echo "::add-mask::$password"
-          echo "DATABASE_URL=postgresql://neondb_owner:${password}@${{ needs.neon-branch.outputs.db_host }}/neondb?sslmode=require" >> "$GITHUB_ENV"
+          echo "DATABASE_URL=postgresql://neondb_owner:${password}@${{ needs.neon-branch.outputs.db_host_pooled }}/neondb?sslmode=require" >> "$GITHUB_ENV"
       - name: Cache Playwright browsers
         id: playwright-cache
         uses: actions/cache@v4
