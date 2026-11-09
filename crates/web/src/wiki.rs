@@ -31,12 +31,14 @@ pub struct PageContent {
     pub content_json: String,
     pub content_markdown: String,
     /// `content_json` rendered to HTML server-side (via
-    /// `render_blocks_html`, then `with_table_of_contents`) — what the
-    /// read-only view injects with `inner_html`, so a plain visitor never
-    /// has to load the editor's JS just to read a page. Already includes
-    /// a "Contents" box if the page has one (inserted via the editor's
-    /// Insert menu, or added automatically for a page with 2+ headings
-    /// and no explicit placement) — nothing further to render for it.
+    /// `render_blocks_html`, then `with_table_of_contents`, then
+    /// `with_footnotes`) — what the read-only view injects with
+    /// `inner_html`, so a plain visitor never has to load the editor's JS
+    /// just to read a page. Already includes a "Contents" box if the page
+    /// has one (inserted via the editor's Insert menu, or added
+    /// automatically for a page with 2+ headings and no explicit
+    /// placement) and a generated "Footnotes" list at the end if the page
+    /// has any — nothing further to render for either.
     pub content_html: String,
 }
 
@@ -173,6 +175,7 @@ pub async fn get_page(page_id: Uuid) -> Result<Option<PageContent>, ServerFnErro
         let content_html = render_blocks_html(&r.content_json);
         let toc = extract_toc(&content_html);
         let content_html = with_table_of_contents(content_html, &toc);
+        let content_html = with_footnotes(content_html);
         PageContent {
             id: r.id,
             parent_id: r.parent_id,
@@ -436,7 +439,8 @@ fn render_blocks_html(content_json: &str) -> String {
         return String::new();
     };
     let mut heading_ids = HashMap::new();
-    render_block_sequence(&blocks, &mut heading_ids)
+    let mut footnote_count = 0u32;
+    render_block_sequence(&blocks, &mut heading_ids, &mut footnote_count)
 }
 
 /// Renders a flat array of sibling blocks — the document root, or any
@@ -444,7 +448,11 @@ fn render_blocks_html(content_json: &str) -> String {
 /// `<ul>`/`<ol>` the way `BlockNote` represents a list: as adjacent
 /// top-level blocks, not a dedicated list-container block type.
 #[cfg(feature = "ssr")]
-fn render_block_sequence(blocks: &[Value], heading_ids: &mut HashMap<String, u32>) -> String {
+fn render_block_sequence(
+    blocks: &[Value],
+    heading_ids: &mut HashMap<String, u32>,
+    footnote_count: &mut u32,
+) -> String {
     let mut html = String::new();
     let mut i = 0;
     while i < blocks.len() {
@@ -461,10 +469,15 @@ fn render_block_sequence(blocks: &[Value], heading_ids: &mut HashMap<String, u32
                 block_type,
                 &blocks[i..j],
                 heading_ids,
+                footnote_count,
             ));
             i = j;
         } else {
-            html.push_str(&render_single_block(&blocks[i], heading_ids));
+            html.push_str(&render_single_block(
+                &blocks[i],
+                heading_ids,
+                footnote_count,
+            ));
             html.push('\n');
             i += 1;
         }
@@ -508,6 +521,7 @@ fn render_list(
     block_type: &str,
     items: &[Value],
     heading_ids: &mut HashMap<String, u32>,
+    footnote_count: &mut u32,
 ) -> String {
     let mut html = format!("\n<{}", wrapper.tag);
     if let Some(class) = wrapper.class {
@@ -526,7 +540,12 @@ fn render_list(
     }
     html.push('>');
     for item in items {
-        html.push_str(&render_list_item(block_type, item, heading_ids));
+        html.push_str(&render_list_item(
+            block_type,
+            item,
+            heading_ids,
+            footnote_count,
+        ));
     }
     let _ = writeln!(html, "</{}>", wrapper.tag);
     html
@@ -537,6 +556,7 @@ fn render_list_item(
     block_type: &str,
     item: &Value,
     heading_ids: &mut HashMap<String, u32>,
+    footnote_count: &mut u32,
 ) -> String {
     let props = item.get("props").unwrap_or(&Value::Null);
     let content = item.get("content").unwrap_or(&Value::Null);
@@ -544,8 +564,8 @@ fn render_list_item(
         .get("children")
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
-    let inline = render_inline(content);
-    let children_html = render_block_sequence(children, heading_ids);
+    let inline = render_inline(content, footnote_count);
+    let children_html = render_block_sequence(children, heading_ids, footnote_count);
     let style = style_attr(props);
     match block_type {
         "checkListItem" => {
@@ -570,7 +590,11 @@ fn render_list_item(
 /// Everything that isn't a list item — rendered on its own, never grouped
 /// with a sibling the way list items are.
 #[cfg(feature = "ssr")]
-fn render_single_block(block: &Value, heading_ids: &mut HashMap<String, u32>) -> String {
+fn render_single_block(
+    block: &Value,
+    heading_ids: &mut HashMap<String, u32>,
+    footnote_count: &mut u32,
+) -> String {
     let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
     let props = block.get("props").unwrap_or(&Value::Null);
     let content = block.get("content").unwrap_or(&Value::Null);
@@ -578,13 +602,20 @@ fn render_single_block(block: &Value, heading_ids: &mut HashMap<String, u32>) ->
         .get("children")
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
-    let children_html = render_block_sequence(children, heading_ids);
+    let children_html = render_block_sequence(children, heading_ids, footnote_count);
     let style = style_attr(props);
     match block_type {
-        "heading" => render_heading(props, content, &children_html, &style, heading_ids),
+        "heading" => render_heading(
+            props,
+            content,
+            &children_html,
+            &style,
+            heading_ids,
+            footnote_count,
+        ),
         "quote" => format!(
             "<blockquote{style}>{}</blockquote>{children_html}",
-            render_inline(content)
+            render_inline(content, footnote_count)
         ),
         "codeBlock" => {
             let language = props.get("language").and_then(Value::as_str).unwrap_or("");
@@ -603,7 +634,7 @@ fn render_single_block(block: &Value, heading_ids: &mut HashMap<String, u32>) ->
         "video" => render_media_block(MediaKind::Video, props, &children_html),
         "audio" => render_media_block(MediaKind::Audio, props, &children_html),
         "file" => render_media_block(MediaKind::File, props, &children_html),
-        "table" => format!("{}{children_html}", render_table(content)),
+        "table" => format!("{}{children_html}", render_table(content, footnote_count)),
         // `@blocknote/xl-multi-column`'s two block types (see
         // editor/src/main.tsx's `wikiSchema`) — a `columnList` is content
         // "none" and holds nothing but `column` children side by side; each
@@ -619,7 +650,10 @@ fn render_single_block(block: &Value, heading_ids: &mut HashMap<String, u32>) ->
         // (forward compatibility with a future BlockNote block type) —
         // falls back to a plain paragraph rather than silently dropping
         // its text.
-        _ => format!("<p{style}>{}</p>{children_html}", render_inline(content)),
+        _ => format!(
+            "<p{style}>{}</p>{children_html}",
+            render_inline(content, footnote_count)
+        ),
     }
 }
 
@@ -630,6 +664,7 @@ fn render_heading(
     children_html: &str,
     style: &str,
     heading_ids: &mut HashMap<String, u32>,
+    footnote_count: &mut u32,
 ) -> String {
     let level = props
         .get("level")
@@ -639,7 +674,7 @@ fn render_heading(
     let id = unique_heading_id(&inline_plain_text(content), heading_ids);
     let tag = format!(
         "<h{level} id=\"{id}\"{style}>{}</h{level}>",
-        render_inline(content)
+        render_inline(content, footnote_count)
     );
     let toggleable = props
         .get("isToggleable")
@@ -734,7 +769,7 @@ fn render_column(props: &Value, children_html: &str) -> String {
 /// [...]}`), not an array like every other block's `content` — its own
 /// shape, carried over unchanged from `BlockNote`'s document model.
 #[cfg(feature = "ssr")]
-fn render_table(content: &Value) -> String {
+fn render_table(content: &Value, footnote_count: &mut u32) -> String {
     let Some(rows) = content.get("rows").and_then(Value::as_array) else {
         return String::new();
     };
@@ -743,7 +778,7 @@ fn render_table(content: &Value) -> String {
         html.push_str("<tr>");
         if let Some(cells) = row.get("cells").and_then(Value::as_array) {
             for cell in cells {
-                html.push_str(&render_table_cell(cell));
+                html.push_str(&render_table_cell(cell, footnote_count));
             }
         }
         html.push_str("</tr>\n");
@@ -753,7 +788,7 @@ fn render_table(content: &Value) -> String {
 }
 
 #[cfg(feature = "ssr")]
-fn render_table_cell(cell: &Value) -> String {
+fn render_table_cell(cell: &Value, footnote_count: &mut u32) -> String {
     let props = cell.get("props").unwrap_or(&Value::Null);
     // A cell's own `content` is a plain inline-content array directly —
     // unlike a table BLOCK's `content` above, a cell isn't wrapped in its
@@ -770,30 +805,59 @@ fn render_table_cell(cell: &Value) -> String {
     {
         let _ = write!(attrs, " rowspan=\"{rowspan}\"");
     }
-    format!("<td{attrs}>{}</td>", render_inline(content))
+    format!("<td{attrs}>{}</td>", render_inline(content, footnote_count))
 }
 
-/// Inline content — the `text`/`link` item array shared by every block
-/// whose `content` holds actual prose (paragraph, heading, quote, list
-/// items, table cells).
+/// Inline content — the `text`/`link`/`footnoteRef` item array shared by
+/// every block whose `content` holds actual prose (paragraph, heading,
+/// quote, list items, table cells).
 #[cfg(feature = "ssr")]
-fn render_inline(content: &Value) -> String {
+fn render_inline(content: &Value, footnote_count: &mut u32) -> String {
     let Some(items) = content.as_array() else {
         return String::new();
     };
     let mut html = String::new();
     for item in items {
-        html.push_str(&render_inline_item(item));
+        html.push_str(&render_inline_item(item, footnote_count));
     }
     html
 }
 
 #[cfg(feature = "ssr")]
-fn render_inline_item(item: &Value) -> String {
-    if item.get("type").and_then(Value::as_str) == Some("link") {
-        let href = item.get("href").and_then(Value::as_str).unwrap_or("");
-        let inner = render_inline(item.get("content").unwrap_or(&Value::Null));
-        return format!("<a href=\"{}\">{inner}</a>", escape_attr(href));
+fn render_inline_item(item: &Value, footnote_count: &mut u32) -> String {
+    match item.get("type").and_then(Value::as_str) {
+        Some("link") => {
+            let href = item.get("href").and_then(Value::as_str).unwrap_or("");
+            let inner = render_inline(item.get("content").unwrap_or(&Value::Null), footnote_count);
+            return format!("<a href=\"{}\">{inner}</a>", escape_attr(href));
+        }
+        // editor/src/main.tsx's FootnoteRef — a plain-text annotation (see
+        // its own doc comment on why `content: "none"` rather than nested
+        // rich content), so its text lives directly in `props.text` here,
+        // not walked as further inline content the way `link`'s above is.
+        // Numbered purely by the order encountered walking the saved
+        // content, same strategy `unique_heading_id`/`heading_ids` already
+        // uses for heading ids — not `props.noteId`, which only the live
+        // editor's own numbering (editor/src/main.tsx's footnoteNumber)
+        // ever reads. extract_footnotes below pulls this same text back out
+        // of `data-footnote-text` to build the generated list at the
+        // article's end, the same after-the-fact-scan `extract_toc` uses
+        // for the "Contents" box, rather than threading a second
+        // accumulator alongside this counter.
+        Some("footnoteRef") => {
+            *footnote_count += 1;
+            let number = *footnote_count;
+            let text = item
+                .get("props")
+                .and_then(|p| p.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            return format!(
+                "<sup class=\"wiki-footnote-ref\" id=\"fnref-{number}\" data-footnote-text=\"{}\"><a href=\"#fn-{number}\">{number}</a></sup>",
+                escape_attr(text),
+            );
+        }
+        _ => {}
     }
     let text = escape_html(item.get("text").and_then(Value::as_str).unwrap_or(""));
     wrap_styles(text, item.get("styles"))
@@ -1100,6 +1164,64 @@ fn toc_html(toc: &[TocEntry]) -> String {
     html
 }
 
+/// Pulls each footnote's number and text back out of `render_blocks_html`'s
+/// own output — the same after-the-fact-scan strategy `extract_toc` uses
+/// for headings, rather than threading a second accumulator (a `Vec`)
+/// alongside the plain counter `render_inline_item` already needs just to
+/// assign the numbers. Scans for one fixed, self-contained marker shape
+/// (`id="fnref-N" data-footnote-text="..."`, both emitted together by
+/// `render_inline_item`'s own `footnoteRef` arm) rather than a full HTML
+/// parser dependency. `text` comes out still `escape_attr`-escaped exactly
+/// as `render_inline_item` wrote it — safe to drop straight into `<li>`
+/// text content unchanged, since `escape_attr` escapes a strict superset
+/// (`&`/`</>`/`"`) of what plain text content (`&`/`</>`) needs.
+#[cfg(feature = "ssr")]
+fn extract_footnotes(html: &str) -> Vec<(u32, String)> {
+    let mut entries = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find("id=\"fnref-") {
+        rest = &rest[start + "id=\"fnref-".len()..];
+        let Some(id_end) = rest.find('"') else { break };
+        let Ok(number) = rest[..id_end].parse::<u32>() else {
+            break;
+        };
+        rest = &rest[id_end..];
+        let Some(text_start) = rest.find("data-footnote-text=\"") else {
+            break;
+        };
+        rest = &rest[text_start + "data-footnote-text=\"".len()..];
+        let Some(text_end) = rest.find('"') else {
+            break;
+        };
+        entries.push((number, rest[..text_end].to_string()));
+        rest = &rest[text_end..];
+    }
+    entries
+}
+
+/// Appends a generated "Footnotes" section listing each footnote `html`'s
+/// own inline markers already numbered and linked to — unlike
+/// `with_table_of_contents`, there's no marker to splice at: a footnotes
+/// list, unlike a table of contents, has no place in the document a writer
+/// would naturally position it themselves, so it always lands at the very
+/// end. A no-op when the page has none.
+#[cfg(feature = "ssr")]
+fn with_footnotes(html: String) -> String {
+    let footnotes = extract_footnotes(&html);
+    if footnotes.is_empty() {
+        return html;
+    }
+    let mut section = String::from("<section class=\"wiki-footnotes\"><hr/><ol>");
+    for (number, text) in &footnotes {
+        let _ = write!(
+            section,
+            "<li id=\"fn-{number}\">{text} <a href=\"#fnref-{number}\" class=\"wiki-footnote-backlink\" aria-label=\"Back to reference {number}\">\u{21a9}</a></li>",
+        );
+    }
+    section.push_str("</ol></section>");
+    format!("{html}{section}")
+}
+
 /// Strips inline HTML tags (e.g. `<code>`/`<strong>` from inline markdown
 /// inside a heading) and unescapes the handful of entities `render_markdown`
 /// can actually produce in heading text, down to the plain text a TOC
@@ -1146,6 +1268,10 @@ mod tests {
 
     fn toc_marker() -> Value {
         json!({"type": "tableOfContents", "props": {}, "content": [], "children": []})
+    }
+
+    fn footnote_ref(text: &str) -> Value {
+        json!({"type": "footnoteRef", "props": {"noteId": "ignored-by-the-renderer", "text": text}})
     }
 
     fn heading(level: u64, text: &str) -> Value {
@@ -1584,6 +1710,76 @@ mod tests {
         assert_eq!(render_blocks_html("{}"), "");
         assert_eq!(render_blocks_html(""), "");
         assert_eq!(render_blocks_html("not json"), "");
+    }
+
+    #[test]
+    fn a_page_with_no_footnotes_gets_no_footnotes_section() {
+        let html = render_blocks_html(&doc(vec![paragraph("plain text, no notes")]));
+        let html = with_footnotes(html);
+        assert!(!html.contains("wiki-footnotes"), "{html}");
+    }
+
+    #[test]
+    fn a_footnote_renders_a_numbered_marker_and_a_matching_list_entry() {
+        let html = render_blocks_html(&doc(vec![json!({
+            "type": "paragraph",
+            "props": default_props(),
+            "content": [text_item("see"), footnote_ref("the actual note text")],
+            "children": [],
+        })]));
+        let html = with_footnotes(html);
+        assert!(
+            html.contains("<sup class=\"wiki-footnote-ref\" id=\"fnref-1\" data-footnote-text=\"the actual note text\"><a href=\"#fn-1\">1</a></sup>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<section class=\"wiki-footnotes\">"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<li id=\"fn-1\">the actual note text <a href=\"#fnref-1\" class=\"wiki-footnote-backlink\""),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn footnotes_number_in_document_order_across_separate_blocks() {
+        let html = render_blocks_html(&doc(vec![
+            json!({
+                "type": "paragraph",
+                "props": default_props(),
+                "content": [footnote_ref("first")],
+                "children": [],
+            }),
+            heading(2, "A heading in between"),
+            json!({
+                "type": "paragraph",
+                "props": default_props(),
+                "content": [footnote_ref("second")],
+                "children": [],
+            }),
+        ]));
+        let html = with_footnotes(html);
+        let first_marker = html.find("id=\"fnref-1\"").unwrap();
+        let second_marker = html.find("id=\"fnref-2\"").unwrap();
+        assert!(first_marker < second_marker, "{html}");
+        let list_first = html.find("id=\"fn-1\">first").unwrap();
+        let list_second = html.find("id=\"fn-2\">second").unwrap();
+        assert!(list_first < list_second, "{html}");
+    }
+
+    #[test]
+    fn footnote_text_with_a_quote_is_attribute_escaped_in_the_inline_marker() {
+        let html = render_blocks_html(&doc(vec![json!({
+            "type": "paragraph",
+            "props": default_props(),
+            "content": [footnote_ref("a \"quoted\" note")],
+            "children": [],
+        })]));
+        assert!(
+            html.contains("data-footnote-text=\"a &quot;quoted&quot; note\""),
+            "{html}"
+        );
     }
 
     #[test]

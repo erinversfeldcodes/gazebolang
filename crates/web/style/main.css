@@ -1296,6 +1296,28 @@ main:has(> .wiki-shell) {
     border-color: var(--wiki-ink-subtle);
 }
 
+/* Deliberately quieter than .wiki-edit-toggle's "Done" — a borderless,
+   muted-text button reads as the lesser of the two actions, the same way
+   a dialog's "Cancel" sits visually behind its primary button rather than
+   competing with it. */
+.wiki-edit-discard {
+    font-family: var(--wiki-font);
+    font-weight: 500;
+    font-size: 0.85rem;
+    text-transform: none;
+    letter-spacing: normal;
+    color: var(--wiki-ink-subtle);
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    padding: 0.4rem 0.9rem;
+}
+
+.wiki-edit-discard:hover {
+    color: var(--wiki-ink);
+    border-color: var(--wiki-border-strong);
+}
+
 /* Styled to read as the page's h1 until you actually click it — the title
    *is* the heading, editable in place, the way Confluence and Docs both
    do it, not a separate "Rename" button opening a separate form. */
@@ -1609,6 +1631,106 @@ main:has(> .wiki-shell) {
 
 .wiki-toc-level-3 {
     padding-left: 2rem;
+}
+
+/* .wiki-footnote-ref covers both shapes that class actually appears on:
+   wiki.rs's read-view <sup><a href="#fn-N">N</a></sup> (jumps to
+   .wiki-footnotes below) and the live editor's <sup> wrapping a clickable
+   .wiki-footnote-marker button that opens .wiki-footnote-popover instead —
+   editing has nowhere to "jump" to, so it pops the text up in place. */
+.wiki-footnote-ref {
+    position: relative;
+    font-size: 0.75em;
+}
+
+.wiki-footnote-ref a,
+.wiki-footnote-marker {
+    color: var(--wiki-accent);
+    text-decoration: none;
+    font-weight: 600;
+}
+
+.wiki-footnote-marker {
+    font-family: var(--wiki-font);
+    background: none;
+    border: none;
+    /* Visually a tight superscript digit, but padded well past its own
+       text size — confirmed live that the plain `padding: 0 0.1em` this
+       replaced made the actual clickable element too small to reliably
+       hit at all, as opposed to the `<sup>` wrapper around it (which
+       isn't itself clickable). */
+    padding: 0.3em 0.35em;
+    margin: -0.3em -0.35em;
+    cursor: pointer;
+    font-size: 1em;
+    vertical-align: super;
+    line-height: 1;
+}
+
+.wiki-footnote-ref a:hover,
+.wiki-footnote-marker:hover {
+    text-decoration: underline;
+}
+
+.wiki-footnote-popover {
+    position: absolute;
+    left: 0;
+    top: 100%;
+    z-index: 5;
+    background: var(--wiki-bg);
+    border: 1px solid var(--wiki-border-strong);
+    border-radius: 3px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+    padding: 0.4rem;
+}
+
+.wiki-footnote-popover textarea {
+    font-family: var(--wiki-font);
+    font-size: 0.85rem;
+    width: 16rem;
+    height: 4rem;
+    resize: vertical;
+    border: 1px solid var(--wiki-border);
+    border-radius: 2px;
+    padding: 0.3rem;
+}
+
+/* The generated list wiki.rs's with_footnotes appends after the article's
+   own content — same "derived, not authored in place" relationship to the
+   article the .wiki-toc box above has to its headings, just appended at
+   the end rather than spliced at a marker, since a footnote (unlike a
+   table of contents) has no single natural spot the writer would place it
+   at themselves. */
+.wiki-footnotes {
+    margin-top: 2rem;
+    padding-top: 1rem;
+    font-size: 0.85rem;
+    color: var(--wiki-ink-subtle);
+}
+
+.wiki-footnotes hr {
+    border: none;
+    border-top: 1px solid var(--wiki-border);
+    margin: 0 0 1rem;
+    max-width: 12rem;
+}
+
+.wiki-footnotes ol {
+    padding-left: 1.4rem;
+}
+
+.wiki-footnotes li {
+    padding: 0.15rem 0;
+}
+
+.wiki-footnote-backlink {
+    color: var(--wiki-accent);
+    text-decoration: none;
+    margin-left: 0.3em;
+}
+
+.wiki-footnote-backlink:hover {
+    text-decoration: underline;
 }
 
 .wiki-article h4,

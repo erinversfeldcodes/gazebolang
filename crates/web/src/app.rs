@@ -2619,6 +2619,14 @@ fn WikiPage() -> impl IntoView {
     // live feedback against real Confluence screenshots; see the "Edit"/
     // "Done" button below.
     let editing = RwSignal::new(false);
+    // Set true for exactly one unmount by the "Discard" handler below, so
+    // <WikiEditor>'s on_unmount_snapshot (see its own call site) knows to
+    // skip its usual flush-save for this one exit — otherwise discarding
+    // would just get silently overwritten by the very save it was trying
+    // to avoid. Reset back to false by that same callback once read, not
+    // left armed for the next, unrelated edit session on whatever page
+    // comes next.
+    let discard_requested = RwSignal::new(false);
     // Bumped exactly once, by the "Done" handler below, when leaving edit
     // mode — the one explicit signal that forces `page` to refetch (see its
     // own comment: it deliberately ignores save.version(), since refetching
@@ -2912,6 +2920,25 @@ fn WikiPage() -> impl IntoView {
                         let edit_toggle = signed_in.then(|| {
                             if is_editing {
                                 view! {
+                                    // No "are you sure" step, unlike delete (delete_armed)
+                                    // below — the worst a discard can lose is whatever was
+                                    // typed since the last autosave tick (at most 6s, see the
+                                    // autosave loop above), and the page's full revision
+                                    // history already covers wanting an older version back.
+                                    // <WikiEditor>'s on_unmount_snapshot is what actually
+                                    // skips the flush-save for this exit (see
+                                    // discard_requested's own comment) — this handler's only
+                                    // job is to arm that flag before leaving edit mode.
+                                    <button
+                                        type="button"
+                                        class="wiki-edit-discard"
+                                        on:click=move |_| {
+                                            discard_requested.set(true);
+                                            editing.set(false);
+                                        }
+                                    >
+                                        "Discard"
+                                    </button>
                                     <button
                                         type="button"
                                         class="wiki-edit-toggle"
@@ -3020,6 +3047,57 @@ fn WikiPage() -> impl IntoView {
                                             page_id=id
                                             initial_document_json=content_json.clone()
                                             read_only=false
+                                            // Covers every way this editor can unmount without
+                                            // going through the explicit "Done" button above —
+                                            // right now, specifically, navigating to a different
+                                            // wiki page mid-edit: `editing` is one signal shared
+                                            // across every /wiki/:id route (this whole component
+                                            // is reused across them, not remounted per page), so
+                                            // without resetting it here too, the next page you
+                                            // land on rendered straight into edit mode instead of
+                                            // its read view — reported live as "one continuous
+                                            // editing session" across unrelated pages. The dirty-
+                                            // check mirrors "Done"'s own (content_json against
+                                            // last_saved_content_json); id/title_signal are safe
+                                            // to read here (not stale) because WikiEditor's own
+                                            // on_cleanup captures its snapshot synchronously,
+                                            // before `page_id`/`title_signal` have had any chance
+                                            // to move on to a different page — see its own
+                                            // comment for why that ordering matters.
+                                            on_unmount_snapshot=move |content_json: String, content_markdown: String| {
+                                                // discard_requested, not a plain bool check —
+                                                // this callback is the one place that would
+                                                // otherwise silently re-save a discarded edit
+                                                // out from under the "Discard" button above
+                                                // (its own click handler can't just skip its own
+                                                // save: it never had one, the save only ever
+                                                // happens here, on unmount — see this prop's own
+                                                // doc comment).
+                                                let discarding = discard_requested.get_untracked();
+                                                if discarding {
+                                                    discard_requested.set(false);
+                                                }
+                                                #[cfg(feature = "hydrate")]
+                                                {
+                                                    if !discarding && content_json != last_saved_content_json.get_untracked() {
+                                                        let title = title_signal.get_untracked();
+                                                        wasm_bindgen_futures::spawn_local(async move {
+                                                            let _ = save_page_revision(
+                                                                id,
+                                                                title,
+                                                                content_json,
+                                                                content_markdown,
+                                                            )
+                                                            .await;
+                                                        });
+                                                    }
+                                                }
+                                                #[cfg(not(feature = "hydrate"))]
+                                                {
+                                                    let _ = (&content_json, &content_markdown, discarding);
+                                                }
+                                                editing.set(false);
+                                            }
                                         />
                                     }
                                         .into_any()
