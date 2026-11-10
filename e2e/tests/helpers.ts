@@ -102,11 +102,13 @@ export async function createCardInOwnDeck(
 // fake device, not just that the click landed), accumulates at least one
 // second so MediaRecorder's periodic dataavailable actually fires at
 // least once, then stops and waits for the resulting preview player.
-// Assumes the given page already has exactly one audio RecordButton and
-// one video RecordButton, audio first — true of both the new-card and
-// edit-card forms today.
+// Located by which file input it sits next to, not by position — card
+// type now gates which of audio/video (if either) actually render (see
+// app.rs's MediaFields), so a card form doesn't always have both, or have
+// them in the same order, the way `.recorder`'s nth(0)/nth(1) used to
+// assume.
 export async function recordClip(page: Page, kind: "audio" | "video"): Promise<void> {
-  const recorder = page.locator(".recorder").nth(kind === "audio" ? 0 : 1);
+  const recorder = page.locator(`label:has(input[accept="${kind}/*"]) + .recorder`);
   await recorder.getByRole("button", { name: "Record", exact: true }).click();
   await expect(recorder.getByRole("button", { name: "Stop recording" })).toBeVisible();
   await page.waitForTimeout(1500);
