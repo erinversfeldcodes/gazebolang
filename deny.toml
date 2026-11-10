@@ -32,6 +32,19 @@ ignore = [
     # it's a tiny proc-macro helper, not a live security exposure. Revisit
     # when leptos drops it.
     "RUSTSEC-2024-0436",
+    # libsqlite3-sys (RUSTSEC-2026-0459, CVE-2026-119375): a pre-3.54
+    # bundled SQLite vulnerable to uninitialized-memory disclosure via a
+    # crafted mismatched-page-size WAL file. Only in Cargo.lock because
+    # sqlx lists "sqlite" as a possible feature at all (this graph is
+    # evaluated with all-features = true above) — crates/web only ever
+    # requests sqlx's "postgres" feature, so sqlx-sqlite/libsqlite3-sys
+    # never actually compiles into this binary, and sqlx-sqlite 0.9.0
+    # pins `libsqlite3-sys = ">=0.30.1, <0.38.0"` anyway, so there's no
+    # patched version to move to from our side even if it did. Mirrored
+    # in .github/workflows/audit.yml's own ignore list for cargo-audit,
+    # which checks the same advisory DB via a different tool. Revisit
+    # once sqlx-sqlite widens that range.
+    "RUSTSEC-2026-0459",
 ]
 
 [sources]
