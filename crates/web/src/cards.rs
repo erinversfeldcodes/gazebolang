@@ -42,6 +42,7 @@ pub struct CardDetail {
 pub const CARD_TYPES: &[(&str, &str)] = &[
     ("image_to_target", "Image → written"),
     ("sound_to_written", "Audio → written"),
+    ("image_to_audio", "Image → audio"),
     ("sentence_translation", "Sentence translation"),
 ];
 

@@ -6,6 +6,12 @@ test("recording audio attaches a playable clip to a new card", async ({ page }) 
 
   await page.goto("/new");
   await page.getByLabel("Target-language word/phrase").fill(word);
+  // image_to_target (the default card type) no longer shows an audio
+  // field at all — confirmed live that showing audio upload/record
+  // controls on an image card was exactly the clutter MediaAttachmentFields'
+  // per-type field gating (app.rs's MediaFields) was built to remove.
+  // "Audio → written" is the type that still offers it.
+  await page.getByLabel("Card type").selectOption("sound_to_written");
   await recordClip(page, "audio");
 
   // The recorded clip actually landed on the file input itself (not just
@@ -47,6 +53,8 @@ test("removing an attached recording clears it from the card", async ({ page }) 
 
   await page.goto("/new");
   await page.getByLabel("Target-language word/phrase").fill(word);
+  // See the "recording audio attaches..." test above for why this is needed.
+  await page.getByLabel("Card type").selectOption("sound_to_written");
   await recordClip(page, "audio");
   await page.getByRole("button", { name: "Add" }).click();
   await expect(page).toHaveURL("/");

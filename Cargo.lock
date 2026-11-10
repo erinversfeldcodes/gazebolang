@@ -4805,6 +4805,7 @@ dependencies = [
  "rand 0.10.3",
  "reqwest",
  "s3",
+ "send_wrapper",
  "serde",
  "serde_json",
  "similar 3.2.1",

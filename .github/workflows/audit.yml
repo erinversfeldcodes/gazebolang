@@ -26,3 +26,21 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # RUSTSEC-2026-0459: libsqlite3-sys bundles a pre-3.54 SQLite
+          # vulnerable to CVE-2026-119375 (uninitialized memory via a
+          # crafted mismatched-page-size WAL file). It's in Cargo.lock only
+          # because sqlx's Cargo.toml lists "sqlite" as a possible feature
+          # at all — Cargo.lock pins a version for every optional
+          # dependency reachable under *any* feature combination,
+          # independent of which ones this workspace actually requests.
+          # crates/web only ever enables sqlx's "postgres" feature
+          # (default-features = false, no "sqlite"), so sqlx-sqlite/
+          # libsqlite3-sys never compiles into this binary and the WAL
+          # file attack surface doesn't exist here. No upgrade available
+          # from our side either way: sqlx-sqlite 0.9.0 pins
+          # `libsqlite3-sys = ">=0.30.1, <0.38.0"`, so even forcing
+          # Cargo.lock to the patched 0.39.x would fail to resolve.
+          # Mirrored in deny.toml's own [advisories] ignore list, which
+          # cargo-deny checks against the same advisory DB. Revisit once
+          # sqlx-sqlite widens that range.
+          ignore: RUSTSEC-2026-0459

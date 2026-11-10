@@ -321,7 +321,34 @@ select {
 /* --- Card list: a scatter of index cards pulled from the drawer --- */
 
 .card-filters {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.9rem 1.2rem;
     margin-bottom: 1.5rem;
+}
+
+/* An <a>, not a <button> — the global button rule above only targets
+   button/input[type="submit"], so this repeats its look explicitly
+   rather than inheriting it. */
+.card-filters-add {
+    display: inline-block;
+    font-family: var(--font-serif);
+    font-size: 0.85rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    text-decoration: none;
+    color: var(--paper);
+    background: linear-gradient(var(--wood-light), var(--wood-dark));
+    border: 1px solid var(--brass-dim);
+    border-radius: 2px;
+    padding: 0.5rem 1rem;
+    box-shadow: 0 2px 4px var(--shadow-soft);
+}
+
+.card-filters-add:hover {
+    background: linear-gradient(var(--wood-medium), var(--wood-dark));
+    border-color: var(--brass);
 }
 
 .card-grid {
@@ -409,6 +436,36 @@ select {
     text-transform: uppercase;
     letter-spacing: 0.05em;
     align-self: flex-end;
+}
+
+/* Edit + Delete side by side, right-aligned as one unit — .card-grid li's
+   own flex-column would otherwise stack them as two separate full-width
+   rows, one per direct child. */
+.card-grid-actions {
+    display: flex;
+    gap: 0.9rem;
+    align-self: flex-end;
+}
+
+/* Delete reuses "Edit"'s own plain-text look rather than the global
+   button's wood-gradient treatment — a small grid card is too cramped a
+   spot for a heavy, filled-in button, and visually matching Edit (not
+   contrasting against it) reads as "two equally-ordinary actions on this
+   card", which is what a single, un-confirmed click already implies. */
+.card-grid-actions button {
+    font-family: var(--font-serif);
+    font-size: 0.8rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--rule-red);
+    background: none;
+    border: none;
+    box-shadow: none;
+    padding: 0;
+}
+
+.card-grid-actions button:hover {
+    text-decoration: underline;
 }
 
 /* --- Decks: a card-catalog cabinet of drawers --- */
@@ -620,6 +677,39 @@ form p,
 .card-section p:not(.card-section-heading),
 .word-dialog p {
     color: var(--ink-faded);
+}
+
+/* ImageSearchPicker never had any sizing rules at all — confirmed live
+   the chosen-image preview rendered at its native, full-resolution
+   dimensions (import_card_image re-hosts the provider's full image, not
+   just its thumbnail), overflowing the form well past the page edge. */
+.image-search-results {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin: 0.5rem 0;
+}
+
+.image-search-thumb {
+    width: 5.5rem;
+    height: 5.5rem;
+    object-fit: cover;
+    border: 1px solid var(--paper-dark);
+    border-radius: 2px;
+    cursor: pointer;
+}
+
+.image-search-thumb:hover {
+    border-color: var(--brass-dim);
+}
+
+.image-search-chosen img {
+    display: block;
+    max-width: 100%;
+    max-height: 16rem;
+    height: auto;
+    border: 1px solid var(--paper-dark);
+    margin: 0.5rem 0;
 }
 
 .review-grades {
@@ -1739,6 +1829,26 @@ main:has(> .wiki-shell) {
 .bn-container input[type="submit"] {
     all: revert;
     cursor: pointer;
+}
+
+/* `all: revert` above also rolled display back to a bare <button>'s own
+   native default (confirmed live: inline-block), not Mantine's intended
+   one — Mantine's own bundled CSS never sets display on .mantine-Menu-item
+   itself, relying instead on its full component library's base reset,
+   which this app only pulls in the pieces of (buttons, menus, nothing
+   else). Confirmed live without this, every item in a Menu dropdown
+   (table row/column handle, slash menu, anywhere else BlockNote uses
+   Mantine's Menu) laid out as a single inline-flowing row rather than
+   stacking — not how a dropdown menu looks anywhere else, on this site or
+   off it. Scoped to .mantine-Menu-dropdown specifically (Mantine's own
+   class, not BlockNote's), not every button under .bn-container above —
+   the side menu's drag-handle/"+" icon pair, for one, is a small
+   horizontal cluster, not a dropdown, and genuinely wants to stay
+   inline. */
+.mantine-Menu-dropdown button {
+    display: block;
+    width: 100%;
+    text-align: left;
 }
 
 .wiki-footnote-popover {

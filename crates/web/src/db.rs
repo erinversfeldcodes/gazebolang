@@ -422,6 +422,27 @@ pub async fn delete_deck(pool: &PgPool, deck_id: Uuid) -> sqlx::Result<()> {
     Ok(())
 }
 
+/// Bulk-adds every card tagged `tag` to `deck_id` in one statement — the
+/// same `cards c JOIN card_tags t ON t.card_id = c.id AND t.tag = $1` shape
+/// `list_cards`'s tag-filtered branch already queries with, just inserting
+/// the matches directly instead of returning them. `ON CONFLICT DO
+/// NOTHING` matches `add_card_to_deck`'s own idempotency, though it can
+/// only matter here if the tag's cards changed between the page load that
+/// offered this tag and the submit that picked it.
+pub async fn populate_deck_by_tag(pool: &PgPool, deck_id: Uuid, tag: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO deck_cards (deck_id, card_id) \
+         SELECT $1, c.id FROM cards c \
+         JOIN card_tags t ON t.card_id = c.id AND t.tag = $2 \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(deck_id)
+    .bind(tag)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn add_card_to_deck(pool: &PgPool, deck_id: Uuid, card_id: Uuid) -> sqlx::Result<()> {
     sqlx::query("INSERT INTO deck_cards (deck_id, card_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
         .bind(deck_id)

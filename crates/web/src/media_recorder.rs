@@ -97,6 +97,34 @@ pub fn RecordButton(
     #[cfg(feature = "hydrate")]
     let active_stream: Rc<RefCell<Option<MediaStream>>> = Rc::new(RefCell::new(None));
 
+    // The mic/camera indicator a browser shows stays lit for as long as a
+    // MediaStream's tracks are live — not just while a recording is
+    // actually in progress. Every normal stop path already releases them
+    // (`on_stop_closure`/the error paths in `start_recording`, both via
+    // `stop_tracks`), but confirmed live there was one gap: navigating
+    // away mid-recording (a client-side route change, not a full page
+    // reload) disposes this component without ever calling its own Stop
+    // handler, and nothing was releasing the still-open stream when that
+    // happened — the mic would stay hot indefinitely, with no recording
+    // actually running and no UI left on screen to stop it from. on_cleanup
+    // is Leptos's hook for exactly this: it runs on route-away disposal the
+    // same as it would on a more ordinary unmount.
+    #[cfg(feature = "hydrate")]
+    {
+        let active_recorder = active_recorder.clone();
+        let active_stream = active_stream.clone();
+        // on_cleanup requires Send + Sync even in this single-threaded wasm
+        // build (see wiki_editor's autosave-loop cancellation flag for the
+        // same constraint on a plain bool) — these are JS-backed types that
+        // can't genuinely promise that, so SendWrapper stands in: its
+        // unsafe Send/Sync impl only has to hold up because wasm32 never
+        // actually crosses a thread boundary to begin with.
+        let release = send_wrapper::SendWrapper::new(move || {
+            browser::release_on_cleanup(&active_recorder, &active_stream);
+        });
+        on_cleanup(move || release.take()());
+    }
+
     let on_toggle = move |_| {
         #[cfg(feature = "hydrate")]
         {
@@ -274,6 +302,27 @@ mod browser {
 
             stop_tracks(&active_stream);
         })
+    }
+
+    // Called from on_cleanup, where the component's own signals
+    // (recording/preview_url/...) may already be disposed — unlike
+    // stop_recording below, this never routes through the MediaRecorder's
+    // onstop handler (on_stop_closure writes to those signals and finishes
+    // attaching the clip to target_input, neither of which makes sense, or
+    // is even safe, once this component is gone). It clears the recorder's
+    // own event handlers first so a stop() here can't trigger that handler
+    // later anyway, then releases the hardware directly via stop_tracks —
+    // the actual mic/camera-off step either path ultimately relies on.
+    pub(super) fn release_on_cleanup(
+        active_recorder: &Rc<RefCell<Option<MediaRecorder>>>,
+        active_stream: &Rc<RefCell<Option<MediaStream>>>,
+    ) {
+        if let Some(media_recorder) = active_recorder.borrow_mut().take() {
+            media_recorder.set_ondataavailable(None);
+            media_recorder.set_onstop(None);
+            let _ = media_recorder.stop();
+        }
+        stop_tracks(active_stream);
     }
 
     pub(super) fn stop_recording(active_recorder: &Rc<RefCell<Option<MediaRecorder>>>) {
