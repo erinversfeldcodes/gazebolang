@@ -213,7 +213,55 @@ pub fn DictionaryDetailsEditor(
     #[prop(default = String::new())] example_target_initial: String,
     #[prop(default = String::new())] example_gloss_initial: String,
     #[prop(default = String::new())] linked_words_initial: String,
+    // NewCardPage's case: there's no card yet for these details to be
+    // attached to, so there's nothing for an independent "Save" here to
+    // save *against* — confirmed live it let you fill this section in,
+    // click Save, and walk away without ever creating the card at all,
+    // leaving a dictionary entry with no card pointing at it. Embedded
+    // renders plain named fields with no save button/action of its own;
+    // the enclosing <Form> carries them to the server alongside the rest
+    // of the card, and the card-creation handler saves the definition
+    // itself, atomically with the card. EditCardPage keeps the standalone
+    // (default) behavior: there, the card already exists, and editing its
+    // word's dictionary entry is a genuinely separate action from editing
+    // the card's own fields.
+    #[prop(default = false)] embedded: bool,
 ) -> impl IntoView {
+    if embedded {
+        return view! {
+            <div class="card-section">
+                <p class="card-section-heading">"Dictionary details (optional)"</p>
+                <label>
+                    "English translation"
+                    <input type="text" name="dict_english_translation" value=english_translation_initial />
+                </label>
+                <label>
+                    "Part of speech"
+                    <input type="text" name="dict_part_of_speech" value=part_of_speech_initial />
+                </label>
+                <label>
+                    "Notes"
+                    <textarea name="dict_notes">{notes_initial}</textarea>
+                </label>
+                <div class="dict-example">
+                    <label>
+                        "Example sentence (target language)"
+                        <input type="text" name="dict_example_target" value=example_target_initial />
+                    </label>
+                    <label>
+                        "Example sentence gloss (English/source — shown only in the lookup popup, never during review)"
+                        <input type="text" name="dict_example_gloss" value=example_gloss_initial />
+                    </label>
+                </div>
+                <label>
+                    "Related words (comma separated)"
+                    <input type="text" name="dict_linked_words" value=linked_words_initial />
+                </label>
+            </div>
+        }
+        .into_any();
+    }
+
     let save = ServerAction::<SaveWordDefinition>::new();
     let part_of_speech: NodeRef<html::Input> = NodeRef::new();
     let notes: NodeRef<html::Textarea> = NodeRef::new();
@@ -276,4 +324,5 @@ pub fn DictionaryDetailsEditor(
             }}
         </div>
     }
+    .into_any()
 }

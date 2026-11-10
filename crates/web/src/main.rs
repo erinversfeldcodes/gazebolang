@@ -226,6 +226,27 @@ struct CardFormFields {
     // immediately via its own server actions, not submitted with this
     // form), so `cards_update` always sees this empty.
     deck_ids: Vec<uuid::Uuid>,
+    // Only ever populated by NewCardPage (DictionaryDetailsEditor's
+    // `embedded` mode — see that component's own doc comment for why).
+    // EditCardPage's form keeps the standalone dictionary editor, which
+    // saves independently via its own server action, so `cards_update`
+    // always sees this empty too.
+    dict: DictFormFields,
+}
+
+/// `NewCardPage`'s embedded "Dictionary details" fields — see
+/// `DictionaryDetailsEditor`'s `embedded` prop. Grouped the same way
+/// `web::db::WordFields` groups the word's own optional metadata, since
+/// these map onto it directly in `cards_new`.
+#[cfg(feature = "ssr")]
+#[derive(Default)]
+struct DictFormFields {
+    part_of_speech: String,
+    notes: String,
+    english_translation: String,
+    example_target: String,
+    example_gloss: String,
+    linked_words_raw: String,
 }
 
 /// Pulls every field out of a card create/edit form submission: text
@@ -252,6 +273,7 @@ async fn parse_card_multipart(
         remove_video: false,
         remove_youtube: false,
         deck_ids: Vec::new(),
+        dict: DictFormFields::default(),
     };
 
     while let Some(field) = multipart
@@ -317,6 +339,22 @@ async fn parse_card_multipart(
                     );
                 }
             }
+            "dict_part_of_speech" => {
+                fields.dict.part_of_speech = field.text().await.unwrap_or_default();
+            }
+            "dict_notes" => fields.dict.notes = field.text().await.unwrap_or_default(),
+            "dict_english_translation" => {
+                fields.dict.english_translation = field.text().await.unwrap_or_default();
+            }
+            "dict_example_target" => {
+                fields.dict.example_target = field.text().await.unwrap_or_default();
+            }
+            "dict_example_gloss" => {
+                fields.dict.example_gloss = field.text().await.unwrap_or_default();
+            }
+            "dict_linked_words" => {
+                fields.dict.linked_words_raw = field.text().await.unwrap_or_default();
+            }
             _ => {}
         }
     }
@@ -330,6 +368,17 @@ fn parse_tags(raw: &str) -> Vec<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Trims `s`, mapping a blank result to `None` — the same blank-to-`None`
+/// rule `dictionary::save_word_definition` applies to each of its own
+/// optional fields, shared here rather than duplicated a third time (it
+/// used to be nested inside `importer_save_word_definition` alone; now
+/// `cards_new` needs it too).
+#[cfg(feature = "ssr")]
+fn non_empty_trimmed(s: &str) -> Option<String> {
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
 }
 
 /// Percent-encodes `s` for safe embedding as one query-string value in a
@@ -415,6 +464,45 @@ async fn cards_new(
         Err(e) => return error_redirect("/new", &e.to_string()),
     };
 
+    // Only written if the user actually filled in at least one field,
+    // matching the section's own "(optional)" labeling — an empty
+    // dictionary entry with nothing in it isn't worth creating for every
+    // single card made. Best-effort, same reasoning as the deck
+    // assignment below: the card itself already exists by this point, so
+    // a failure here shouldn't make the whole submission look like it
+    // failed.
+    let dict = &fields.dict;
+    let has_dict_details = !dict.part_of_speech.trim().is_empty()
+        || !dict.notes.trim().is_empty()
+        || !dict.english_translation.trim().is_empty()
+        || !dict.example_target.trim().is_empty()
+        || !dict.linked_words_raw.trim().is_empty();
+    if has_dict_details {
+        let examples = non_empty_trimmed(&dict.example_target)
+            .map(|t| vec![(t, non_empty_trimmed(&dict.example_gloss))])
+            .unwrap_or_default();
+        let linked = parse_tags(&dict.linked_words_raw);
+        if let Err(e) = web::db::upsert_word_definition(
+            &state.db_pool,
+            &fields.target_text,
+            user.id,
+            web::db::WordFields {
+                part_of_speech: non_empty_trimmed(&dict.part_of_speech).as_deref(),
+                notes: non_empty_trimmed(&dict.notes).as_deref(),
+                english_translation: non_empty_trimmed(&dict.english_translation).as_deref(),
+            },
+            &examples,
+            &linked,
+        )
+        .await
+        {
+            log::error!(
+                "failed to save dictionary details for new card {card_id} ({}): {e}",
+                fields.target_text
+            );
+        }
+    }
+
     // Best-effort, same as `upload_media_field` above: the card itself is
     // already created at this point, so a deck-membership failure here
     // (only plausible on a genuine DB/connectivity issue — `deck_id`s come
@@ -431,21 +519,29 @@ async fn cards_new(
 }
 
 /// One parsed-and-ready-to-create entry from the bulk-add page — a target
-/// word/phrase plus whichever image (uploaded file or search import) was
-/// attached to it. The English translation used to search for that image
+/// word/phrase plus its own card type and whichever media that type's
+/// fields produced. The English translation used to search for an image
 /// never reaches here at all — see `ImageSearchPicker`'s doc comment — so
 /// there's nothing to carry for it.
 #[cfg(feature = "ssr")]
 struct BulkDraftFields {
     target_text: String,
+    source_text: String,
+    card_type: String,
     image_url: Option<String>,
+    audio_url: Option<String>,
+    video_url: Option<String>,
+    youtube_url: Option<String>,
 }
 
 /// Parses `BulkAddPage`'s submission: one `<div>` per draft, each
-/// contributing its own `target_text_{i}`/`image_{i}`/`image_url_{i}`
+/// contributing its own `target_text_{i}`/`card_type_{i}`/`source_text_{i}`/
+/// `image_{i}`/`image_url_{i}`/`audio_{i}`/`video_{i}`/`youtube_url_{i}`
 /// fields (indexed rather than one of each, since this form carries an
-/// unbounded number of cards at once — see `cards_bulk`). Field order
-/// within the multipart body isn't assumed; a `BTreeMap` keyed by index
+/// unbounded number of cards at once — see `cards_bulk`) — the same set
+/// `parse_card_multipart` reads for a single card, just suffixed per draft
+/// (see `MediaAttachmentFields`'s `field_suffix`). Field order within the
+/// multipart body isn't assumed; a `BTreeMap` per field keyed by index
 /// collects everything first, then gets flattened once the whole body has
 /// been read.
 #[cfg(feature = "ssr")]
@@ -455,7 +551,17 @@ async fn parse_bulk_multipart(
 ) -> Result<Vec<BulkDraftFields>, (axum::http::StatusCode, String)> {
     let mut target_texts: std::collections::BTreeMap<usize, String> =
         std::collections::BTreeMap::new();
+    let mut source_texts: std::collections::BTreeMap<usize, String> =
+        std::collections::BTreeMap::new();
+    let mut card_types: std::collections::BTreeMap<usize, String> =
+        std::collections::BTreeMap::new();
     let mut image_urls: std::collections::BTreeMap<usize, String> =
+        std::collections::BTreeMap::new();
+    let mut audio_urls: std::collections::BTreeMap<usize, String> =
+        std::collections::BTreeMap::new();
+    let mut video_urls: std::collections::BTreeMap<usize, String> =
+        std::collections::BTreeMap::new();
+    let mut youtube_urls: std::collections::BTreeMap<usize, String> =
         std::collections::BTreeMap::new();
 
     while let Some(field) = multipart
@@ -466,21 +572,66 @@ async fn parse_bulk_multipart(
         let name = field.name().unwrap_or_default().to_string();
         // "image_url_" must be checked before "image_" — it's the more
         // specific prefix, and would otherwise also match the latter.
+        // "audio_"/"video_" have no such shorter sibling (unlike image,
+        // neither ever carries a second "chosen via search" hidden field).
         if let Some(idx) = name
             .strip_prefix("target_text_")
             .and_then(|s| s.parse().ok())
         {
             target_texts.insert(idx, field.text().await.unwrap_or_default());
+        } else if let Some(idx) = name
+            .strip_prefix("source_text_")
+            .and_then(|s| s.parse().ok())
+        {
+            source_texts.insert(idx, field.text().await.unwrap_or_default());
+        } else if let Some(idx) = name.strip_prefix("card_type_").and_then(|s| s.parse().ok()) {
+            let raw = field.text().await.unwrap_or_default();
+            if web::cards::CARD_TYPES
+                .iter()
+                .any(|(value, _)| *value == raw)
+            {
+                card_types.insert(idx, raw);
+            }
         } else if let Some(idx) = name.strip_prefix("image_url_").and_then(|s| s.parse().ok()) {
             let raw = field.text().await.unwrap_or_default();
             let trimmed = raw.trim();
             if !trimmed.is_empty() {
                 image_urls.insert(idx, trimmed.to_string());
             }
-        } else if let Some(idx) = name.strip_prefix("image_").and_then(|s| s.parse().ok())
-            && let Some(url) = upload_media_field(state, field, "image").await?
+        } else if let Some(idx) = name
+            .strip_prefix("youtube_url_")
+            .and_then(|s| s.parse().ok())
         {
-            image_urls.insert(idx, url);
+            let raw = field.text().await.unwrap_or_default();
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                let embed = youtube_embed_url(trimmed)
+                    .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
+                youtube_urls.insert(idx, embed);
+            }
+        } else if let Some(idx) = name.strip_prefix("image_").and_then(|s| s.parse().ok()) {
+            // Moved inside each branch's own body, not chained into the
+            // condition like the single-field arms above — `field` doesn't
+            // implement Copy, and with three sibling branches that can each
+            // move it, the borrow checker can't see them as mutually
+            // exclusive when the move sits in the shared if/else-if
+            // condition chain instead (confirmed live: it rejected this as
+            // a potential double-move across the image_/audio_/video_
+            // branches, despite "image_"'s own strip_prefix having already
+            // ruled the other two names out by this point).
+            if let Some(url) = upload_media_field(state, field, "image").await? {
+                image_urls.insert(idx, url);
+            }
+        } else if let Some(idx) = name.strip_prefix("audio_").and_then(|s| s.parse().ok()) {
+            if let Some(url) = upload_media_field(state, field, "audio").await? {
+                audio_urls.insert(idx, url);
+            }
+        // Fine to collapse, unlike its two siblings above: as the last
+        // branch in the chain, nothing after it also wants to move `field`.
+        } else if let Some(idx) = name.strip_prefix("video_").and_then(|s| s.parse().ok())
+            && let Some(url) = upload_media_field(state, field, "video").await?
+        {
+            video_urls.insert(idx, url);
         }
     }
 
@@ -490,7 +641,15 @@ async fn parse_bulk_multipart(
             let target_text = target_text.trim().to_string();
             (!target_text.is_empty()).then(|| BulkDraftFields {
                 target_text,
+                source_text: source_texts.get(&idx).cloned().unwrap_or_default(),
+                card_type: card_types
+                    .get(&idx)
+                    .cloned()
+                    .unwrap_or_else(|| "image_to_target".to_string()),
                 image_url: image_urls.get(&idx).cloned(),
+                audio_url: audio_urls.get(&idx).cloned(),
+                video_url: video_urls.get(&idx).cloned(),
+                youtube_url: youtube_urls.get(&idx).cloned(),
             })
         })
         .collect())
@@ -550,9 +709,9 @@ struct ImporterSaveWordDefinitionForm {
 /// `dictionary::save_word_definition` — see that fn's own doc comment
 /// for why. Field-level behavior (trimming, blank-to-`None`, the
 /// comma-separated linked-words list) mirrors the server-fn version
-/// exactly; `non_empty_trimmed` is duplicated rather than shared across
-/// the bin/lib boundary, the same way `parse_tags`/`parse_comma_list`
-/// already are for the same reason (see that fn's own comment).
+/// exactly, via this file's own `non_empty_trimmed`/`parse_tags` — kept
+/// as local equivalents rather than shared across the bin/lib boundary
+/// with `dictionary::non_empty_trimmed`/`parse_comma_list`.
 #[cfg(feature = "ssr")]
 async fn importer_save_word_definition(
     axum::extract::State(state): axum::extract::State<AppState>,
@@ -560,11 +719,6 @@ async fn importer_save_word_definition(
     axum::Form(form): axum::Form<ImporterSaveWordDefinitionForm>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-
-    fn non_empty_trimmed(s: &str) -> Option<String> {
-        let s = s.trim();
-        (!s.is_empty()).then(|| s.to_string())
-    }
 
     let Some(user) = web::auth::current_user(&state.db_pool, &cookies).await else {
         return axum::http::StatusCode::UNAUTHORIZED.into_response();
@@ -628,9 +782,14 @@ async fn cards_bulk(
             &state.db_pool,
             user.id,
             web::db::NewCard {
+                card_type: &draft.card_type,
                 image_url: draft.image_url.as_deref().unwrap_or(""),
+                audio_url: draft.audio_url.as_deref().unwrap_or(""),
+                video_url: draft.video_url.as_deref().unwrap_or(""),
+                youtube_url: draft.youtube_url.as_deref().unwrap_or(""),
                 target_text: &draft.target_text,
-                ..Default::default()
+                source_text: &draft.source_text,
+                two_way: false,
             },
             &[],
         )

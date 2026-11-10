@@ -144,51 +144,77 @@ fn ImageSearchPicker(
                 "Search images"
             </button>
             {move || search.pending().get().then(|| view! { <p>"Searching…"</p> })}
+            // Once an image is chosen, the stale results grid from whatever
+            // search produced it has nothing left to do — confirmed live it
+            // was staying mounted (search.value() only ever changes on a
+            // new search, not on a pick) and sitting there underneath the
+            // chosen-image preview. Hidden rather than cleared: "Remove"
+            // below un-chooses without forcing a re-search, and the same
+            // results reappear right where they were.
             {move || {
-                // Distinguishes "haven't searched yet" (None, show nothing)
-                // from "searched and every provider came back empty" (an
-                // Ok with no results) — without this, a search that
-                // genuinely found nothing looks identical to never having
-                // searched at all, with no signal that redoing it with
-                // different text might help.
-                search.value().get().and_then(|result| match result {
-                    Ok(results) if results.is_empty() => {
-                        Some(view! { <p>"No images found — try different search text."</p> }.into_any())
-                    }
-                    Ok(_) => None,
-                    Err(e) => Some(view! { <p>"Error: " {e.to_string()}</p> }.into_any()),
-                })
+                (chosen_image_url.get().is_none())
+                    .then(|| {
+                        view! {
+                            {move || {
+                                // Distinguishes "haven't searched yet" (None, show
+                                // nothing) from "searched and every provider came
+                                // back empty" (an Ok with no results) — without
+                                // this, a search that genuinely found nothing
+                                // looks identical to never having searched at
+                                // all, with no signal that redoing it with
+                                // different text might help.
+                                search
+                                    .value()
+                                    .get()
+                                    .and_then(|result| match result {
+                                        Ok(results) if results.is_empty() => {
+                                            Some(
+                                                view! {
+                                                    <p>"No images found — try different search text."</p>
+                                                }
+                                                    .into_any(),
+                                            )
+                                        }
+                                        Ok(_) => None,
+                                        Err(e) => {
+                                            Some(view! { <p>"Error: " {e.to_string()}</p> }.into_any())
+                                        }
+                                    })
+                            }}
+                            <div class="image-search-results">
+                                {move || {
+                                    let results: Vec<ImageSearchResult> = search
+                                        .value()
+                                        .get()
+                                        .and_then(Result::ok)
+                                        .unwrap_or_default();
+                                    results
+                                        .into_iter()
+                                        .map(|r| {
+                                            let provider = r.provider.clone();
+                                            let id = r.id.clone();
+                                            view! {
+                                                <img
+                                                    src=r.thumbnail_url
+                                                    alt=r.description
+                                                    class="image-search-thumb"
+                                                    data-provider=r.provider.clone()
+                                                    on:click=move |_| {
+                                                        import
+                                                            .dispatch(ImportCardImage {
+                                                                provider: provider.clone(),
+                                                                id: id.clone(),
+                                                            });
+                                                    }
+                                                />
+                                            }
+                                        })
+                                        .collect_view()
+                                }}
+                            </div>
+                        }
+                    })
             }}
-            <div class="image-search-results">
-                {move || {
-                    let results: Vec<ImageSearchResult> = search
-                        .value()
-                        .get()
-                        .and_then(Result::ok)
-                        .unwrap_or_default();
-                    results
-                        .into_iter()
-                        .map(|r| {
-                            let provider = r.provider.clone();
-                            let id = r.id.clone();
-                            view! {
-                                <img
-                                    src=r.thumbnail_url
-                                    alt=r.description
-                                    class="image-search-thumb"
-                                    data-provider=r.provider.clone()
-                                    on:click=move |_| {
-                                        import.dispatch(ImportCardImage {
-                                            provider: provider.clone(),
-                                            id: id.clone(),
-                                        });
-                                    }
-                                />
-                            }
-                        })
-                        .collect_view()
-                }}
-            </div>
             {move || import.pending().get().then(|| view! { <p>"Adding image…"</p> })}
             {move || {
                 import.value().get().and_then(Result::err).map(|e| {
@@ -209,13 +235,43 @@ fn ImageSearchPicker(
     }
 }
 
-/// The image/audio/video/YouTube attachment fields shared by `NewCardPage`
-/// and `EditCardPage` — previously hand-duplicated between the two with
-/// only label wording and the presence of "remove" checkboxes differing.
-/// `editing` switches between "Image file" (create) and "Replace image
-/// (optional)" (edit) wording for all four fields; the `has_*` flags gate
-/// each "Remove X" checkbox, since there's nothing to remove on a brand
-/// new card (NewCardPage never passes `true` for any of them).
+/// Which of `MediaAttachmentFields`' fields a given card type actually
+/// uses — `image_to_target`/`sound_to_written`/`image_to_audio` each want
+/// a specific, narrow subset; `All` is the fallback for a card type this
+/// component doesn't know about yet (or, on the edit form, a card that
+/// already has media set outside its nominal type's usual set — see
+/// `EditCardPage`'s own call site), rather than hiding fields that
+/// already hold real data with no other way left to manage them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MediaFields {
+    Image,
+    Audio,
+    ImageAndAudio,
+    All,
+}
+
+/// `card_type`'s nominal `MediaFields` — shared by `NewCardPage`/
+/// `BulkAddPage` (a brand new card only ever has the fields its chosen
+/// type actually uses). `EditCardPage` starts from this too, but widens
+/// it back to `All` when the card already has media outside that set —
+/// see its own call site.
+fn media_fields_for(card_type: &str) -> MediaFields {
+    match card_type {
+        "sound_to_written" => MediaFields::Audio,
+        "image_to_target" => MediaFields::Image,
+        "image_to_audio" => MediaFields::ImageAndAudio,
+        _ => MediaFields::All,
+    }
+}
+
+/// The image/audio/video/YouTube attachment fields shared by `NewCardPage`,
+/// `EditCardPage`, and `BulkAddPage` — previously hand-duplicated between
+/// the first two with only label wording and the presence of "remove"
+/// checkboxes differing. `editing` switches between "Image file" (create)
+/// and "Replace image (optional)" (edit) wording for all four fields; the
+/// `has_*` flags gate each "Remove X" checkbox, since there's nothing to
+/// remove on a brand new card (NewCardPage/BulkAddPage never pass `true`
+/// for any of them).
 #[component]
 fn MediaAttachmentFields(
     chosen_image_url: RwSignal<Option<String>>,
@@ -226,10 +282,18 @@ fn MediaAttachmentFields(
     #[prop(default = false)] has_audio: bool,
     #[prop(default = false)] has_video: bool,
     #[prop(default = false)] has_youtube: bool,
-    // `sound_to_written` cards are audio-only — nothing stops the image/
-    // video/YouTube inputs from also submitting a value, but there's no
-    // reason to show fields that type doesn't use.
-    #[prop(default = false)] audio_only: bool,
+    #[prop(default = MediaFields::All)] fields: MediaFields,
+    // Appended to every field name below ("image", "audio", "card_type",
+    // ...) — empty for NewCardPage/EditCardPage (one card per form, so
+    // plain names), `"_{idx}"` for BulkAddPage (many cards in one
+    // multipart submission, needing distinguishable field names per draft
+    // — see main.rs's parse_bulk_multipart).
+    #[prop(default = String::new())] field_suffix: String,
+    // Pre-fills ImageSearchPicker's own search field — see its
+    // `initial_query` doc comment for why (BulkAddPage already knows the
+    // English word from the pasted list; NewCardPage/EditCardPage have
+    // nothing to prefill it with).
+    #[prop(default = String::new())] search_query: String,
 ) -> impl IntoView {
     let image_label = if editing {
         "Replace image (optional)"
@@ -255,44 +319,89 @@ fn MediaAttachmentFields(
     let audio_fields = view! {
         <label>
             {audio_label}
-            <input type="file" name="audio" accept="audio/*" node_ref=audio_input />
+            <input
+                type="file"
+                name=format!("audio{field_suffix}")
+                accept="audio/*"
+                node_ref=audio_input
+            />
         </label>
         <RecordButton kind="audio" target_input=audio_input />
         {has_audio.then(|| view! {
-            <label><input type="checkbox" name="remove_audio" />"Remove audio"</label>
+            <label>
+                <input type="checkbox" name=format!("remove_audio{field_suffix}") />
+                "Remove audio"
+            </label>
         })}
     };
 
-    if audio_only {
+    if fields == MediaFields::Audio {
         return audio_fields.into_any();
     }
 
-    view! {
-        <label>{image_label} <input type="file" name="image" accept="image/*" /></label>
-        <ImageSearchPicker chosen_image_url=chosen_image_url />
-        {move || {
-            chosen_image_url.get().map(|url| view! {
-                <input type="hidden" name="image_url" value=url />
-            })
-        }}
+    let image_fields = view! {
+        <label>
+            {image_label}
+            <input type="file" name=format!("image{field_suffix}") accept="image/*" />
+        </label>
+        <ImageSearchPicker chosen_image_url=chosen_image_url initial_query=search_query />
+        {
+            let field_suffix = field_suffix.clone();
+            move || {
+                let field_suffix = field_suffix.clone();
+                chosen_image_url.get().map(|url| view! {
+                    <input type="hidden" name=format!("image_url{field_suffix}") value=url />
+                })
+            }
+        }
         {has_image.then(|| view! {
-            <label><input type="checkbox" name="remove_image" />"Remove image"</label>
+            <label>
+                <input type="checkbox" name=format!("remove_image{field_suffix}") />
+                "Remove image"
+            </label>
         })}
+    };
+
+    if fields == MediaFields::Image {
+        return image_fields.into_any();
+    }
+
+    if fields == MediaFields::ImageAndAudio {
+        return view! { {image_fields} {audio_fields} }.into_any();
+    }
+
+    view! {
+        {image_fields}
         {audio_fields}
         <label>
             {video_label}
-            <input type="file" name="video" accept="video/*" node_ref=video_input />
+            <input
+                type="file"
+                name=format!("video{field_suffix}")
+                accept="video/*"
+                node_ref=video_input
+            />
         </label>
         <RecordButton kind="video" target_input=video_input />
         {has_video.then(|| view! {
-            <label><input type="checkbox" name="remove_video" />"Remove video"</label>
+            <label>
+                <input type="checkbox" name=format!("remove_video{field_suffix}") />
+                "Remove video"
+            </label>
         })}
         <label>
             {youtube_label}
-            <input type="url" name="youtube_url" placeholder="https://www.youtube.com/watch?v=..." />
+            <input
+                type="url"
+                name=format!("youtube_url{field_suffix}")
+                placeholder="https://www.youtube.com/watch?v=..."
+            />
         </label>
         {has_youtube.then(|| view! {
-            <label><input type="checkbox" name="remove_youtube" />"Remove YouTube link"</label>
+            <label>
+                <input type="checkbox" name=format!("remove_youtube{field_suffix}") />
+                "Remove YouTube link"
+            </label>
         })}
     }
     .into_any()
@@ -647,14 +756,19 @@ fn CardListPage() -> impl IntoView {
 
     let tags = Resource::new(|| (), |()| list_tags());
     let decks = Resource::new(|| (), |()| list_decks());
+    let delete = ServerAction::<DeleteCard>::new();
     let cards = Resource::new(
-        move || (tag_filter.get(), deck_filter.get()),
-        |(tag, deck_id)| crate::cards::list_cards(tag, deck_id),
+        move || (tag_filter.get(), deck_filter.get(), delete.version().get()),
+        |(tag, deck_id, _)| crate::cards::list_cards(tag, deck_id),
     );
 
     view! {
         <h1>"Cards"</h1>
         <div class="card-filters">
+            // Previously only reachable via the nav bar's "Cards ▾" dropdown
+            // — confirmed live that was the only way in, one extra hop from
+            // the page you're already looking at the cards on.
+            <A href="/new" attr:class="card-filters-add">"Add a card"</A>
             <label>
                 "Filter by tag "
                 <select
@@ -744,8 +858,30 @@ fn CardListPage() -> impl IntoView {
                                                 <summary>"Reveal"</summary>
                                                 <span>{card.target_text}</span>
                                             </details>
-                                            " "
-                                            <A href=edit_href>"Edit"</A>
+                                            <div class="card-grid-actions">
+                                                <A href=edit_href>"Edit"</A>
+                                                // Deliberately a single click,
+                                                // no arm-then-confirm step —
+                                                // asked for directly, and
+                                                // matches this app's existing
+                                                // "acceptable for 4 trusted
+                                                // users" tolerance for low
+                                                // ceremony elsewhere (e.g.
+                                                // EditCardPage's own delete
+                                                // also dispatches immediately
+                                                // once armed; this just drops
+                                                // the arm step for the
+                                                // one-tap case this grid view
+                                                // is for).
+                                                <button
+                                                    type="button"
+                                                    on:click=move |_| {
+                                                        delete.dispatch(DeleteCard { card_id: card.id });
+                                                    }
+                                                >
+                                                    "Delete"
+                                                </button>
+                                            </div>
                                         </li>
                                     }
                                 })
@@ -772,6 +908,20 @@ fn NewCardPage() -> impl IntoView {
     let chosen_image_url: RwSignal<Option<String>> = RwSignal::new(None);
     let target_text_signal: RwSignal<String> = RwSignal::new(String::new());
     let card_type = RwSignal::new("image_to_target".to_string());
+    // Confirmed live: the "Dictionary details" section always started
+    // blank, even typing a word that already has a saved entry — e.g. a
+    // second card for an already-documented word (an audio-prompt card
+    // for "umfundi" after an image-prompt one already exists), where the
+    // definition should just already be there, not need retyping. Looked
+    // up once, on leaving the target_text field, rather than on every
+    // keystroke (unlike wiki_sidebar's search, a remount here would wipe
+    // out whatever the user had already started typing into the
+    // dictionary fields themselves) — word_looked_up gates it to that one
+    // shot, and word_lookup only ever moves None -> Some, so the
+    // CardDictionarySection below only remounts if a match is actually
+    // found.
+    let word_lookup: RwSignal<Option<WordDefinition>> = RwSignal::new(None);
+    let word_looked_up = RwSignal::new(false);
 
     view! {
         <h1>"Add a card"</h1>
@@ -793,6 +943,22 @@ fn NewCardPage() -> impl IntoView {
                                 type="text"
                                 name="target_text"
                                 on:input=move |ev| target_text_signal.set(event_target_value(&ev))
+                                on:blur=move |_| {
+                                    if word_looked_up.get_untracked() {
+                                        return;
+                                    }
+                                    let text = target_text_signal.get_untracked();
+                                    if text.trim().is_empty() {
+                                        return;
+                                    }
+                                    word_looked_up.set(true);
+                                    #[cfg(feature = "hydrate")]
+                                    wasm_bindgen_futures::spawn_local(async move {
+                                        if let Ok(Some(def)) = get_word_definition(text).await {
+                                            word_lookup.set(Some(def));
+                                        }
+                                    });
+                                }
                             />
                         </label>
                         <label>"Tags (comma separated)" <input type="text" name="tags" /></label>
@@ -823,7 +989,7 @@ fn NewCardPage() -> impl IntoView {
                                         chosen_image_url=chosen_image_url
                                         audio_input=audio_input
                                         video_input=video_input
-                                        audio_only=card_type.get() == "sound_to_written"
+                                        fields=media_fields_for(&card_type.get())
                                     />
                                 }
                                 .into_any()
@@ -833,6 +999,13 @@ fn NewCardPage() -> impl IntoView {
                             <input type="checkbox" name="two_way" />
                             "Two-way: also review back → front, scheduled independently"
                         </label>
+                        {move || view! {
+                            <CardDictionarySection
+                                target_text_signal=target_text_signal
+                                existing_definition=word_lookup.get()
+                                embedded=true
+                            />
+                        }}
                         // Unchecked by default — there's no existing
                         // membership to reflect for a card that doesn't
                         // exist yet. Chosen deck ids ride this same
@@ -869,7 +1042,6 @@ fn NewCardPage() -> impl IntoView {
                         </div>
                         <button type="submit">"Add"</button>
                     </Form>
-                    <DictionaryDetailsEditor target_text=target_text_signal.into() />
                     // No card_id exists until this form is submitted, so
                     // there's nothing a link control could attach to yet —
                     // this previews the three LINK_TYPES as inert pills
@@ -997,35 +1169,66 @@ fn BulkAddPage() -> impl IntoView {
                                 .into_iter()
                                 .map(|draft| {
                                     let chosen_image_url: RwSignal<Option<String>> = RwSignal::new(None);
+                                    let audio_input: NodeRef<html::Input> = NodeRef::new();
+                                    let video_input: NodeRef<html::Input> = NodeRef::new();
+                                    let card_type = RwSignal::new("image_to_target".to_string());
                                     let idx = draft.key;
+                                    let suffix = format!("_{idx}");
                                     view! {
-                                        <div class="bulk-draft">
+                                        // .card-section gives each draft the same
+                                        // bordered-box treatment NewCardPage's
+                                        // "Decks" block already uses — confirmed
+                                        // live that without it, a page of several
+                                        // drafts ran together into one
+                                        // undifferentiated wall of fields with no
+                                        // visual boundary between "this card" and
+                                        // "the next one".
+                                        <div class="card-section bulk-draft">
+                                            <p class="card-section-heading">
+                                                {draft.target_text.clone()} " (" {draft.english.clone()} ")"
+                                            </p>
                                             <input
                                                 type="hidden"
-                                                name=format!("target_text_{idx}")
+                                                name=format!("target_text{suffix}")
                                                 value=draft.target_text.clone()
                                             />
-                                            <p>{draft.target_text.clone()} " (" {draft.english.clone()} ")"</p>
                                             <label>
-                                                "Image file"
-                                                <input
-                                                    type="file"
-                                                    name=format!("image_{idx}")
-                                                    accept="image/*"
-                                                />
+                                                "Card type "
+                                                <select
+                                                    name=format!("card_type{suffix}")
+                                                    prop:value=move || card_type.get()
+                                                    on:change=move |ev| card_type.set(event_target_value(&ev))
+                                                >
+                                                    {CARD_TYPES.iter().map(|(value, label)| {
+                                                        view! { <option value=*value>{*label}</option> }
+                                                    }).collect_view()}
+                                                </select>
                                             </label>
-                                            <ImageSearchPicker
-                                                chosen_image_url=chosen_image_url
-                                                initial_query=draft.english
-                                            />
                                             {move || {
-                                                chosen_image_url.get().map(|url| view! {
-                                                    <input
-                                                        type="hidden"
-                                                        name=format!("image_url_{idx}")
-                                                        value=url
-                                                    />
-                                                })
+                                                if card_type.get() == "sentence_translation" {
+                                                    view! {
+                                                        <label>
+                                                            "Known-language sentence"
+                                                            <input
+                                                                type="text"
+                                                                name=format!("source_text{suffix}")
+                                                            />
+                                                        </label>
+                                                    }
+                                                        .into_any()
+                                                } else {
+                                                    view! {
+                                                        <MediaAttachmentFields
+                                                            chosen_image_url=chosen_image_url
+                                                            audio_input=audio_input
+                                                            video_input=video_input
+                                                            fields=media_fields_for(&card_type.get())
+                                                            field_suffix=suffix.clone()
+                                                            search_query=draft.english.clone()
+                                                        />
+                                                    }
+                                                        .into_any()
+                                                }
                                             }}
                                         </div>
                                     }
@@ -1050,6 +1253,7 @@ fn BulkAddPage() -> impl IntoView {
 /// `.review-card` block.
 #[component]
 fn CardPreviewHeader(
+    card_type: String,
     image_url: Option<String>,
     audio_url: Option<String>,
     video_url: Option<String>,
@@ -1062,12 +1266,24 @@ fn CardPreviewHeader(
     signed_in: bool,
 ) -> impl IntoView {
     let image_view = image_url.map(|url| view! { <img src=url alt="" /> });
+    // image_to_audio: audio is the answer, not the prompt — same
+    // prompt/reveal split ReviewPage's own card_type == "image_to_audio"
+    // branch uses, and for the same reason (showing it alongside the image
+    // up front would leak the answer before "Reveal"). Every other type
+    // shows audio immediately, alongside image/video/youtube, since it's
+    // part of *their* prompt.
     let audio_view = audio_url.map(|url| view! { <audio controls src=url></audio> });
+    let (prompt_audio, answer_audio) = if card_type == "image_to_audio" {
+        (None, audio_view)
+    } else {
+        (audio_view, None)
+    };
     let video_view = video_url.map(|url| view! { <video controls src=url></video> });
     let youtube_view = youtube_url.map(youtube_embed);
     let source_view = source_text.map(|text| view! { <p>{text}</p> });
     let tags_display = tags.join(", ");
     let info = view! {
+        {answer_audio}
         <div class="word-display"><ClickableWord text=target_text /></div>
         {(!tags.is_empty()).then(|| view! { <p>"Tags: " {tags_display}</p> })}
     };
@@ -1093,7 +1309,7 @@ fn CardPreviewHeader(
     view! {
         <div class="review-card">
             {image_view}
-            {audio_view}
+            {prompt_audio}
             {video_view}
             {youtube_view}
             {source_view}
@@ -1112,6 +1328,7 @@ fn CardPreviewHeader(
 fn CardDictionarySection(
     target_text_signal: RwSignal<String>,
     existing_definition: Option<WordDefinition>,
+    #[prop(default = false)] embedded: bool,
 ) -> impl IntoView {
     let first_example = existing_definition
         .as_ref()
@@ -1119,6 +1336,7 @@ fn CardDictionarySection(
     view! {
         <DictionaryDetailsEditor
             target_text=target_text_signal.into()
+            embedded=embedded
             part_of_speech_initial=existing_definition
                 .as_ref()
                 .and_then(|d| d.part_of_speech.clone())
@@ -1232,6 +1450,23 @@ fn CardEditForm(
                     }
                     .into_any()
                 } else {
+                    // Narrowed from the type's nominal MediaFields only
+                    // when nothing already set would end up hidden with no
+                    // other way left on this form to see or remove it —
+                    // e.g. a card that's (say) image_to_target but already
+                    // carries video/youtube from before this type existed.
+                    let card_type = card_type_signal.get();
+                    let nominal = media_fields_for(&card_type);
+                    let fields = match nominal {
+                        MediaFields::Audio if has_image || has_video || has_youtube => {
+                            MediaFields::All
+                        }
+                        MediaFields::Image if has_audio || has_video || has_youtube => {
+                            MediaFields::All
+                        }
+                        MediaFields::ImageAndAudio if has_video || has_youtube => MediaFields::All,
+                        other => other,
+                    };
                     view! {
                         <MediaAttachmentFields
                             editing=true
@@ -1242,7 +1477,7 @@ fn CardEditForm(
                             has_audio=has_audio
                             has_video=has_video
                             has_youtube=has_youtube
-                            audio_only=card_type_signal.get() == "sound_to_written"
+                            fields=fields
                         />
                     }
                     .into_any()
@@ -1714,6 +1949,7 @@ fn EditCardPage() -> impl IntoView {
                         // failure mode, see that doc comment for the history.
                         let preview = view! {
                             <CardPreviewHeader
+                                card_type=detail.card_type.clone()
                                 image_url=detail.image_url.clone()
                                 audio_url=detail.audio_url.clone()
                                 video_url=detail.video_url.clone()
@@ -3404,43 +3640,80 @@ fn ReviewPage() -> impl IntoView {
                             Some(card) => {
                                 let card_id = card.id;
                                 let direction = card.direction;
-                                // `sentence_translation` cards have no media at
-                                // all — the known-language sentence fills the
-                                // same prompt/answer slot a media_view would.
-                                let media_view = if card.card_type == "sentence_translation" {
-                                    view! { <p>{card.source_text.unwrap_or_default()}</p> }
-                                        .into_any()
-                                } else {
-                                    view! {
-                                        {card.image_url.map(|url| view! { <img src=url alt="" /> })}
-                                        {card.audio_url.map(|url| view! { <audio controls src=url></audio> })}
-                                        {card.video_url.map(|url| view! { <video controls src=url></video> })}
-                                        {card.youtube_url.map(youtube_embed)}
-                                    }
-                                    .into_any()
-                                };
-                                // Forward: media is the prompt, target_text the
-                                // answer. Reverse (two-way cards only): the same
-                                // card, but target_text is the prompt and media
-                                // is the answer — this slot is independently
-                                // scheduled from the forward one.
-                                let prompt_and_answer = match direction {
-                                    DirectionInput::Forward => view! {
-                                        {media_view}
-                                        <details>
-                                            <summary>"Reveal"</summary>
+                                // image_to_audio is the one type where the
+                                // generic media_view below would be wrong, not
+                                // just incomplete: it renders every set media
+                                // field together in whichever slot (prompt or
+                                // reveal) gets media_view whole, but here image
+                                // is specifically the prompt and audio is
+                                // specifically the (otherwise hidden) answer —
+                                // showing both together up front would leak the
+                                // answer before "Reveal". sentence_translation
+                                // has no media at all (source_text fills the
+                                // same slot media_view would), which the
+                                // generic path already does handle inline below.
+                                let prompt_and_answer = if card.card_type == "image_to_audio" {
+                                    let image = card.image_url.map(|url| view! { <img src=url alt="" /> });
+                                    let audio = card
+                                        .audio_url
+                                        .map(|url| view! { <audio controls src=url></audio> });
+                                    match direction {
+                                        DirectionInput::Forward => view! {
+                                            {image}
+                                            <details>
+                                                <summary>"Reveal"</summary>
+                                                {audio}
+                                                <div class="word-display"><ClickableWord text=card.target_text /></div>
+                                            </details>
+                                        }
+                                        .into_any(),
+                                        DirectionInput::Reverse => view! {
                                             <div class="word-display"><ClickableWord text=card.target_text /></div>
-                                        </details>
+                                            <details>
+                                                <summary>"Reveal"</summary>
+                                                {image}
+                                                {audio}
+                                            </details>
+                                        }
+                                        .into_any(),
                                     }
-                                    .into_any(),
-                                    DirectionInput::Reverse => view! {
-                                        <div class="word-display"><ClickableWord text=card.target_text /></div>
-                                        <details>
-                                            <summary>"Reveal"</summary>
+                                } else {
+                                    let media_view = if card.card_type == "sentence_translation" {
+                                        view! { <p>{card.source_text.unwrap_or_default()}</p> }
+                                            .into_any()
+                                    } else {
+                                        view! {
+                                            {card.image_url.map(|url| view! { <img src=url alt="" /> })}
+                                            {card.audio_url.map(|url| view! { <audio controls src=url></audio> })}
+                                            {card.video_url.map(|url| view! { <video controls src=url></video> })}
+                                            {card.youtube_url.map(youtube_embed)}
+                                        }
+                                        .into_any()
+                                    };
+                                    // Forward: media is the prompt, target_text
+                                    // the answer. Reverse (two-way cards only):
+                                    // the same card, but target_text is the
+                                    // prompt and media is the answer — this slot
+                                    // is independently scheduled from the
+                                    // forward one.
+                                    match direction {
+                                        DirectionInput::Forward => view! {
                                             {media_view}
-                                        </details>
+                                            <details>
+                                                <summary>"Reveal"</summary>
+                                                <div class="word-display"><ClickableWord text=card.target_text /></div>
+                                            </details>
+                                        }
+                                        .into_any(),
+                                        DirectionInput::Reverse => view! {
+                                            <div class="word-display"><ClickableWord text=card.target_text /></div>
+                                            <details>
+                                                <summary>"Reveal"</summary>
+                                                {media_view}
+                                            </details>
+                                        }
+                                        .into_any(),
                                     }
-                                    .into_any(),
                                 };
                                 view! {
                                     {counts}
