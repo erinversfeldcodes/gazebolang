@@ -5,6 +5,10 @@ async function createCardWithAudio(page: import("@playwright/test").Page, prefix
   const word = uniqueWord(prefix);
   await page.goto("/new");
   await page.getByLabel("Target-language word/phrase").fill(word);
+  // image_to_target (the default card type) no longer shows an audio
+  // field — see media-cards.spec.ts's "recording audio attaches..." test
+  // for why. "Audio → written" is the type that still offers it.
+  await page.getByLabel("Card type").selectOption("sound_to_written");
   await recordClip(page, "audio");
   await page.getByRole("button", { name: "Add" }).click();
   await expect(page).toHaveURL("/");

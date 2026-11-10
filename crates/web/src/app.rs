@@ -235,32 +235,35 @@ fn ImageSearchPicker(
     }
 }
 
-/// Which of `MediaAttachmentFields`' fields a given card type actually
-/// uses — `image_to_target`/`sound_to_written`/`image_to_audio` each want
-/// a specific, narrow subset; `All` is the fallback for a card type this
-/// component doesn't know about yet (or, on the edit form, a card that
-/// already has media set outside its nominal type's usual set — see
-/// `EditCardPage`'s own call site), rather than hiding fields that
-/// already hold real data with no other way left to manage them.
+/// Which of `MediaAttachmentFields`' image/audio fields a given card type
+/// actually uses — `image_to_target`/`sound_to_written`/`image_to_audio`
+/// each want a specific, narrow subset. Video and `YouTube` aren't part of
+/// this: they're supplementary media that can ride alongside *any* type
+/// (`ReviewPage`'s generic `media_view` already renders whichever of the
+/// four fields a card has, for every type except `image_to_audio`/
+/// `sentence_translation`), not something tied to one particular type the
+/// way image and audio are — confirmed live as a real regression, not
+/// just a test-script mismatch, when gating them the same way made
+/// video/`YouTube` unreachable from every card type's own create/edit
+/// form.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MediaFields {
     Image,
     Audio,
     ImageAndAudio,
-    All,
 }
 
 /// `card_type`'s nominal `MediaFields` — shared by `NewCardPage`/
-/// `BulkAddPage` (a brand new card only ever has the fields its chosen
-/// type actually uses). `EditCardPage` starts from this too, but widens
-/// it back to `All` when the card already has media outside that set —
-/// see its own call site.
+/// `BulkAddPage` (a brand new card only ever has the image/audio fields
+/// its chosen type actually uses, though video/YouTube are always
+/// offered regardless — see `MediaFields`'s own doc comment). `EditCardPage`
+/// starts from this too, but widens it to `ImageAndAudio` when the card
+/// already has the *other* one set — see its own call site.
 fn media_fields_for(card_type: &str) -> MediaFields {
     match card_type {
         "sound_to_written" => MediaFields::Audio,
         "image_to_target" => MediaFields::Image,
-        "image_to_audio" => MediaFields::ImageAndAudio,
-        _ => MediaFields::All,
+        _ => MediaFields::ImageAndAudio,
     }
 }
 
@@ -282,7 +285,7 @@ fn MediaAttachmentFields(
     #[prop(default = false)] has_audio: bool,
     #[prop(default = false)] has_video: bool,
     #[prop(default = false)] has_youtube: bool,
-    #[prop(default = MediaFields::All)] fields: MediaFields,
+    #[prop(default = MediaFields::ImageAndAudio)] fields: MediaFields,
     // Appended to every field name below ("image", "audio", "card_type",
     // ...) — empty for NewCardPage/EditCardPage (one card per form, so
     // plain names), `"_{idx}"` for BulkAddPage (many cards in one
@@ -335,10 +338,6 @@ fn MediaAttachmentFields(
         })}
     };
 
-    if fields == MediaFields::Audio {
-        return audio_fields.into_any();
-    }
-
     let image_fields = view! {
         <label>
             {image_label}
@@ -362,17 +361,14 @@ fn MediaAttachmentFields(
         })}
     };
 
-    if fields == MediaFields::Image {
-        return image_fields.into_any();
-    }
-
-    if fields == MediaFields::ImageAndAudio {
-        return view! { {image_fields} {audio_fields} }.into_any();
-    }
+    let image_or_audio_fields = match fields {
+        MediaFields::Image => image_fields.into_any(),
+        MediaFields::Audio => audio_fields.into_any(),
+        MediaFields::ImageAndAudio => view! { {image_fields} {audio_fields} }.into_any(),
+    };
 
     view! {
-        {image_fields}
-        {audio_fields}
+        {image_or_audio_fields}
         <label>
             {video_label}
             <input
@@ -1453,18 +1449,15 @@ fn CardEditForm(
                     // Narrowed from the type's nominal MediaFields only
                     // when nothing already set would end up hidden with no
                     // other way left on this form to see or remove it —
-                    // e.g. a card that's (say) image_to_target but already
-                    // carries video/youtube from before this type existed.
+                    // e.g. a card that's (say) sound_to_written but already
+                    // carries an image from before this type existed.
+                    // Video/youtube need no such check: MediaAttachmentFields
+                    // always offers them regardless of `fields`.
                     let card_type = card_type_signal.get();
                     let nominal = media_fields_for(&card_type);
                     let fields = match nominal {
-                        MediaFields::Audio if has_image || has_video || has_youtube => {
-                            MediaFields::All
-                        }
-                        MediaFields::Image if has_audio || has_video || has_youtube => {
-                            MediaFields::All
-                        }
-                        MediaFields::ImageAndAudio if has_video || has_youtube => MediaFields::All,
+                        MediaFields::Audio if has_image => MediaFields::ImageAndAudio,
+                        MediaFields::Image if has_audio => MediaFields::ImageAndAudio,
                         other => other,
                     };
                     view! {
