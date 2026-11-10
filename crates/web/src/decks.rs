@@ -37,13 +37,26 @@ pub async fn list_decks() -> Result<Vec<Deck>, ServerFnError> {
         .collect())
 }
 
+/// `group_by_tag`, when set, adds every card already carrying that tag to
+/// the new deck immediately — the alternative to building a deck up one
+/// card at a time via each card's own "assign to deck" controls. Grouping
+/// by anything other than a tag (card type, deck membership, date range,
+/// ...) isn't offered: tag is the one attribute `list_cards`/the card
+/// list's own filter already treat as a first-class grouping, so it's the
+/// one with an existing, known set of values to list here rather than a
+/// new ad-hoc query.
 #[server]
-pub async fn create_deck(name: String) -> Result<(), ServerFnError> {
+pub async fn create_deck(name: String, group_by_tag: Option<String>) -> Result<(), ServerFnError> {
     let user = require_user().await?;
     let state = expect_context::<crate::state::AppState>();
-    crate::db::create_deck(&state.db_pool, user.id, &name)
+    let deck_id = crate::db::create_deck(&state.db_pool, user.id, &name)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
+    if let Some(tag) = group_by_tag.filter(|t| !t.trim().is_empty()) {
+        crate::db::populate_deck_by_tag(&state.db_pool, deck_id, tag.trim())
+            .await
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+    }
     Ok(())
 }
 

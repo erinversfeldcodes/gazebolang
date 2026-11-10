@@ -2053,6 +2053,7 @@ fn DecksPage() -> impl IntoView {
     let create = ServerAction::<CreateDeck>::new();
     let rename = ServerAction::<RenameDeck>::new();
     let delete = ServerAction::<DeleteDeck>::new();
+    let tags = Resource::new(|| (), |()| list_tags());
     let decks = Resource::new(
         move || {
             (
@@ -2076,6 +2077,19 @@ fn DecksPage() -> impl IntoView {
                     view! {
                         <ActionForm action=create>
                             <label>"New deck name" <input type="text" name="name" /></label>
+                            <label>
+                                "Group by tag (optional)"
+                                <select name="group_by_tag">
+                                    <option value="">"Don't group — start empty"</option>
+                                    <Transition fallback=|| ()>
+                                        {move || Suspend::new(async move {
+                                            tags.await.unwrap_or_default().into_iter().map(|tag| {
+                                                view! { <option value=tag.clone()>{tag.clone()}</option> }
+                                            }).collect_view()
+                                        })}
+                                    </Transition>
+                                </select>
+                            </label>
                             <button type="submit">"Create"</button>
                         </ActionForm>
                         {move || {
