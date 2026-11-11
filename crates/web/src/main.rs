@@ -948,7 +948,13 @@ async fn main() {
     use leptos_axum::{LeptosRoutes, generate_route_list};
     use web::app::{App, shell};
 
-    env_logger::init();
+    // `env_logger::init()` with no explicit default shows `error` only when
+    // `RUST_LOG` isn't set — which drops every `warn!`/`info!` call this
+    // codebase uses to make third-party integration failures (Pixabay,
+    // Resend, S3/Tigris) debuggable from `fly logs`. `info` as the default
+    // (still overridable via RUST_LOG) keeps those visible without needing
+    // a separate Fly secret just to see them.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let conf = get_configuration(None).unwrap();
     let leptos_options = conf.leptos_options;

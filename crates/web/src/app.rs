@@ -35,7 +35,8 @@ use crate::wiki::save_page_revision;
 use crate::wiki_editor::WikiEditor;
 use leptos::html;
 use leptos::prelude::*;
-use leptos_meta::{MetaTags, Stylesheet, Title, provide_meta_context};
+// Deliberately not leptos_meta::{Stylesheet, Title, MetaTags,
+// provide_meta_context} — see shell()'s doc comment for why.
 use leptos_router::{
     StaticSegment,
     components::{A, Form, Redirect, Route, Router, Routes},
@@ -403,6 +404,22 @@ fn MediaAttachmentFields(
     .into_any()
 }
 
+// `<Stylesheet>`/`<Title>`/`<MetaTags/>` (leptos_meta) are deliberately not
+// used here, even though both tags are static and sit at an unconditional,
+// top-level position in App()'s view — confirmed live (gazebo.fly.dev
+// panicking on every /cards/:id hydration, "the framework expected a marker
+// node, but found this instead: nav") that leptos_meta 0.8.7 (on leptos
+// 0.8.22/tachys 0.2.19, the latest mutually-released 0.8.x line as of this
+// fix) doesn't leave a matching hydration marker in <body> for tags whose
+// actual rendered output is teleported into <head> — the client-side
+// hydration walker then consumes the Router's own first node (<nav>) trying
+// to satisfy that phantom expectation, and the whole page's event listeners
+// never finish attaching. WikiEditor already hit the same class of bug for
+// its own injected <script>/<link> and worked around it by never going
+// through leptos_meta at all (see its own doc comment) — this is that same
+// fix applied to the two tags App() itself declared. Both are static (never
+// change per route), so hardcoding them directly into this non-hydrated
+// shell is strictly equivalent and sidesteps the mechanism entirely.
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
         <!DOCTYPE html>
@@ -412,7 +429,8 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
                 <meta name="viewport" content="width=device-width, initial-scale=1"/>
                 <AutoReload options=options.clone() />
                 <HydrationScripts options/>
-                <MetaTags/>
+                <link id="leptos" rel="stylesheet" href="/pkg/web.css"/>
+                <title>"Gazebo"</title>
             </head>
             <body>
                 <App/>
@@ -423,13 +441,9 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 
 #[component]
 pub fn App() -> impl IntoView {
-    provide_meta_context();
     let auth = Resource::new(|| (), |()| current_user_name());
 
     view! {
-        <Stylesheet id="leptos" href="/pkg/web.css"/>
-        <Title text="Gazebo"/>
-
         <Router>
             <nav>
                 // Grouped by purpose rather than 9 flat links: content you

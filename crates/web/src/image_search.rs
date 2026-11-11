@@ -150,7 +150,10 @@ impl ImageSearch {
     pub async fn fetch_by_id(&self, provider: &str, id: &str) -> Result<(Vec<u8>, String), String> {
         let image_url = match provider {
             "pixabay" => self.pixabay_full_url(id).await?,
-            other => return Err(format!("unknown image provider: {other}")),
+            other => {
+                log::warn!("image fetch: unknown provider {other:?} (id {id})");
+                return Err(format!("unknown image provider: {other}"));
+            }
         };
 
         let response = self
@@ -158,6 +161,9 @@ impl ImageSearch {
             .get(&image_url)
             .send()
             .await
+            .inspect_err(|e| {
+                log::error!("image fetch: downloading from {provider} (id {id}) failed: {e}");
+            })
             .map_err(|e| e.to_string())?;
         let content_type = response
             .headers()
@@ -166,12 +172,25 @@ impl ImageSearch {
             .unwrap_or("application/octet-stream")
             .to_string();
         if !content_type.starts_with("image/") {
+            log::warn!(
+                "image fetch: {provider} (id {id}) returned content-type {content_type}, expected an image"
+            );
             return Err(format!(
                 "expected an image, got content-type {content_type}"
             ));
         }
-        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+        let bytes = response
+            .bytes()
+            .await
+            .inspect_err(|e| {
+                log::error!("image fetch: reading body from {provider} (id {id}) failed: {e}");
+            })
+            .map_err(|e| e.to_string())?;
         if bytes.len() > MAX_IMAGE_BYTES {
+            log::warn!(
+                "image fetch: {provider} (id {id}) returned {} bytes, over the {MAX_IMAGE_BYTES}-byte limit",
+                bytes.len()
+            );
             return Err(format!(
                 "image is larger than the {MAX_IMAGE_BYTES}-byte limit"
             ));
@@ -190,10 +209,10 @@ impl ImageSearch {
             large_image_url: String,
         }
 
-        let key = self
-            .pixabay_key
-            .as_ref()
-            .ok_or_else(|| "Pixabay isn't configured".to_string())?;
+        let Some(key) = self.pixabay_key.as_ref() else {
+            log::warn!("image fetch: pixabay requested (id {id}) but PIXABAY_API_KEY isn't set");
+            return Err("Pixabay isn't configured".to_string());
+        };
 
         let response: Response = self
             .client
@@ -201,18 +220,24 @@ impl ImageSearch {
             .query(&[("key", key.as_str()), ("id", id)])
             .send()
             .await
+            .inspect_err(|e| log::error!("image fetch: pixabay metadata request for id {id} failed: {e}"))
             .map_err(|e| e.to_string())?
             .error_for_status()
+            .inspect_err(|e| log::error!("image fetch: pixabay metadata request for id {id} returned an error status: {e}"))
             .map_err(|e| e.to_string())?
             .json()
             .await
+            .inspect_err(|e| log::error!("image fetch: pixabay metadata response for id {id} didn't parse: {e}"))
             .map_err(|e| e.to_string())?;
         response
             .hits
             .into_iter()
             .next()
             .map(|h| h.large_image_url)
-            .ok_or_else(|| "image not found".to_string())
+            .ok_or_else(|| {
+                log::warn!("image fetch: pixabay has no hit for id {id}");
+                "image not found".to_string()
+            })
     }
 }
 

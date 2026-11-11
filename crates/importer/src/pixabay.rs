@@ -18,7 +18,7 @@ struct PixabayHit {
 
 pub fn find_image_url(api_key: Option<&str>, query: &str) -> Option<String> {
     let api_key = api_key?;
-    let url = reqwest::Url::parse_with_params(
+    let url = match reqwest::Url::parse_with_params(
         "https://pixabay.com/api/",
         &[
             ("key", api_key),
@@ -26,13 +26,31 @@ pub fn find_image_url(api_key: Option<&str>, query: &str) -> Option<String> {
             ("image_type", "photo"),
             ("per_page", "3"), // Pixabay rejects per_page < 3
         ],
-    )
-    .ok()?;
-    let res = reqwest::blocking::get(url).ok()?;
+    ) {
+        Ok(url) => url,
+        Err(e) => {
+            println!(
+                "  pixabay search for \"{query}\" failed: couldn't build the request URL: {e}"
+            );
+            return None;
+        }
+    };
+    let res = match reqwest::blocking::get(url) {
+        Ok(res) => res,
+        Err(e) => {
+            println!("  pixabay search for \"{query}\" failed: {e}");
+            return None;
+        }
+    };
     if !res.status().is_success() {
         println!("  pixabay search for \"{query}\" failed: {}", res.status());
         return None;
     }
-    let body: PixabayResponse = res.json().ok()?;
-    body.hits.into_iter().next().map(|h| h.large_image_url)
+    match res.json::<PixabayResponse>() {
+        Ok(body) => body.hits.into_iter().next().map(|h| h.large_image_url),
+        Err(e) => {
+            println!("  pixabay search for \"{query}\" failed: couldn't parse the response: {e}");
+            None
+        }
+    }
 }

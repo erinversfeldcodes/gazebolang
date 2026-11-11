@@ -70,11 +70,12 @@ impl AppClient {
             .ok_or_else(|| "not logged in".to_string())
     }
 
-    pub fn create_cards(&self, cards: &[Card]) -> Result<(), String> {
+    pub fn create_cards(&self, cards: &[Card], card_type: &str) -> Result<(), String> {
         let cookie = self.cookie_header()?;
         let mut form = multipart::Form::new();
         for (i, card) in cards.iter().enumerate() {
             form = form.text(format!("target_text_{i}"), card.target_text.clone());
+            form = form.text(format!("card_type_{i}"), card_type.to_string());
             if let Some(image_url) = &card.image_url {
                 form = form.text(format!("image_url_{i}"), image_url.clone());
             }

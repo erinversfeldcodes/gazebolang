@@ -93,16 +93,20 @@ impl EmailSender {
                     }))
                     .send()
                     .await
+                    .inspect_err(|e| {
+                        log::error!("email: Resend request for {subject:?} to {to} failed: {e}");
+                    })
                     .map_err(|e| e.to_string())?;
 
                 if response.status().is_success() {
                     Ok(())
                 } else {
-                    Err(format!(
-                        "Resend returned {}: {}",
-                        response.status(),
-                        response.text().await.unwrap_or_default()
-                    ))
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    log::error!(
+                        "email: Resend returned {status} sending {subject:?} to {to}: {body}"
+                    );
+                    Err(format!("Resend returned {status}: {body}"))
                 }
             }
         }

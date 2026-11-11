@@ -48,15 +48,32 @@ impl Storage {
         // works with the default auto-detection.
         let path_style = std::env::var("S3_PATH_STYLE").is_ok_and(|v| v == "true");
 
-        let credentials = Credentials::new(access_key, secret_key).ok()?;
+        // Past this point every S3_* var the user intended to set is
+        // actually present, so any further failure is a real
+        // misconfiguration (bad credentials, bad endpoint) worth logging —
+        // unlike the `?`s above, which just mean storage wasn't configured
+        // at all, the normal/expected case in local dev.
+        let credentials = Credentials::new(access_key, secret_key)
+            .inspect_err(|e| {
+                log::error!("storage: S3_* vars are set but building credentials failed: {e}");
+            })
+            .ok()?;
         let mut builder = Client::builder(&endpoint)
+            .inspect_err(|e| {
+                log::error!("storage: S3_* vars are set but building the client failed: {e}");
+            })
             .ok()?
             .region(region)
             .auth(Auth::Static(credentials));
         if path_style {
             builder = builder.addressing_style(AddressingStyle::Path);
         }
-        let client = builder.build().ok()?;
+        let client = builder
+            .build()
+            .inspect_err(|e| {
+                log::error!("storage: S3_* vars are set but building the client failed: {e}");
+            })
+            .ok()?;
 
         Some(Self {
             client,
@@ -71,14 +88,17 @@ impl Storage {
         content_type: &str,
         bytes: &[u8],
     ) -> Result<String, String> {
+        let bucket = &self.bucket;
         self.client
             .objects()
-            .put(&self.bucket, key)
+            .put(bucket, key)
             .content_type(content_type)
+            .inspect_err(|e| log::error!("storage: upload to {bucket}/{key} failed: {e}"))
             .map_err(|e| e.to_string())?
             .body_bytes(bytes.to_vec())
             .send()
             .await
+            .inspect_err(|e| log::error!("storage: upload to {bucket}/{key} failed: {e}"))
             .map_err(|e| e.to_string())?;
         Ok(format!(
             "{}/{key}",

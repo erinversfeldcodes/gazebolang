@@ -47,8 +47,23 @@ pub fn run_create(config: &CreateConfig, cards_in_file: &Path) -> Result<(), Str
         );
     }
 
-    println!("creating {} card(s)...", cards.len());
-    client.create_cards(&cards)?;
+    println!("creating {} image card(s)...", cards.len());
+    client.create_cards(&cards, "image_to_target")?;
+
+    // A second, audio-less card per headword alongside its image card —
+    // same target_text, no media at all — so the word has somewhere to
+    // receive a real audio recording later (via EditCardPage) without
+    // that recording step blocking the bulk import, which can't record
+    // audio itself.
+    println!("creating {} placeholder audio card(s)...", cards.len());
+    let placeholders: Vec<Card> = cards
+        .iter()
+        .map(|card| Card {
+            target_text: card.target_text.clone(),
+            ..Card::default()
+        })
+        .collect();
+    client.create_cards(&placeholders, "sound_to_written")?;
 
     println!("saving dictionary details...");
     for card in &cards {

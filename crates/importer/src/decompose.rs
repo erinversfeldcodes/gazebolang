@@ -487,9 +487,10 @@ the headword itself, \"english\" stays the headword/phrase as normal; \
 never use target-language text as \"english\"), \"target_text\" \
 (the exact target-language \
 text for just this card — never paste in content for a different sense/\
-word), \"part_of_speech\" (a short abbreviation ONLY, e.g. \"n.\", \"v.\", \
-\"adj.\", \"adv.\" — never a definition, an example, or a full sentence; if \
-truly unknown use \"\"), \"notes\" (brief extra context if useful, else \
+word), \"part_of_speech\" (the full part-of-speech name ONLY, e.g. \"noun\", \
+\"verb\", \"adjective\", \"adverb\" — never an abbreviation, a definition, \
+an example, or a full sentence; if truly unknown use \"\"), \"notes\" (brief \
+extra context if useful, else \
 \"\"), \"example_target\" and \"example_gloss\" (if this card itself is \
 built from a worked example, else both \"\"), and \"image_query\" — this \
 field is REQUIRED and must never be empty: a short, concrete, \
