@@ -73,6 +73,32 @@ fn verify_password(password: &str, hash: &str) -> bool {
     }
 }
 
+/// Runs [`hash_password`] on a blocking-pool thread rather than inline on
+/// the async task — Argon2's whole point is to be slow, and every signup
+/// and password change pays that cost. Inline, it ties up a Tokio runtime
+/// thread for the duration; on the preview app's single-shared-vCPU Fly
+/// machine, concurrent signups/logins during the E2E suite could pile up
+/// behind each other badly enough to blow past even a generous test
+/// timeout.
+async fn hash_password_blocking(password: &str) -> Result<String, String> {
+    let password = password.to_string();
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// [`hash_password_blocking`]'s counterpart for [`verify_password`], paid
+/// on every login attempt. A panic in the blocking task (never expected)
+/// degrades to "didn't verify" rather than propagating, same as any other
+/// non-match here.
+async fn verify_password_blocking(password: &str, hash: &str) -> bool {
+    let password = password.to_string();
+    let hash = hash.to_string();
+    tokio::task::spawn_blocking(move || verify_password(&password, &hash))
+        .await
+        .unwrap_or(false)
+}
+
 /// A syntactically valid Argon2 hash with no corresponding real password,
 /// computed once per process and reused for every login attempt where the
 /// email doesn't match a user, or matches a user who has never set a
@@ -160,7 +186,7 @@ pub async fn sign_up(
         return Err("This app is limited to 4 users and is already full.".to_string());
     }
 
-    let password_hash = hash_password(password)?;
+    let password_hash = hash_password_blocking(password).await?;
 
     let user_id: Uuid = sqlx::query_scalar(
         "INSERT INTO users (email, name, password_hash) VALUES ($1, $2, $3) RETURNING id",
@@ -209,7 +235,7 @@ pub async fn log_in(pool: &PgPool, email: &str, password: &str) -> Result<String
         Some((_, None)) | None => (None, dummy_password_hash().to_string()),
     };
 
-    if !verify_password(password, &hash) {
+    if !verify_password_blocking(password, &hash).await {
         log::warn!("auth: failed login attempt for {email}");
         return Err(invalid());
     }
@@ -304,7 +330,7 @@ pub async fn confirm_password_reset(
         return Err("this password reset link has expired".to_string());
     }
 
-    let password_hash = hash_password(new_password)?;
+    let password_hash = hash_password_blocking(new_password).await?;
 
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
@@ -424,7 +450,7 @@ pub async fn sign_up_via_invite(
         return Err("This app is limited to 4 users and is already full.".to_string());
     }
 
-    let password_hash = hash_password(password)?;
+    let password_hash = hash_password_blocking(password).await?;
 
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     let user_id: Uuid = sqlx::query_scalar(
@@ -470,7 +496,7 @@ async fn verify_current_password(
         .flatten();
     let hash = hash.unwrap_or_else(|| dummy_password_hash().to_string());
 
-    if verify_password(password, &hash) {
+    if verify_password_blocking(password, &hash).await {
         Ok(())
     } else {
         Err("incorrect password".to_string())
@@ -536,7 +562,7 @@ pub async fn change_password(
 ) -> Result<(), String> {
     verify_current_password(pool, user_id, current_password).await?;
     validate_password(new_password)?;
-    let password_hash = hash_password(new_password)?;
+    let password_hash = hash_password_blocking(new_password).await?;
 
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
