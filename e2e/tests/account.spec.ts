@@ -38,7 +38,11 @@ async function signUpFreshAccount(
   await page.getByLabel("Password", { exact: true }).fill(password);
   await page.getByLabel("Confirm password").fill(password);
   await page.getByRole("button", { name: "Sign up" }).click();
-  await expect(page).toHaveURL("/");
+  // Default 5s is too tight here: auth.rs bounds Argon2 work to 2
+  // concurrent operations (to avoid OOMing the small preview app), so a
+  // burst of signups/logins across the suite can briefly queue behind
+  // each other — not a UI bug, the request is just still in flight.
+  await expect(page).toHaveURL("/", { timeout: 15_000 });
   return { email };
 }
 
@@ -131,11 +135,13 @@ test("changing your email with the right password updates it and future logins",
     await page.getByLabel("Email").fill(email);
     await page.getByLabel("Password").fill("correct-horse-battery");
     await page.getByRole("button", { name: "Sign in" }).click();
-    await expect(page.getByText("invalid email or password")).toBeVisible();
+    // Both logins below go through the same bounded Argon2 verify as
+    // signUpFreshAccount's sign-up — see its comment above.
+    await expect(page.getByText("invalid email or password")).toBeVisible({ timeout: 15_000 });
 
     await page.getByLabel("Email").fill(newEmail);
     await page.getByRole("button", { name: "Sign in" }).click();
-    await expect(page).toHaveURL("/");
+    await expect(page).toHaveURL("/", { timeout: 15_000 });
   } finally {
     // The account now lives under newEmail, not the original — delete
     // whichever one it actually ended up at.
@@ -201,17 +207,20 @@ test("changing your password logs you out and lets you sign in with the new one"
     // not a navigation this test script is racing against.
     await page.getByRole("button", { name: "Change password" }).click();
 
-    await expect(page).toHaveURL("/login?reset=success");
+    // This change, and both logins below, each go through the same
+    // bounded Argon2 verify/hash as signUpFreshAccount's sign-up — see
+    // its comment above.
+    await expect(page).toHaveURL("/login?reset=success", { timeout: 15_000 });
     await expect(page.getByText("Password updated")).toBeVisible();
 
     await page.getByLabel("Email").fill(email);
     await page.getByLabel("Password").fill("correct-horse-battery");
     await page.getByRole("button", { name: "Sign in" }).click();
-    await expect(page.getByText("invalid email or password")).toBeVisible();
+    await expect(page.getByText("invalid email or password")).toBeVisible({ timeout: 15_000 });
 
     await page.getByLabel("Password").fill("a-brand-new-password-99");
     await page.getByRole("button", { name: "Sign in" }).click();
-    await expect(page).toHaveURL("/");
+    await expect(page).toHaveURL("/", { timeout: 15_000 });
   } finally {
     await deleteTestUser(email);
   }

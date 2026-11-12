@@ -97,7 +97,12 @@ test("a full password reset lets you log in with the new password", async ({ pag
   await page.getByLabel("Password", { exact: true }).fill(originalPassword);
   await page.getByLabel("Confirm password").fill(originalPassword);
   await page.getByRole("button", { name: "Sign up" }).click();
-  await expect(page).toHaveURL("/");
+  // Default 5s is too tight here: auth.rs bounds Argon2 work to 2
+  // concurrent operations (to avoid OOMing the small preview app), so a
+  // burst of signups/logins across the suite can briefly queue behind
+  // each other — not a UI bug, the request is just still in flight. Same
+  // reasoning applies to every login/signup/reset round trip below.
+  await expect(page).toHaveURL("/", { timeout: 15_000 });
 
   try {
     await page.goto("/forgot-password");
@@ -112,18 +117,18 @@ test("a full password reset lets you log in with the new password", async ({ pag
     await page.getByLabel("New password", { exact: true }).fill(newPassword);
     await page.getByLabel("Confirm new password").fill(newPassword);
     await page.getByRole("button", { name: "Reset password" }).click();
-    await expect(page).toHaveURL("/login?reset=success");
+    await expect(page).toHaveURL("/login?reset=success", { timeout: 15_000 });
 
     // The old password no longer works…
     await page.getByLabel("Email").fill(email);
     await page.getByLabel("Password", { exact: true }).fill(originalPassword);
     await page.getByRole("button", { name: "Sign in" }).click();
-    await expect(page.getByText("invalid email or password")).toBeVisible();
+    await expect(page.getByText("invalid email or password")).toBeVisible({ timeout: 15_000 });
 
     // …but the new one does.
     await page.getByLabel("Password", { exact: true }).fill(newPassword);
     await page.getByRole("button", { name: "Sign in" }).click();
-    await expect(page).toHaveURL("/");
+    await expect(page).toHaveURL("/", { timeout: 15_000 });
   } finally {
     await deleteTestUser(email);
   }
