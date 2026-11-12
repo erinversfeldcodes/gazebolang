@@ -39,7 +39,13 @@ test("creating an invite and signing up through it creates a working account", a
       await signupPage.getByLabel("Password", { exact: true }).fill("a-friends-password-99");
       await signupPage.getByLabel("Confirm password").fill("a-friends-password-99");
       await signupPage.getByRole("button", { name: "Sign up" }).click();
-      await expect(signupPage).toHaveURL("/");
+      // Default 5s expect timeout is too tight for this specific
+      // assertion: by the time this test runs, dozens of other specs have
+      // already loaded the shared preview app and Neon branch, and the
+      // password hash + insert this round trip does can occasionally miss
+      // that window under contention — not a UI bug (no error renders;
+      // the request is just still in flight).
+      await expect(signupPage).toHaveURL("/", { timeout: 15_000 });
 
       // Signed in as the brand-new account, not left anonymous — and
       // bound to the invite's own email, never whatever the form itself
