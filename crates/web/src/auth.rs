@@ -8,8 +8,9 @@ use password_hash::rand_core::OsRng;
 use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use rand::RngExt;
 use sqlx::PgPool;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use time::{Duration, OffsetDateTime};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 /// Hard cap on signups, matching the 4-friend trust model this app is built
@@ -73,30 +74,53 @@ fn verify_password(password: &str, hash: &str) -> bool {
     }
 }
 
-/// Runs [`hash_password`] on a blocking-pool thread rather than inline on
-/// the async task — Argon2's whole point is to be slow, and every signup
-/// and password change pays that cost. Inline, it ties up a Tokio runtime
-/// thread for the duration; on the preview app's single-shared-vCPU Fly
-/// machine, concurrent signups/logins during the E2E suite could pile up
-/// behind each other badly enough to blow past even a generous test
-/// timeout.
+/// Bounds concurrent Argon2 work to a small, fixed number of
+/// blocking-pool threads, mirroring `thestacks`'s
+/// `Stacks.Accounts.ArgonPool` (a 2-worker `NimblePool` with the same
+/// 10s checkout timeout) — adapted to Tokio, a semaphore gates entry to
+/// `spawn_blocking` instead of relying on its own default pool (up to
+/// 512 threads), which is effectively unbounded for this app's traffic.
+/// An earlier version of this fix used bare `spawn_blocking` with no
+/// cap: a burst of concurrent signups/logins during the E2E suite each
+/// spun up their own ~2MB-stack blocking thread at once, which OOM-killed
+/// the preview app's 256MB Fly machine. Like `ArgonPool.run`, a busy
+/// checkout surfaces as its own distinct error rather than being folded
+/// into "wrong password" — this is a different failure, and the two
+/// shouldn't be told apart only by someone reading the login UI's text.
+static ARGON2_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(2));
+const ARGON2_CHECKOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Runs `f` on a blocking-pool thread, but only after acquiring one of
+/// [`ARGON2_PERMITS`]'s slots — never more than 2 Argon2 operations run
+/// concurrently, however many requests arrive at once.
+async fn run_argon2_bounded<F, T>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let _permit = tokio::time::timeout(ARGON2_CHECKOUT_TIMEOUT, ARGON2_PERMITS.acquire())
+        .await
+        .map_err(|_| "too many password checks in progress — try again in a moment".to_string())?
+        .expect("ARGON2_PERMITS is never closed");
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Runs [`hash_password`] through [`run_argon2_bounded`] rather than
+/// inline on the async task — Argon2's whole point is to be slow, and
+/// every signup and password change pays that cost.
 async fn hash_password_blocking(password: &str) -> Result<String, String> {
     let password = password.to_string();
-    tokio::task::spawn_blocking(move || hash_password(&password))
-        .await
-        .map_err(|e| e.to_string())?
+    run_argon2_bounded(move || hash_password(&password)).await?
 }
 
 /// [`hash_password_blocking`]'s counterpart for [`verify_password`], paid
-/// on every login attempt. A panic in the blocking task (never expected)
-/// degrades to "didn't verify" rather than propagating, same as any other
-/// non-match here.
-async fn verify_password_blocking(password: &str, hash: &str) -> bool {
+/// on every login attempt.
+async fn verify_password_blocking(password: &str, hash: &str) -> Result<bool, String> {
     let password = password.to_string();
     let hash = hash.to_string();
-    tokio::task::spawn_blocking(move || verify_password(&password, &hash))
-        .await
-        .unwrap_or(false)
+    run_argon2_bounded(move || verify_password(&password, &hash)).await
 }
 
 /// A syntactically valid Argon2 hash with no corresponding real password,
@@ -235,7 +259,7 @@ pub async fn log_in(pool: &PgPool, email: &str, password: &str) -> Result<String
         Some((_, None)) | None => (None, dummy_password_hash().to_string()),
     };
 
-    if !verify_password_blocking(password, &hash).await {
+    if !verify_password_blocking(password, &hash).await? {
         log::warn!("auth: failed login attempt for {email}");
         return Err(invalid());
     }
@@ -496,7 +520,7 @@ async fn verify_current_password(
         .flatten();
     let hash = hash.unwrap_or_else(|| dummy_password_hash().to_string());
 
-    if verify_password_blocking(password, &hash).await {
+    if verify_password_blocking(password, &hash).await? {
         Ok(())
     } else {
         Err("incorrect password".to_string())
