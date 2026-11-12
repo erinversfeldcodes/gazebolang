@@ -921,8 +921,26 @@ async fn connect_with_retry(database_url: &str) -> sqlx::PgPool {
         // queue (not error) when the pool's exhausted, which is exactly
         // what a Playwright run against the preview stack surfaced as a
         // slow-but-silent request rather than a crash.
+        //
+        // `min_connections` defaults to 0 — an idle pool holds nothing
+        // and dials every connection cold the instant a burst (the full
+        // E2E suite, 2 Playwright workers) arrives, at the exact moment
+        // a Neon preview branch sitting at its autoscaling floor is
+        // least able to service fresh connection setups quickly. A
+        // handful of pre-warmed connections takes the edge off that
+        // first wave; sqlx reopens them automatically if idle/lifetime
+        // reaping ever drops the pool below this floor.
+        //
+        // `acquire_timeout` is left at sqlx's own default (30s) rather
+        // than shortened — it already comfortably exceeds Neon's own
+        // documented "at least 10-15s" recommended client timeout for
+        // absorbing a brief restart/scale-up, so this just makes that
+        // existing generosity explicit instead of relying on an unstated
+        // library default a future reader might assume is much smaller.
         match sqlx::postgres::PgPoolOptions::new()
             .max_connections(20)
+            .min_connections(4)
+            .acquire_timeout(std::time::Duration::from_secs(30))
             .connect(database_url)
             .await
         {
