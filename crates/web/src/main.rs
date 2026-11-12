@@ -911,40 +911,50 @@ async fn auth_logout(
 #[cfg(feature = "ssr")]
 async fn connect_with_retry(database_url: &str) -> sqlx::PgPool {
     const MAX_ATTEMPTS: u32 = 6;
+    // A single EditCardPage load alone fires 4 concurrent resources
+    // (auth, card, decks, pages), each needing its own pooled
+    // connection at once — 5 total leaves next to no headroom for a
+    // second concurrent visitor on this 4-user app, and connections
+    // queue (not error) when the pool's exhausted, which is exactly
+    // what a Playwright run against the preview stack surfaced as a
+    // slow-but-silent request rather than a crash.
+    //
+    // `min_connections` defaults to 0 — an idle pool holds nothing and
+    // dials every connection cold the instant a burst (the full E2E
+    // suite, 2 Playwright workers) arrives. `connect_lazy` (rather than
+    // the eager `connect` this used to call) is what makes pre-warming
+    // those 4 connections actually safe: it returns the pool immediately
+    // — it only parses the URL, it doesn't dial — and lets sqlx's own
+    // background idle-reaper task establish `min_connections` over time.
+    // The eager form blocks app startup on ALL `min_connections`
+    // succeeding, one at a time, each with its own internal retry, all
+    // inside a single `acquire_timeout` window — against Neon's
+    // documented flaky post-wake-up behavior (see this function's own
+    // comment below), that turned "boot needs one connection to
+    // succeed" into "boot needs four, serially, in the same budget,"
+    // which a live failing preview deploy confirmed could blow the
+    // app's own readiness far past what it took before this existed.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(20)
+        .min_connections(4)
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .connect_lazy(database_url)
+        .unwrap_or_else(|err| panic!("malformed DATABASE_URL: {err}"));
+
     let mut attempt = 0;
     loop {
         attempt += 1;
-        // A single EditCardPage load alone fires 4 concurrent resources
-        // (auth, card, decks, pages), each needing its own pooled
-        // connection at once — 5 total leaves next to no headroom for a
-        // second concurrent visitor on this 4-user app, and connections
-        // queue (not error) when the pool's exhausted, which is exactly
-        // what a Playwright run against the preview stack surfaced as a
-        // slow-but-silent request rather than a crash.
-        //
-        // `min_connections` defaults to 0 — an idle pool holds nothing
-        // and dials every connection cold the instant a burst (the full
-        // E2E suite, 2 Playwright workers) arrives, at the exact moment
-        // a Neon preview branch sitting at its autoscaling floor is
-        // least able to service fresh connection setups quickly. A
-        // handful of pre-warmed connections takes the edge off that
-        // first wave; sqlx reopens them automatically if idle/lifetime
-        // reaping ever drops the pool below this floor.
-        //
-        // `acquire_timeout` is left at sqlx's own default (30s) rather
-        // than shortened — it already comfortably exceeds Neon's own
-        // documented "at least 10-15s" recommended client timeout for
-        // absorbing a brief restart/scale-up, so this just makes that
-        // existing generosity explicit instead of relying on an unstated
-        // library default a future reader might assume is much smaller.
-        match sqlx::postgres::PgPoolOptions::new()
-            .max_connections(20)
-            .min_connections(4)
-            .acquire_timeout(std::time::Duration::from_secs(30))
-            .connect(database_url)
-            .await
-        {
-            Ok(pool) => return pool,
+        // One bounded acquire proves the URL/credentials are actually
+        // correct and the database is reachable — the same thing the
+        // old eager `connect()` validated up front, just without also
+        // waiting on `min_connections` to do it (see this function's own
+        // leading comment for why retrying this matters against Neon
+        // specifically).
+        match pool.acquire().await {
+            Ok(conn) => {
+                drop(conn);
+                return pool;
+            }
             Err(err) if attempt < MAX_ATTEMPTS => {
                 log::warn!(
                     "database connection attempt {attempt}/{MAX_ATTEMPTS} failed, retrying: {err}"
