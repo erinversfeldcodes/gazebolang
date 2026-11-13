@@ -225,7 +225,18 @@ jobs:
           # `--vm-memory 1024`/baseline `cpus = 2` pattern (scripts/deploy-
           # stack.sh) rather than bumping prod's own spec, which doesn't show
           # this symptom.
+          #
+          # Separately: cpu=2 alone fixed the CPU-throttle cascade (see
+          # above) but a second run still hit a real OOM kill at ~164MB
+          # RSS — the same peak (within 0.2%) as an earlier, pre-cpu=2
+          # incident, two data points landing on nearly the same number
+          # rather than random variance. default's 256MB genuinely has
+          # "next to no headroom" (main.rs's own pre-existing comment,
+          # predating this memory bump) even with Argon2 already bounded
+          # to 1 concurrent op. Doubling to 512MB, same ratio thestacks
+          # uses for its own preview-only memory override.
           cpu: "2"
+          memory: "512"
           secrets: >
             DATABASE_URL=postgresql://neondb_owner:${{ steps.dbpass.outputs.password }}@${{ needs.neon-branch.outputs.db_host_pooled }}/neondb?sslmode=require
             PIXABAY_API_KEY=${{ secrets.PIXABAY_API_KEY }}
