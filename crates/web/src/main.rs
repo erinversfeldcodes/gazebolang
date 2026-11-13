@@ -755,6 +755,29 @@ async fn importer_save_word_definition(
     }
 }
 
+/// Lists every card whose image still points straight at Pixabay's own
+/// hotlink host — see `db::BrokenImageCardRow`'s own doc comment — for the
+/// importer's one-off `backfill-images` command to re-host. A plain GET,
+/// same session-cookie auth as `importer_save_word_definition`; no form to
+/// parse, so there's no matching `importer_login`-style request struct.
+#[cfg(feature = "ssr")]
+async fn importer_cards_with_broken_images(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    cookies: tower_cookies::Cookies,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if web::auth::current_user(&state.db_pool, &cookies)
+        .await
+        .is_none()
+    {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    }
+    match web::db::cards_with_broken_external_image(&state.db_pool).await {
+        Ok(rows) => axum::Json(rows).into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 /// Creates every draft from `BulkAddPage` in one submission. Stops at the
 /// first failure — same bail-on-first-error semantics `cards_new` already
 /// uses — rather than inventing partial-success UX for what should be a
@@ -1026,6 +1049,10 @@ async fn main() {
         .route(
             "/api/importer/save-word-definition",
             axum::routing::post(importer_save_word_definition),
+        )
+        .route(
+            "/api/importer/cards-with-broken-images",
+            axum::routing::get(importer_cards_with_broken_images),
         )
         .route("/cards/new", axum::routing::post(cards_new))
         .route("/cards/bulk", axum::routing::post(cards_bulk))

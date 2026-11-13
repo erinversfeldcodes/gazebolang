@@ -8,8 +8,8 @@ use crate::account::{
     current_user_name, user_stats,
 };
 use crate::cards::{
-    AddCardLink, CARD_TYPES, CardLink, DeleteCard, DirectionInput, GradeCard, GradeInput,
-    ImageSearchResult, ImportCardImage, LINK_TYPES, RemoveCardLink, ReviewOrderInput,
+    AddCardLink, CARD_TYPES, CARDS_PAGE_SIZE, CardLink, DeleteCard, DirectionInput, GradeCard,
+    GradeInput, ImageSearchResult, ImportCardImage, LINK_TYPES, RemoveCardLink, ReviewOrderInput,
     SearchCardImages, get_card, list_tags, review_queue, search_cards,
 };
 use crate::decks::{
@@ -763,14 +763,35 @@ fn CardListPage() -> impl IntoView {
             .get("deck")
             .and_then(|id| Uuid::parse_str(&id).ok()),
     );
+    let page = RwSignal::new(0_i64);
 
     let tags = Resource::new(|| (), |()| list_tags());
     let decks = Resource::new(|| (), |()| list_decks());
     let delete = ServerAction::<DeleteCard>::new();
     let cards = Resource::new(
-        move || (tag_filter.get(), deck_filter.get(), delete.version().get()),
-        |(tag, deck_id, _)| crate::cards::list_cards(tag, deck_id),
+        move || {
+            (
+                tag_filter.get(),
+                deck_filter.get(),
+                page.get(),
+                delete.version().get(),
+            )
+        },
+        |(tag, deck_id, page, _)| crate::cards::list_cards(tag, deck_id, page),
     );
+
+    // A delete can empty out the last page (e.g. the one card left on page
+    // 3 just got deleted) — step back a page rather than show a "no cards"
+    // message the user could only escape by editing the URL or re-opening
+    // a filter dropdown.
+    Effect::new(move |_| {
+        if let Some(Ok(result)) = cards.get()
+            && result.cards.is_empty()
+            && page.get_untracked() > 0
+        {
+            page.update(|p| *p -= 1);
+        }
+    });
 
     view! {
         <h1>"Cards"</h1>
@@ -786,6 +807,7 @@ fn CardListPage() -> impl IntoView {
                     on:change=move |ev| {
                         let value = event_target_value(&ev);
                         tag_filter.set(if value.is_empty() { None } else { Some(value) });
+                        page.set(0);
                     }
                 >
                     <option value="">"All tags"</option>
@@ -808,6 +830,7 @@ fn CardListPage() -> impl IntoView {
                     on:change=move |ev| {
                         let value = event_target_value(&ev);
                         deck_filter.set(Uuid::parse_str(&value).ok());
+                        page.set(0);
                     }
                 >
                     <option value="">"All decks"</option>
@@ -824,7 +847,7 @@ fn CardListPage() -> impl IntoView {
         <Transition fallback=|| view! { <p>"Loading…"</p> }>
             {move || Suspend::new(async move {
                 match cards.await {
-                    Ok(cards) if cards.is_empty() => {
+                    Ok(result) if result.cards.is_empty() => {
                         // Distinguish "nothing matches this filter" from
                         // "you have zero cards at all" — only the latter
                         // gets a call to action, since a narrow filter was
@@ -840,9 +863,14 @@ fn CardListPage() -> impl IntoView {
                             view! { <p>"No cards match these filters."</p> }.into_any()
                         }
                     }
-                    Ok(cards) => view! {
+                    Ok(result) => {
+                        let total = result.total;
+                        let current_page = page.get_untracked();
+                        let total_pages = ((total + CARDS_PAGE_SIZE - 1) / CARDS_PAGE_SIZE).max(1);
+                        let has_more = (current_page + 1) * CARDS_PAGE_SIZE < total;
+                        view! {
                         <ul class="card-grid">
-                            {cards
+                            {result.cards
                                 .into_iter()
                                 .map(|card| {
                                     let edit_href = format!("/cards/{}", card.id);
@@ -897,8 +925,28 @@ fn CardListPage() -> impl IntoView {
                                 })
                                 .collect_view()}
                         </ul>
+                        {(total_pages > 1).then(|| view! {
+                            <div class="card-pager">
+                                <button
+                                    type="button"
+                                    disabled=current_page == 0
+                                    on:click=move |_| page.update(|p| *p -= 1)
+                                >
+                                    "Previous"
+                                </button>
+                                <span>{format!("Page {} of {total_pages}", current_page + 1)}</span>
+                                <button
+                                    type="button"
+                                    disabled=!has_more
+                                    on:click=move |_| page.update(|p| *p += 1)
+                                >
+                                    "Next"
+                                </button>
+                            </div>
+                        })}
                     }
-                    .into_any(),
+                    .into_any()
+                    }
                     Err(e) => view! { <p>"Error loading cards: " {e.to_string()}</p> }.into_any(),
                 }
             })}

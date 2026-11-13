@@ -180,11 +180,18 @@ pub async fn list_cards(
     pool: &PgPool,
     tag: Option<&str>,
     deck_id: Option<Uuid>,
+    limit: i64,
+    offset: i64,
 ) -> sqlx::Result<Vec<CardRow>> {
     match (tag, deck_id) {
         (None, None) => {
-            let sql = format!("SELECT {CARD_COLUMNS} FROM cards c ORDER BY c.created_at DESC");
+            let sql = format!(
+                "SELECT {CARD_COLUMNS} FROM cards c \
+                 ORDER BY c.created_at DESC LIMIT $1 OFFSET $2"
+            );
             sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                .bind(limit)
+                .bind(offset)
                 .fetch_all(pool)
                 .await
         }
@@ -192,10 +199,12 @@ pub async fn list_cards(
             let sql = format!(
                 "SELECT {CARD_COLUMNS} FROM cards c \
                  JOIN card_tags t ON t.card_id = c.id AND t.tag = $1 \
-                 ORDER BY c.created_at DESC"
+                 ORDER BY c.created_at DESC LIMIT $2 OFFSET $3"
             );
             sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(tag)
+                .bind(limit)
+                .bind(offset)
                 .fetch_all(pool)
                 .await
         }
@@ -203,10 +212,12 @@ pub async fn list_cards(
             let sql = format!(
                 "SELECT {CARD_COLUMNS} FROM cards c \
                  JOIN deck_cards dc ON dc.card_id = c.id AND dc.deck_id = $1 \
-                 ORDER BY c.created_at DESC"
+                 ORDER BY c.created_at DESC LIMIT $2 OFFSET $3"
             );
             sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(deck_id)
+                .bind(limit)
+                .bind(offset)
                 .fetch_all(pool)
                 .await
         }
@@ -215,13 +226,62 @@ pub async fn list_cards(
                 "SELECT {CARD_COLUMNS} FROM cards c \
                  JOIN card_tags t ON t.card_id = c.id AND t.tag = $1 \
                  JOIN deck_cards dc ON dc.card_id = c.id AND dc.deck_id = $2 \
-                 ORDER BY c.created_at DESC"
+                 ORDER BY c.created_at DESC LIMIT $3 OFFSET $4"
             );
             sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(tag)
                 .bind(deck_id)
+                .bind(limit)
+                .bind(offset)
                 .fetch_all(pool)
                 .await
+        }
+    }
+}
+
+/// Total rows `list_cards` would return for the same filter, ignoring its
+/// `limit`/`offset` — `CardListPage` needs this to know whether a "Next"
+/// page actually exists and to show "page X of Y", neither of which is
+/// derivable from one already-paginated page of rows.
+pub async fn count_cards(
+    pool: &PgPool,
+    tag: Option<&str>,
+    deck_id: Option<Uuid>,
+) -> sqlx::Result<i64> {
+    match (tag, deck_id) {
+        (None, None) => {
+            sqlx::query_scalar("SELECT count(*) FROM cards")
+                .fetch_one(pool)
+                .await
+        }
+        (Some(tag), None) => {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM cards c \
+                 JOIN card_tags t ON t.card_id = c.id AND t.tag = $1",
+            )
+            .bind(tag)
+            .fetch_one(pool)
+            .await
+        }
+        (None, Some(deck_id)) => {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM cards c \
+                 JOIN deck_cards dc ON dc.card_id = c.id AND dc.deck_id = $1",
+            )
+            .bind(deck_id)
+            .fetch_one(pool)
+            .await
+        }
+        (Some(tag), Some(deck_id)) => {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM cards c \
+                 JOIN card_tags t ON t.card_id = c.id AND t.tag = $1 \
+                 JOIN deck_cards dc ON dc.card_id = c.id AND dc.deck_id = $2",
+            )
+            .bind(tag)
+            .bind(deck_id)
+            .fetch_one(pool)
+            .await
         }
     }
 }
@@ -381,6 +441,49 @@ pub async fn delete_card(pool: &PgPool, card_id: Uuid) -> sqlx::Result<()> {
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// A card whose `image_url` still points straight at Pixabay's own hotlink
+/// host rather than our own storage — the importer used to store that raw
+/// provider URL directly instead of re-hosting it (see `crates/importer`'s
+/// `pixabay.rs`/`create.rs`), and those links went dark once Pixabay
+/// started 503ing hotlinked requests. Everything here is exactly what the
+/// importer's backfill needs to resubmit a faithful `/cards/{id}` edit —
+/// `target_text`/`tags`/`card_type`/`two_way` alongside the one field it's
+/// actually replacing, the image — since `cards_update` has no "leave
+/// unspecified fields alone" behavior for those columns the way it does
+/// for the media URLs.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct BrokenImageCardRow {
+    pub id: Uuid,
+    pub target_text: String,
+    pub card_type: String,
+    pub two_way: bool,
+    /// Comma-separated, matching `CardEditForm`'s own `tags.join(", ")` —
+    /// resubmitted as-is to the same `tags` field a real edit form POSTs.
+    pub tags: String,
+    /// `words.english_translation` for this card's `target_text`, if any —
+    /// a better Pixabay search query than the headword itself, same
+    /// fallback order `create.rs`'s own `image_query`-or-`english` already
+    /// uses. `None` when there's no dictionary entry at all.
+    pub english_translation: Option<String>,
+}
+
+pub async fn cards_with_broken_external_image(
+    pool: &PgPool,
+) -> sqlx::Result<Vec<BrokenImageCardRow>> {
+    sqlx::query_as(
+        "SELECT c.id, c.target_text, c.card_type, c.two_way, \
+                COALESCE(string_agg(t.tag, ', '), '') AS tags, \
+                w.english_translation \
+         FROM cards c \
+         LEFT JOIN card_tags t ON t.card_id = c.id \
+         LEFT JOIN words w ON w.target_text = c.target_text \
+         WHERE c.image_url LIKE 'https://pixabay.com/%' \
+         GROUP BY c.id, w.english_translation",
+    )
+    .fetch_all(pool)
+    .await
 }
 
 // --- decks ----------------------------------------------------------------
@@ -1548,7 +1651,7 @@ mod tests {
         .await
         .unwrap();
 
-        let cards = list_cards(&pool, None, None).await.unwrap();
+        let cards = list_cards(&pool, None, None, 100, 0).await.unwrap();
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].id, card_id);
         assert_eq!(cards[0].target_text, "gato");
@@ -1663,7 +1766,9 @@ mod tests {
         .await
         .unwrap();
 
-        let animals = list_cards(&pool, Some("animals"), None).await.unwrap();
+        let animals = list_cards(&pool, Some("animals"), None, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(animals.len(), 1);
         assert_eq!(animals[0].target_text, "gato");
     }
@@ -1746,7 +1851,12 @@ mod tests {
         delete_card(&pool, card_id).await.unwrap();
 
         assert!(get_card(&pool, card_id).await.unwrap().is_none());
-        assert!(list_cards(&pool, None, None).await.unwrap().is_empty());
+        assert!(
+            list_cards(&pool, None, None, 100, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -1762,7 +1872,9 @@ mod tests {
         let deck_id = create_deck(&pool, user_id, "My Deck").await.unwrap();
         add_card_to_deck(&pool, deck_id, in_deck).await.unwrap();
 
-        let cards = list_cards(&pool, None, Some(deck_id)).await.unwrap();
+        let cards = list_cards(&pool, None, Some(deck_id), 100, 0)
+            .await
+            .unwrap();
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].id, in_deck);
 
@@ -1809,7 +1921,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            list_cards(&pool, None, Some(deck_id))
+            list_cards(&pool, None, Some(deck_id), 100, 0)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1827,7 +1939,9 @@ mod tests {
         assert_eq!(decks.len(), 1);
         assert_eq!(decks[0].name, "Default");
 
-        let cards = list_cards(&pool, None, Some(decks[0].id)).await.unwrap();
+        let cards = list_cards(&pool, None, Some(decks[0].id), 100, 0)
+            .await
+            .unwrap();
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].id, card_id);
     }

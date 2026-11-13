@@ -468,6 +468,47 @@ select {
     text-decoration: underline;
 }
 
+/* Previous/Next — same wood-button look as .card-filters-add, just
+   centered below the grid rather than beside the filters. */
+.card-pager {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+    margin-top: 1.8rem;
+}
+
+.card-pager span {
+    font-family: var(--font-serif);
+    font-size: 0.8rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink);
+}
+
+.card-pager button {
+    font-family: var(--font-serif);
+    font-size: 0.85rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--paper);
+    background: linear-gradient(var(--wood-light), var(--wood-dark));
+    border: 1px solid var(--brass-dim);
+    border-radius: 2px;
+    padding: 0.5rem 1rem;
+    box-shadow: 0 2px 4px var(--shadow-soft);
+}
+
+.card-pager button:hover:not(:disabled) {
+    background: linear-gradient(var(--wood-medium), var(--wood-dark));
+    border-color: var(--brass);
+}
+
+.card-pager button:disabled {
+    opacity: 0.45;
+    cursor: default;
+}
+
 /* --- Decks: a card-catalog cabinet of drawers --- */
 
 .deck-cabinet {

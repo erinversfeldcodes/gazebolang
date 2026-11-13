@@ -29,9 +29,12 @@ pub struct Card {
     #[serde(default)]
     pub image_query: String,
     /// Filled in by the `create` stage after a Pixabay lookup — absent
-    /// from the model's own output.
-    #[serde(default)]
-    pub image_url: Option<String>,
+    /// from the model's own output, and never round-tripped through the
+    /// decompose stage's JSON file: this is only ever set and consumed
+    /// within `create`'s own process, and raw image bytes have no business
+    /// living in a JSON file of card drafts.
+    #[serde(skip)]
+    pub image: Option<(Vec<u8>, String)>,
 }
 
 const POS_TAG_WORDS: &[&str] = &[
