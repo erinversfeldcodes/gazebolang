@@ -166,30 +166,59 @@ async fn require_user() -> Result<crate::auth::UserRow, ServerFnError> {
         .map_err(ServerFnError::new)
 }
 
+/// How many cards `CardListPage` shows per page. `list_cards`'s `page` is
+/// 0-indexed; this is the only place that needs to know the page size, so
+/// the frontend never computes an offset itself — it just asks for a page
+/// number and gets back a total it can turn into "page X of Y".
+pub const CARDS_PAGE_SIZE: i64 = 50;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CardsPage {
+    pub cards: Vec<Card>,
+    /// Total cards matching the filter, ignoring pagination — lets the
+    /// frontend disable "Next" on the last page and show a page count,
+    /// neither derivable from one page of rows alone.
+    pub total: i64,
+}
+
 #[server]
 pub async fn list_cards(
     tag: Option<String>,
     deck_id: Option<Uuid>,
-) -> Result<Vec<Card>, ServerFnError> {
+    page: i64,
+) -> Result<CardsPage, ServerFnError> {
     // Browsing the shared card pool is public; only mutating it needs auth.
     let state = expect_context::<crate::state::AppState>();
-    let rows = crate::db::list_cards(&state.db_pool, tag.as_deref(), deck_id)
+    let offset = page.max(0) * CARDS_PAGE_SIZE;
+    let rows = crate::db::list_cards(
+        &state.db_pool,
+        tag.as_deref(),
+        deck_id,
+        CARDS_PAGE_SIZE,
+        offset,
+    )
+    .await
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let total = crate::db::count_cards(&state.db_pool, tag.as_deref(), deck_id)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
-    Ok(rows
-        .into_iter()
-        .map(|r| Card {
-            id: r.id,
-            card_type: r.card_type,
-            image_url: r.image_url,
-            audio_url: r.audio_url,
-            video_url: r.video_url,
-            youtube_url: r.youtube_url,
-            target_text: r.target_text,
-            source_text: r.source_text,
-            two_way: r.two_way,
-        })
-        .collect())
+    Ok(CardsPage {
+        cards: rows
+            .into_iter()
+            .map(|r| Card {
+                id: r.id,
+                card_type: r.card_type,
+                image_url: r.image_url,
+                audio_url: r.audio_url,
+                video_url: r.video_url,
+                youtube_url: r.youtube_url,
+                target_text: r.target_text,
+                source_text: r.source_text,
+                two_way: r.two_way,
+            })
+            .collect(),
+        total,
+    })
 }
 
 #[server]

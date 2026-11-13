@@ -39,7 +39,10 @@ setup("authenticate", async ({ page }) => {
     await page.getByRole("button", { name: "Sign up" }).click();
   }
 
-  await expect(page).toHaveURL("/");
+  // Generous timeout for consistency with every other login/signup round
+  // trip in the suite — auth.rs bounds Argon2 work to 1 operation at a
+  // time, so this can queue behind other specs' setup/login/signup calls.
+  await expect(page).toHaveURL("/", { timeout: 15_000 });
 
   // The daily new-card limit is real per-user product behavior (paces how
   // many unseen cards a learner is introduced to), not something the e2e

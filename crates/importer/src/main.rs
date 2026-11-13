@@ -133,6 +133,7 @@ fn run() -> Result<(), String> {
             cards_out_file,
         } => run_decompose_cmd(&entries_in_file, &cards_out_file),
         Commands::Create { cards_in_file } => run_create_cmd(&cards_in_file),
+        Commands::BackfillImages => run_backfill_images_cmd(),
         Commands::All { images, run_dir } => run_all(&images, run_dir.as_deref()),
     }
 }
@@ -142,6 +143,7 @@ fn normalize_args(argv: Vec<String>) -> Vec<String> {
         "segment",
         "decompose",
         "create",
+        "backfill-images",
         "all",
         "-h",
         "--help",
@@ -205,6 +207,20 @@ fn run_create_cmd(cards_in_file: &Path) -> Result<(), String> {
         pixabay_api_key: pixabay_api_key.as_deref(),
     };
     create::run_create(&config, cards_in_file)
+}
+
+fn run_backfill_images_cmd() -> Result<(), String> {
+    let base_url = env_or("BASE_URL", "http://127.0.0.1:3000");
+    let auth_email = require_env("AUTH_EMAIL")?;
+    let auth_password = require_env("AUTH_PASSWORD")?;
+    let pixabay_api_key = std::env::var("PIXABAY_API_KEY").ok();
+    let config = create::CreateConfig {
+        base_url,
+        auth_email: &auth_email,
+        auth_password: &auth_password,
+        pixabay_api_key: pixabay_api_key.as_deref(),
+    };
+    create::run_backfill_images(&config)
 }
 
 fn run_all(images: &[PathBuf], run_dir_override: Option<&Path>) -> Result<(), String> {

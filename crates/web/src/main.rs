@@ -479,8 +479,7 @@ async fn cards_new(
         || !dict.linked_words_raw.trim().is_empty();
     if has_dict_details {
         let examples = non_empty_trimmed(&dict.example_target)
-            .map(|t| vec![(t, non_empty_trimmed(&dict.example_gloss))])
-            .unwrap_or_default();
+            .map_or_default(|t| vec![(t, non_empty_trimmed(&dict.example_gloss))]);
         let linked = parse_tags(&dict.linked_words_raw);
         if let Err(e) = web::db::upsert_word_definition(
             &state.db_pool,
@@ -732,8 +731,7 @@ async fn importer_save_word_definition(
             .into_response();
     }
     let examples = non_empty_trimmed(&form.example_target_sentence)
-        .map(|t| vec![(t, non_empty_trimmed(&form.example_gloss_sentence))])
-        .unwrap_or_default();
+        .map_or_default(|t| vec![(t, non_empty_trimmed(&form.example_gloss_sentence))]);
     let linked = parse_tags(&form.linked_words_raw);
 
     let result = web::db::upsert_word_definition(
@@ -751,6 +749,29 @@ async fn importer_save_word_definition(
     .await;
     match result {
         Ok(_) => axum::http::StatusCode::OK.into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Lists every card whose image still points straight at Pixabay's own
+/// hotlink host — see `db::BrokenImageCardRow`'s own doc comment — for the
+/// importer's one-off `backfill-images` command to re-host. A plain GET,
+/// same session-cookie auth as `importer_save_word_definition`; no form to
+/// parse, so there's no matching `importer_login`-style request struct.
+#[cfg(feature = "ssr")]
+async fn importer_cards_with_broken_images(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    cookies: tower_cookies::Cookies,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if web::auth::current_user(&state.db_pool, &cookies)
+        .await
+        .is_none()
+    {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+    }
+    match web::db::cards_with_broken_external_image(&state.db_pool).await {
+        Ok(rows) => axum::Json(rows).into_response(),
         Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -911,22 +932,50 @@ async fn auth_logout(
 #[cfg(feature = "ssr")]
 async fn connect_with_retry(database_url: &str) -> sqlx::PgPool {
     const MAX_ATTEMPTS: u32 = 6;
+    // A single EditCardPage load alone fires 4 concurrent resources
+    // (auth, card, decks, pages), each needing its own pooled
+    // connection at once — 5 total leaves next to no headroom for a
+    // second concurrent visitor on this 4-user app, and connections
+    // queue (not error) when the pool's exhausted, which is exactly
+    // what a Playwright run against the preview stack surfaced as a
+    // slow-but-silent request rather than a crash.
+    //
+    // `min_connections` defaults to 0 — an idle pool holds nothing and
+    // dials every connection cold the instant a burst (the full E2E
+    // suite, 2 Playwright workers) arrives. `connect_lazy` (rather than
+    // the eager `connect` this used to call) is what makes pre-warming
+    // those 4 connections actually safe: it returns the pool immediately
+    // — it only parses the URL, it doesn't dial — and lets sqlx's own
+    // background idle-reaper task establish `min_connections` over time.
+    // The eager form blocks app startup on ALL `min_connections`
+    // succeeding, one at a time, each with its own internal retry, all
+    // inside a single `acquire_timeout` window — against Neon's
+    // documented flaky post-wake-up behavior (see this function's own
+    // comment below), that turned "boot needs one connection to
+    // succeed" into "boot needs four, serially, in the same budget,"
+    // which a live failing preview deploy confirmed could blow the
+    // app's own readiness far past what it took before this existed.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(20)
+        .min_connections(4)
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .connect_lazy(database_url)
+        .unwrap_or_else(|err| panic!("malformed DATABASE_URL: {err}"));
+
     let mut attempt = 0;
     loop {
         attempt += 1;
-        // A single EditCardPage load alone fires 4 concurrent resources
-        // (auth, card, decks, pages), each needing its own pooled
-        // connection at once — 5 total leaves next to no headroom for a
-        // second concurrent visitor on this 4-user app, and connections
-        // queue (not error) when the pool's exhausted, which is exactly
-        // what a Playwright run against the preview stack surfaced as a
-        // slow-but-silent request rather than a crash.
-        match sqlx::postgres::PgPoolOptions::new()
-            .max_connections(20)
-            .connect(database_url)
-            .await
-        {
-            Ok(pool) => return pool,
+        // One bounded acquire proves the URL/credentials are actually
+        // correct and the database is reachable — the same thing the
+        // old eager `connect()` validated up front, just without also
+        // waiting on `min_connections` to do it (see this function's own
+        // leading comment for why retrying this matters against Neon
+        // specifically).
+        match pool.acquire().await {
+            Ok(conn) => {
+                drop(conn);
+                return pool;
+            }
             Err(err) if attempt < MAX_ATTEMPTS => {
                 log::warn!(
                     "database connection attempt {attempt}/{MAX_ATTEMPTS} failed, retrying: {err}"
@@ -948,7 +997,13 @@ async fn main() {
     use leptos_axum::{LeptosRoutes, generate_route_list};
     use web::app::{App, shell};
 
-    env_logger::init();
+    // `env_logger::init()` with no explicit default shows `error` only when
+    // `RUST_LOG` isn't set — which drops every `warn!`/`info!` call this
+    // codebase uses to make third-party integration failures (Pixabay,
+    // Resend, S3/Tigris) debuggable from `fly logs`. `info` as the default
+    // (still overridable via RUST_LOG) keeps those visible without needing
+    // a separate Fly secret just to see them.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let conf = get_configuration(None).unwrap();
     let leptos_options = conf.leptos_options;
@@ -992,6 +1047,10 @@ async fn main() {
         .route(
             "/api/importer/save-word-definition",
             axum::routing::post(importer_save_word_definition),
+        )
+        .route(
+            "/api/importer/cards-with-broken-images",
+            axum::routing::get(importer_cards_with_broken_images),
         )
         .route("/cards/new", axum::routing::post(cards_new))
         .route("/cards/bulk", axum::routing::post(cards_bulk))

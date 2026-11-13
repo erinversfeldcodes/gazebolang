@@ -1,4 +1,10 @@
 [toolchain]
-channel = "stable"
+# Pinned to an exact version, not the "stable" channel — "stable" drifts
+# to whatever's newest whenever rustup/CI re-resolves it, which is how a
+# stricter clippy lint in a newer stable release broke CI on pre-existing
+# code this branch never touched. Bump deliberately, matching the
+# `toolchain:` input in every `dtolnay/rust-toolchain@master` step across
+# .github/workflows/ (and, optionally, flake.nix's rust-overlay pin).
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 targets = ["wasm32-unknown-unknown"]

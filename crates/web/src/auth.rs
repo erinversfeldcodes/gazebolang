@@ -8,8 +8,9 @@ use password_hash::rand_core::OsRng;
 use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use rand::RngExt;
 use sqlx::PgPool;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use time::{Duration, OffsetDateTime};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 /// Hard cap on signups, matching the 4-friend trust model this app is built
@@ -71,6 +72,65 @@ fn verify_password(password: &str, hash: &str) -> bool {
             .is_ok(),
         Err(_) => false,
     }
+}
+
+/// Bounds concurrent Argon2 work to a small, fixed number of
+/// blocking-pool threads, mirroring `thestacks`'s
+/// `Stacks.Accounts.ArgonPool` (a 2-worker `NimblePool` with the same
+/// 10s checkout timeout) — adapted to Tokio, a semaphore gates entry to
+/// `spawn_blocking` instead of relying on its own default pool (up to
+/// 512 threads), which is effectively unbounded for this app's traffic.
+/// An earlier version of this fix used bare `spawn_blocking` with no
+/// cap: a burst of concurrent signups/logins during the E2E suite each
+/// spun up their own ~2MB-stack blocking thread at once, which OOM-killed
+/// the preview app's 256MB Fly machine. A later version allowed 2
+/// concurrent permits (matching `ArgonPool`'s worker count), which still
+/// OOM-killed the same 256MB machine: each Argon2 call costs ~19MiB
+/// (`Params::DEFAULT_M_COST`) by design — that's the point of a
+/// memory-hard KDF — so 2 concurrent permits means ~38MiB peak just for
+/// password hashing, on a box with next to no headroom to begin with.
+/// 1 permit keeps this fix's actual point (Argon2 never blocks the async
+/// executor) while capping Argon2's own memory cost at a single
+/// operation's worth; buying back real concurrent throughput later means
+/// growing the box's memory specifically to afford it, not raising this
+/// number again. Like `ArgonPool.run`, a busy checkout surfaces as its
+/// own distinct error rather than being folded into "wrong password" —
+/// this is a different failure, and the two shouldn't be told apart only
+/// by someone reading the login UI's text.
+static ARGON2_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
+const ARGON2_CHECKOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Runs `f` on a blocking-pool thread, but only after acquiring
+/// [`ARGON2_PERMITS`]'s single slot — only one Argon2 operation runs at
+/// a time, however many requests arrive at once.
+async fn run_argon2_bounded<F, T>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let _permit = tokio::time::timeout(ARGON2_CHECKOUT_TIMEOUT, ARGON2_PERMITS.acquire())
+        .await
+        .map_err(|_| "too many password checks in progress — try again in a moment".to_string())?
+        .expect("ARGON2_PERMITS is never closed");
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Runs [`hash_password`] through [`run_argon2_bounded`] rather than
+/// inline on the async task — Argon2's whole point is to be slow, and
+/// every signup and password change pays that cost.
+async fn hash_password_blocking(password: &str) -> Result<String, String> {
+    let password = password.to_string();
+    run_argon2_bounded(move || hash_password(&password)).await?
+}
+
+/// [`hash_password_blocking`]'s counterpart for [`verify_password`], paid
+/// on every login attempt.
+async fn verify_password_blocking(password: &str, hash: &str) -> Result<bool, String> {
+    let password = password.to_string();
+    let hash = hash.to_string();
+    run_argon2_bounded(move || verify_password(&password, &hash)).await
 }
 
 /// A syntactically valid Argon2 hash with no corresponding real password,
@@ -160,7 +220,7 @@ pub async fn sign_up(
         return Err("This app is limited to 4 users and is already full.".to_string());
     }
 
-    let password_hash = hash_password(password)?;
+    let password_hash = hash_password_blocking(password).await?;
 
     let user_id: Uuid = sqlx::query_scalar(
         "INSERT INTO users (email, name, password_hash) VALUES ($1, $2, $3) RETURNING id",
@@ -209,7 +269,7 @@ pub async fn log_in(pool: &PgPool, email: &str, password: &str) -> Result<String
         Some((_, None)) | None => (None, dummy_password_hash().to_string()),
     };
 
-    if !verify_password(password, &hash) {
+    if !verify_password_blocking(password, &hash).await? {
         log::warn!("auth: failed login attempt for {email}");
         return Err(invalid());
     }
@@ -304,7 +364,7 @@ pub async fn confirm_password_reset(
         return Err("this password reset link has expired".to_string());
     }
 
-    let password_hash = hash_password(new_password)?;
+    let password_hash = hash_password_blocking(new_password).await?;
 
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
@@ -424,7 +484,7 @@ pub async fn sign_up_via_invite(
         return Err("This app is limited to 4 users and is already full.".to_string());
     }
 
-    let password_hash = hash_password(password)?;
+    let password_hash = hash_password_blocking(password).await?;
 
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     let user_id: Uuid = sqlx::query_scalar(
@@ -470,7 +530,7 @@ async fn verify_current_password(
         .flatten();
     let hash = hash.unwrap_or_else(|| dummy_password_hash().to_string());
 
-    if verify_password(password, &hash) {
+    if verify_password_blocking(password, &hash).await? {
         Ok(())
     } else {
         Err("incorrect password".to_string())
@@ -536,7 +596,7 @@ pub async fn change_password(
 ) -> Result<(), String> {
     verify_current_password(pool, user_id, current_password).await?;
     validate_password(new_password)?;
-    let password_hash = hash_password(new_password)?;
+    let password_hash = hash_password_blocking(new_password).await?;
 
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")

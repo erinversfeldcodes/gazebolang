@@ -18,6 +18,19 @@ pub struct AppClient {
     session_cookie: Option<String>,
 }
 
+/// Mirrors `web::db::BrokenImageCardRow` field-for-field — see that
+/// struct's own doc comment for what each field is for and why it's here
+/// at all.
+#[derive(serde::Deserialize)]
+pub struct BrokenImageCard {
+    pub id: String,
+    pub target_text: String,
+    pub card_type: String,
+    pub two_way: bool,
+    pub tags: String,
+    pub english_translation: Option<String>,
+}
+
 impl AppClient {
     pub fn new(base_url: String) -> Result<Self, String> {
         let http = Client::builder()
@@ -70,13 +83,21 @@ impl AppClient {
             .ok_or_else(|| "not logged in".to_string())
     }
 
-    pub fn create_cards(&self, cards: &[Card]) -> Result<(), String> {
+    pub fn create_cards(&self, cards: &[Card], card_type: &str) -> Result<(), String> {
         let cookie = self.cookie_header()?;
         let mut form = multipart::Form::new();
         for (i, card) in cards.iter().enumerate() {
             form = form.text(format!("target_text_{i}"), card.target_text.clone());
-            if let Some(image_url) = &card.image_url {
-                form = form.text(format!("image_url_{i}"), image_url.clone());
+            form = form.text(format!("card_type_{i}"), card_type.to_string());
+            // A real file part, not `image_url_{i}` text — see
+            // `pixabay.rs`'s doc comment for why linking Pixabay's own URL
+            // directly broke every card that did it.
+            if let Some((bytes, content_type)) = &card.image {
+                let part = multipart::Part::bytes(bytes.clone())
+                    .file_name("image")
+                    .mime_str(content_type)
+                    .map_err(|e| e.to_string())?;
+                form = form.part(format!("image_{i}"), part);
             }
         }
         let res = self
@@ -97,6 +118,73 @@ impl AppClient {
         }
         if location.contains("error=") {
             return Err(format!("the app rejected the batch: {location}"));
+        }
+        Ok(())
+    }
+
+    pub fn list_cards_with_broken_images(&self) -> Result<Vec<BrokenImageCard>, String> {
+        let cookie = self.cookie_header()?;
+        let res = self
+            .http
+            .get(format!(
+                "{}/api/importer/cards-with-broken-images",
+                self.base_url
+            ))
+            .header(reqwest::header::COOKIE, cookie)
+            .send()
+            .map_err(|e| e.to_string())?;
+        if !res.status().is_success() {
+            return Err(format!(
+                "listing cards with broken images failed: {}",
+                res.status()
+            ));
+        }
+        res.json().map_err(|e| e.to_string())
+    }
+
+    /// Resubmits `card`'s existing `target_text`/`tags`/`card_type`/
+    /// `two_way` unchanged, replacing only the image — the same
+    /// `/cards/{id}` route `EditCardPage`'s own form posts to, so this is
+    /// exactly as faithful as a human re-saving that form with a new image
+    /// chosen. See `BrokenImageCard`'s doc comment for why every other
+    /// field has to come along for the ride.
+    pub fn update_card_image(
+        &self,
+        card_id: &str,
+        card: &BrokenImageCard,
+        image_bytes: &[u8],
+        image_content_type: &str,
+    ) -> Result<(), String> {
+        let cookie = self.cookie_header()?;
+        let part = multipart::Part::bytes(image_bytes.to_vec())
+            .file_name("image")
+            .mime_str(image_content_type)
+            .map_err(|e| e.to_string())?;
+        let form = multipart::Form::new()
+            .text("target_text", card.target_text.clone())
+            .text("tags", card.tags.clone())
+            .text("card_type", card.card_type.clone())
+            .part("image", part);
+        let form = if card.two_way {
+            form.text("two_way", "on".to_string())
+        } else {
+            form
+        };
+        let res = self
+            .http
+            .post(format!("{}/cards/{card_id}", self.base_url))
+            .header(reqwest::header::COOKIE, cookie)
+            .multipart(form)
+            .send()
+            .map_err(|e| e.to_string())?;
+        let location = res
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        if location.contains("error=") {
+            return Err(format!("the app rejected the update: {location}"));
         }
         Ok(())
     }

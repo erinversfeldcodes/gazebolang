@@ -1,0 +1,45 @@
+app = "gazebo"
+primary_region = "iad"
+
+[build]
+
+[env]
+LEPTOS_SITE_ADDR = "0.0.0.0:8080"
+
+[http_service]
+internal_port = 8080
+force_https = true
+auto_stop_machines = "stop"
+auto_start_machines = true
+min_machines_running = 0
+
+# DB-aware, not bare liveness: a machine that's up but can't reach Postgres
+# should get restarted rather than keep eating traffic. Fly's internal
+# checks hit internal_port directly, bypassing force_https, so this isn't
+# affected by it. Health checks don't themselves count as traffic, so this
+# doesn't fight auto_stop_machines/min_machines_running = 0.
+[[http_service.checks]]
+interval = "15s"
+timeout = "5s"
+grace_period = "10s"
+method = "GET"
+path = "/health"
+
+# Preview-only: a separate file from fly.toml (which prod's deploy.yml deploys
+# verbatim via a bare `flyctl deploy`, with no --vm-cpus/--vm-memory flags of
+# its own) specifically so bumping preview's VM size can never also bump
+# prod's. This file's own [[vm]] exists at all only because Fly's `fly deploy`
+# gives an app's fly.toml [[vm]] block precedence over --vm-cpu-kind/--vm-cpus/
+# --vm-memory CLI flags on every redeploy of an app that already has a machine
+# (confirmed against Fly's own "Scale Machine CPU and RAM" docs and multiple
+# community reports of the identical symptom: https://community.fly.io/t/fly-deploy-vm-memory-flag-not-working/18633,
+# https://community.fly.io/t/running-fly-deploy-keeps-moving-my-machine-back-to-256mb-of-ram/19675).
+# preview.yml's `cpu: "2"` / `memory: "512"` action inputs were silently
+# losing to this file's old shared-cpu-1x/256mb every single redeploy — the
+# live preview machine for PR #15 was confirmed via `fly machine status` to
+# still be shared-cpu-1x/256MB after that fix had already been merged and
+# deployed twice. This block must be kept in sync with preview.yml's cpu/
+# memory inputs; they're set to the same values for exactly this reason.
+[[vm]]
+size = "shared-cpu-2x"
+memory = "512mb"

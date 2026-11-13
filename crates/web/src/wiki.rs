@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "ssr")]
 use serde_json::Value;
 #[cfg(feature = "ssr")]
-use std::collections::HashMap;
+use std::collections::HashSet;
 #[cfg(feature = "ssr")]
 use std::fmt::Write as _;
 use uuid::Uuid;
@@ -459,7 +459,7 @@ fn render_blocks_html(content_json: &str) -> String {
         // a server error over what's just an empty document.
         return String::new();
     };
-    let mut heading_ids = HashMap::new();
+    let mut heading_ids = HashSet::new();
     let mut footnote_count = 0u32;
     render_block_sequence(&blocks, &mut heading_ids, &mut footnote_count)
 }
@@ -471,7 +471,7 @@ fn render_blocks_html(content_json: &str) -> String {
 #[cfg(feature = "ssr")]
 fn render_block_sequence(
     blocks: &[Value],
-    heading_ids: &mut HashMap<String, u32>,
+    heading_ids: &mut HashSet<String>,
     footnote_count: &mut u32,
 ) -> String {
     let mut html = String::new();
@@ -541,7 +541,7 @@ fn render_list(
     wrapper: ListWrapper,
     block_type: &str,
     items: &[Value],
-    heading_ids: &mut HashMap<String, u32>,
+    heading_ids: &mut HashSet<String>,
     footnote_count: &mut u32,
 ) -> String {
     let mut html = format!("\n<{}", wrapper.tag);
@@ -576,7 +576,7 @@ fn render_list(
 fn render_list_item(
     block_type: &str,
     item: &Value,
-    heading_ids: &mut HashMap<String, u32>,
+    heading_ids: &mut HashSet<String>,
     footnote_count: &mut u32,
 ) -> String {
     let props = item.get("props").unwrap_or(&Value::Null);
@@ -613,7 +613,7 @@ fn render_list_item(
 #[cfg(feature = "ssr")]
 fn render_single_block(
     block: &Value,
-    heading_ids: &mut HashMap<String, u32>,
+    heading_ids: &mut HashSet<String>,
     footnote_count: &mut u32,
 ) -> String {
     let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
@@ -684,7 +684,7 @@ fn render_heading(
     content: &Value,
     children_html: &str,
     style: &str,
-    heading_ids: &mut HashMap<String, u32>,
+    heading_ids: &mut HashSet<String>,
     footnote_count: &mut u32,
 ) -> String {
     let level = props
@@ -1054,16 +1054,27 @@ fn inline_plain_text(content: &Value) -> String {
 /// alphanumeric runs, hyphen-joined) — then de-duplicates with a numeric
 /// suffix, since two headings with the same text is common (e.g. two
 /// sections both titled "Examples") and would otherwise collide on the
-/// same in-page anchor.
+/// same in-page anchor. `used` holds every id actually handed out so
+/// far, not just a per-base count — a suffixed id like "h-1" is itself a
+/// valid slug, so some other heading's own text can independently
+/// slugify to exactly that string (e.g. two "h" headings followed by one
+/// whose text slugifies to "h-1"); checking against the real set of
+/// issued ids, rather than trusting that this base's own count never
+/// collides with another base's suffix, is what keeps that case unique
+/// too.
 #[cfg(feature = "ssr")]
-fn unique_heading_id(text: &str, used: &mut HashMap<String, u32>) -> String {
+fn unique_heading_id(text: &str, used: &mut HashSet<String>) -> String {
     let base = slugify(text);
-    let count = used.entry(base.clone()).or_insert(0);
-    *count += 1;
-    if *count == 1 {
-        base
-    } else {
-        format!("{base}-{}", *count - 1)
+    if used.insert(base.clone()) {
+        return base;
+    }
+    let mut n = 1u32;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        n += 1;
     }
 }
 
@@ -1972,16 +1983,19 @@ mod tests {
         }
 
         /// The entire reason `unique_heading_id` exists: feed it any
-        /// sequence of heading texts sharing the same `used` map (the
+        /// sequence of heading texts sharing the same `used` set (the
         /// same shape as `srs.rs`'s own state-evolves-through-a-
         /// sequence property test), and every id it has ever returned
         /// must be unique — duplicate ids would mean two headings'
-        /// in-page anchors collide.
+        /// in-page anchors collide. `seen` is deliberately a second,
+        /// independent set from the function's own `used` — this checks
+        /// what the function actually returned, not just that its
+        /// internal bookkeeping is self-consistent.
         #[test]
         fn unique_heading_id_never_repeats_an_id_across_a_sequence(
             texts in proptest::collection::vec(".*", 0..20),
         ) {
-            let mut used = std::collections::HashMap::new();
+            let mut used = std::collections::HashSet::new();
             let mut seen = std::collections::HashSet::new();
             for text in texts {
                 let id = unique_heading_id(&text, &mut used);

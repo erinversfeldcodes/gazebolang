@@ -468,6 +468,47 @@ select {
     text-decoration: underline;
 }
 
+/* Previous/Next — same wood-button look as .card-filters-add, just
+   centered below the grid rather than beside the filters. */
+.card-pager {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+    margin-top: 1.8rem;
+}
+
+.card-pager span {
+    font-family: var(--font-serif);
+    font-size: 0.8rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink);
+}
+
+.card-pager button {
+    font-family: var(--font-serif);
+    font-size: 0.85rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--paper);
+    background: linear-gradient(var(--wood-light), var(--wood-dark));
+    border: 1px solid var(--brass-dim);
+    border-radius: 2px;
+    padding: 0.5rem 1rem;
+    box-shadow: 0 2px 4px var(--shadow-soft);
+}
+
+.card-pager button:hover:not(:disabled) {
+    background: linear-gradient(var(--wood-medium), var(--wood-dark));
+    border-color: var(--brass);
+}
+
+.card-pager button:disabled {
+    opacity: 0.45;
+    cursor: default;
+}
+
 /* --- Decks: a card-catalog cabinet of drawers --- */
 
 .deck-cabinet {
@@ -2113,6 +2154,16 @@ main:has(> .wiki-shell) {
    Confluence's own toolbar buttons only pick up a background on
    hover/press, so a row of them reads as one toolbar, not nine separate
    buttons sitting side by side. */
+/* Sticky for the same reason .wiki-sidebar already is — scroll down to a
+   table (or anything else) further into a long article and, without
+   this, the toolbar scrolls away with everything above it. Confirmed
+   live as a real access problem, not just a convenience: a multi-cell
+   selection's own Merge button was already enabling correctly the whole
+   time, with no way left on screen to actually click it once the
+   toolbar holding it had scrolled out of view. nav above isn't sticky
+   itself, so top: 0 means the viewport's own top edge, not nav's bottom
+   edge — confirmed nothing else competes for that position once nav has
+   scrolled past. */
 .wiki-editor-toolbar {
     display: flex;
     align-items: center;
@@ -2124,6 +2175,9 @@ main:has(> .wiki-shell) {
     border: 1px solid var(--wiki-border);
     border-radius: 4px;
     background: var(--wiki-sidebar-bg);
+    position: sticky;
+    top: 0;
+    z-index: 2;
 }
 
 .wiki-toolbar-blocktype {

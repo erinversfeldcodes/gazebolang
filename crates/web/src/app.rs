@@ -8,8 +8,8 @@ use crate::account::{
     current_user_name, user_stats,
 };
 use crate::cards::{
-    AddCardLink, CARD_TYPES, CardLink, DeleteCard, DirectionInput, GradeCard, GradeInput,
-    ImageSearchResult, ImportCardImage, LINK_TYPES, RemoveCardLink, ReviewOrderInput,
+    AddCardLink, CARD_TYPES, CARDS_PAGE_SIZE, CardLink, DeleteCard, DirectionInput, GradeCard,
+    GradeInput, ImageSearchResult, ImportCardImage, LINK_TYPES, RemoveCardLink, ReviewOrderInput,
     SearchCardImages, get_card, list_tags, review_queue, search_cards,
 };
 use crate::decks::{
@@ -35,7 +35,8 @@ use crate::wiki::save_page_revision;
 use crate::wiki_editor::WikiEditor;
 use leptos::html;
 use leptos::prelude::*;
-use leptos_meta::{MetaTags, Stylesheet, Title, provide_meta_context};
+// Deliberately not leptos_meta::{Stylesheet, Title, MetaTags,
+// provide_meta_context} — see shell()'s doc comment for why.
 use leptos_router::{
     StaticSegment,
     components::{A, Form, Redirect, Route, Router, Routes},
@@ -403,6 +404,22 @@ fn MediaAttachmentFields(
     .into_any()
 }
 
+// `<Stylesheet>`/`<Title>`/`<MetaTags/>` (leptos_meta) are deliberately not
+// used here, even though both tags are static and sit at an unconditional,
+// top-level position in App()'s view — confirmed live (gazebo.fly.dev
+// panicking on every /cards/:id hydration, "the framework expected a marker
+// node, but found this instead: nav") that leptos_meta 0.8.7 (on leptos
+// 0.8.22/tachys 0.2.19, the latest mutually-released 0.8.x line as of this
+// fix) doesn't leave a matching hydration marker in <body> for tags whose
+// actual rendered output is teleported into <head> — the client-side
+// hydration walker then consumes the Router's own first node (<nav>) trying
+// to satisfy that phantom expectation, and the whole page's event listeners
+// never finish attaching. WikiEditor already hit the same class of bug for
+// its own injected <script>/<link> and worked around it by never going
+// through leptos_meta at all (see its own doc comment) — this is that same
+// fix applied to the two tags App() itself declared. Both are static (never
+// change per route), so hardcoding them directly into this non-hydrated
+// shell is strictly equivalent and sidesteps the mechanism entirely.
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
         <!DOCTYPE html>
@@ -412,7 +429,8 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
                 <meta name="viewport" content="width=device-width, initial-scale=1"/>
                 <AutoReload options=options.clone() />
                 <HydrationScripts options/>
-                <MetaTags/>
+                <link id="leptos" rel="stylesheet" href="/pkg/web.css"/>
+                <title>"Gazebo"</title>
             </head>
             <body>
                 <App/>
@@ -423,13 +441,9 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 
 #[component]
 pub fn App() -> impl IntoView {
-    provide_meta_context();
     let auth = Resource::new(|| (), |()| current_user_name());
 
     view! {
-        <Stylesheet id="leptos" href="/pkg/web.css"/>
-        <Title text="Gazebo"/>
-
         <Router>
             <nav>
                 // Grouped by purpose rather than 9 flat links: content you
@@ -749,14 +763,35 @@ fn CardListPage() -> impl IntoView {
             .get("deck")
             .and_then(|id| Uuid::parse_str(&id).ok()),
     );
+    let page = RwSignal::new(0_i64);
 
     let tags = Resource::new(|| (), |()| list_tags());
     let decks = Resource::new(|| (), |()| list_decks());
     let delete = ServerAction::<DeleteCard>::new();
     let cards = Resource::new(
-        move || (tag_filter.get(), deck_filter.get(), delete.version().get()),
-        |(tag, deck_id, _)| crate::cards::list_cards(tag, deck_id),
+        move || {
+            (
+                tag_filter.get(),
+                deck_filter.get(),
+                page.get(),
+                delete.version().get(),
+            )
+        },
+        |(tag, deck_id, page, _)| crate::cards::list_cards(tag, deck_id, page),
     );
+
+    // A delete can empty out the last page (e.g. the one card left on page
+    // 3 just got deleted) — step back a page rather than show a "no cards"
+    // message the user could only escape by editing the URL or re-opening
+    // a filter dropdown.
+    Effect::new(move |_| {
+        if let Some(Ok(result)) = cards.get()
+            && result.cards.is_empty()
+            && page.get_untracked() > 0
+        {
+            page.update(|p| *p -= 1);
+        }
+    });
 
     view! {
         <h1>"Cards"</h1>
@@ -772,6 +807,7 @@ fn CardListPage() -> impl IntoView {
                     on:change=move |ev| {
                         let value = event_target_value(&ev);
                         tag_filter.set(if value.is_empty() { None } else { Some(value) });
+                        page.set(0);
                     }
                 >
                     <option value="">"All tags"</option>
@@ -788,12 +824,11 @@ fn CardListPage() -> impl IntoView {
             <label>
                 "Filter by deck "
                 <select
-                    prop:value=move || {
-                        deck_filter.get().map(|id| id.to_string()).unwrap_or_default()
-                    }
+                    prop:value=move || deck_filter.get().map_or_default(|id| id.to_string())
                     on:change=move |ev| {
                         let value = event_target_value(&ev);
                         deck_filter.set(Uuid::parse_str(&value).ok());
+                        page.set(0);
                     }
                 >
                     <option value="">"All decks"</option>
@@ -810,7 +845,7 @@ fn CardListPage() -> impl IntoView {
         <Transition fallback=|| view! { <p>"Loading…"</p> }>
             {move || Suspend::new(async move {
                 match cards.await {
-                    Ok(cards) if cards.is_empty() => {
+                    Ok(result) if result.cards.is_empty() => {
                         // Distinguish "nothing matches this filter" from
                         // "you have zero cards at all" — only the latter
                         // gets a call to action, since a narrow filter was
@@ -826,9 +861,14 @@ fn CardListPage() -> impl IntoView {
                             view! { <p>"No cards match these filters."</p> }.into_any()
                         }
                     }
-                    Ok(cards) => view! {
+                    Ok(result) => {
+                        let total = result.total;
+                        let current_page = page.get_untracked();
+                        let total_pages = ((total + CARDS_PAGE_SIZE - 1) / CARDS_PAGE_SIZE).max(1);
+                        let has_more = (current_page + 1) * CARDS_PAGE_SIZE < total;
+                        view! {
                         <ul class="card-grid">
-                            {cards
+                            {result.cards
                                 .into_iter()
                                 .map(|card| {
                                     let edit_href = format!("/cards/{}", card.id);
@@ -883,8 +923,28 @@ fn CardListPage() -> impl IntoView {
                                 })
                                 .collect_view()}
                         </ul>
+                        {(total_pages > 1).then(|| view! {
+                            <div class="card-pager">
+                                <button
+                                    type="button"
+                                    disabled=current_page == 0
+                                    on:click=move |_| page.update(|p| *p -= 1)
+                                >
+                                    "Previous"
+                                </button>
+                                <span>{format!("Page {} of {total_pages}", current_page + 1)}</span>
+                                <button
+                                    type="button"
+                                    disabled=!has_more
+                                    on:click=move |_| page.update(|p| *p += 1)
+                                >
+                                    "Next"
+                                </button>
+                            </div>
+                        })}
                     }
-                    .into_any(),
+                    .into_any()
+                    }
                     Err(e) => view! { <p>"Error loading cards: " {e.to_string()}</p> }.into_any(),
                 }
             })}
@@ -1346,21 +1406,19 @@ fn CardDictionarySection(
                 .and_then(|d| d.english_translation.clone())
                 .unwrap_or_default()
             example_target_initial=first_example
-                .map(|e| e.target_sentence.clone())
-                .unwrap_or_default()
+                .map_or_default(|e| e.target_sentence.clone())
             example_gloss_initial=first_example
                 .and_then(|e| e.gloss_sentence.clone())
                 .unwrap_or_default()
             linked_words_initial=existing_definition
                 .as_ref()
-                .map(|d| {
+                .map_or_default(|d| {
                     d.linked_words
                         .iter()
                         .map(|l| l.target_text.clone())
                         .collect::<Vec<_>>()
                         .join(", ")
                 })
-                .unwrap_or_default()
         />
     }
 }
@@ -3831,7 +3889,7 @@ fn SettingsPage() -> impl IntoView {
                                 type="number"
                                 name="limit"
                                 min="0"
-                                value=current.map(|n| n.to_string()).unwrap_or_default()
+                                value=current.map_or_default(|n| n.to_string())
                             />
                         </label>
                         <button type="submit">"Save"</button>
@@ -3882,8 +3940,8 @@ fn AccountPage() -> impl IntoView {
                     return view! { <Redirect path="/login"/> }.into_any();
                 }
                 let current = profile.await.ok();
-                let name_value = current.as_ref().map(|p| p.name.clone()).unwrap_or_default();
-                let email_value = current.as_ref().map(|p| p.email.clone()).unwrap_or_default();
+                let name_value = current.as_ref().map_or_default(|p| p.name.clone());
+                let email_value = current.as_ref().map_or_default(|p| p.email.clone());
 
                 view! {
                     <h2>"Name"</h2>

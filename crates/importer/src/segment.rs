@@ -56,8 +56,7 @@ pub fn segment_page(engine: &mut VisionEngine, image_path: &Path) -> Result<Vec<
     let ext = image_path
         .extension()
         .and_then(|e| e.to_str())
-        .map(str::to_lowercase)
-        .unwrap_or_default();
+        .map_or_default(str::to_lowercase);
     if !SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
         return Err(format!(
             "unrecognized image type for {} (expected .jpg/.jpeg/.png/.webp)",

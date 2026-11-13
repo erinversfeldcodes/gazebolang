@@ -25,6 +25,9 @@ pub enum Commands {
     Create {
         cards_in_file: PathBuf,
     },
+    /// One-off repair for cards created before this tool re-hosted images
+    /// — see `create::run_backfill_images`'s own doc comment.
+    BackfillImages,
     All {
         #[arg(required = true, num_args = 1..)]
         images: Vec<PathBuf>,

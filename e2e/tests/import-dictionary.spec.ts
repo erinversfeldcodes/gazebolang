@@ -60,10 +60,16 @@ test("create stage logs in, creates the card, and saves its dictionary details",
   const client = new Client({ connectionString: process.env.DATABASE_URL });
   await client.connect();
   try {
-    const cardRows = await client.query("SELECT target_text FROM cards WHERE target_text = $1", [
-      targetText,
-    ]);
-    expect(cardRows.rowCount).toBe(1);
+    // Two cards per headword: the image card itself, plus a media-less
+    // placeholder audio card (see run_create's doc comment in
+    // crates/importer/src/create.rs) sharing the same target_text so the
+    // word has somewhere to receive a real audio recording later.
+    const cardRows = await client.query(
+      "SELECT card_type FROM cards WHERE target_text = $1 ORDER BY card_type",
+      [targetText],
+    );
+    expect(cardRows.rowCount).toBe(2);
+    expect(cardRows.rows.map((r) => r.card_type)).toEqual(["image_to_target", "sound_to_written"]);
 
     const wordRows = await client.query(
       "SELECT english_translation, part_of_speech FROM words WHERE target_text = $1",

@@ -39,8 +39,9 @@ pub fn fill_schema() -> Value {
             "part_of_speech": {
                 "type": "string",
                 "enum": [
-                    "", "n.", "v.", "vt.", "vi.", "adj.", "adv.", "prep.",
-                    "conj.", "pron.", "interj.", "num.",
+                    "", "noun", "verb", "transitive verb", "intransitive verb",
+                    "adjective", "adverb", "preposition", "conjunction",
+                    "pronoun", "interjection", "numeral",
                 ],
             },
             "notes": { "type": "string", "maxLength": 300 },
