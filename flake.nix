@@ -18,7 +18,11 @@
           overlays = [ rust-overlay.overlays.default ];
         };
 
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+        # Pinned to match rust-toolchain.toml / CI's dtolnay/rust-toolchain
+        # steps exactly, not `.latest` — "latest" drifts independently of
+        # both, which is how local/Nix/CI ended up on three different
+        # rustc versions despite all three claiming to track "stable".
+        rustToolchain = pkgs.rust-bin.stable."1.99.1".default.override {
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
           targets = [ "wasm32-unknown-unknown" ];
         };

@@ -211,6 +211,21 @@ jobs:
         uses: superfly/fly-pr-review-apps@main
         with:
           name: gazebo-pr-${{ github.event.number }}
+          # fly-pr-review-apps always passes explicit --vm-cpu-kind/--vm-cpus/
+          # --vm-memory flags to `flyctl deploy` from its OWN inputs (default
+          # cpu=1) — these override fly.toml's [[vm]] block entirely, so
+          # bumping fly.toml alone would do nothing for preview. shared-cpu-1x
+          # vCPUs pool their CPU-credit quota/burst balance (confirmed via
+          # Fly's own CPU Performance docs); this E2E suite's 2 parallel
+          # Playwright workers sustain enough SSR+DB load for long enough to
+          # exhaust that balance outright and get hard-capped at 6.25% of a
+          # core for minutes — not an OOM, not a code bug, a genuine capacity
+          # ceiling under sustained automated load that real human traffic on
+          # prod never sustains. Mirrors thestacks's own preview-only
+          # `--vm-memory 1024`/baseline `cpus = 2` pattern (scripts/deploy-
+          # stack.sh) rather than bumping prod's own spec, which doesn't show
+          # this symptom.
+          cpu: "2"
           secrets: >
             DATABASE_URL=postgresql://neondb_owner:${{ steps.dbpass.outputs.password }}@${{ needs.neon-branch.outputs.db_host_pooled }}/neondb?sslmode=require
             PIXABAY_API_KEY=${{ secrets.PIXABAY_API_KEY }}
@@ -294,7 +309,9 @@ jobs:
       # against this job's own checkout (only the `create` stage, which
       # needs no model/GPU — see ci.yml's matching comment) — built here
       # since this job otherwise has no Rust toolchain at all.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
       # importer vendors and CMake-builds llama.cpp from source — see the

@@ -14,8 +14,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          # Pinned to match rust-toolchain.toml exactly — @stable (the ref
+          # itself) ignores that file entirely and always re-resolves to
+          # whatever's newest, which is what let a newer stable's stricter
+          # clippy lint break CI on code this branch never touched.
+          toolchain: "1.99.1"
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: rui314/setup-mold@v1
@@ -42,7 +47,9 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p importer
       - run: cargo test -p importer
@@ -76,8 +83,9 @@ jobs:
       PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.1"
           targets: wasm32-unknown-unknown
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
@@ -141,8 +149,9 @@ jobs:
       RUST_LOG: info
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.1"
           targets: wasm32-unknown-unknown
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2

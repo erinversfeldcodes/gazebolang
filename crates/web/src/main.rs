@@ -479,8 +479,7 @@ async fn cards_new(
         || !dict.linked_words_raw.trim().is_empty();
     if has_dict_details {
         let examples = non_empty_trimmed(&dict.example_target)
-            .map(|t| vec![(t, non_empty_trimmed(&dict.example_gloss))])
-            .unwrap_or_default();
+            .map_or_default(|t| vec![(t, non_empty_trimmed(&dict.example_gloss))]);
         let linked = parse_tags(&dict.linked_words_raw);
         if let Err(e) = web::db::upsert_word_definition(
             &state.db_pool,
@@ -732,8 +731,7 @@ async fn importer_save_word_definition(
             .into_response();
     }
     let examples = non_empty_trimmed(&form.example_target_sentence)
-        .map(|t| vec![(t, non_empty_trimmed(&form.example_gloss_sentence))])
-        .unwrap_or_default();
+        .map_or_default(|t| vec![(t, non_empty_trimmed(&form.example_gloss_sentence))]);
     let linked = parse_tags(&form.linked_words_raw);
 
     let result = web::db::upsert_word_definition(

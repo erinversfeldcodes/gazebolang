@@ -10,8 +10,7 @@ use std::path::Path;
 pub fn run_dir_name(first_image_path: &str) -> String {
     let file_name = Path::new(first_image_path)
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|n| n.to_string_lossy().into_owned());
     let base = strip_extension(&file_name);
     let sanitized: String = base
         .chars()
