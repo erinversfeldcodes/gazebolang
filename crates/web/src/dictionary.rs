@@ -122,8 +122,7 @@ pub async fn save_word_definition(
         return Err(ServerFnError::new("target_text can't be empty"));
     }
     let examples = non_empty_trimmed(&example_target_sentence)
-        .map(|t| vec![(t, non_empty_trimmed(&example_gloss_sentence))])
-        .unwrap_or_default();
+        .map_or_default(|t| vec![(t, non_empty_trimmed(&example_gloss_sentence))]);
     let linked = parse_comma_list(&linked_words_raw);
 
     crate::db::upsert_word_definition(

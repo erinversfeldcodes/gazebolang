@@ -83,16 +83,26 @@ fn verify_password(password: &str, hash: &str) -> bool {
 /// An earlier version of this fix used bare `spawn_blocking` with no
 /// cap: a burst of concurrent signups/logins during the E2E suite each
 /// spun up their own ~2MB-stack blocking thread at once, which OOM-killed
-/// the preview app's 256MB Fly machine. Like `ArgonPool.run`, a busy
-/// checkout surfaces as its own distinct error rather than being folded
-/// into "wrong password" — this is a different failure, and the two
-/// shouldn't be told apart only by someone reading the login UI's text.
-static ARGON2_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(2));
+/// the preview app's 256MB Fly machine. A later version allowed 2
+/// concurrent permits (matching `ArgonPool`'s worker count), which still
+/// OOM-killed the same 256MB machine: each Argon2 call costs ~19MiB
+/// (`Params::DEFAULT_M_COST`) by design — that's the point of a
+/// memory-hard KDF — so 2 concurrent permits means ~38MiB peak just for
+/// password hashing, on a box with next to no headroom to begin with.
+/// 1 permit keeps this fix's actual point (Argon2 never blocks the async
+/// executor) while capping Argon2's own memory cost at a single
+/// operation's worth; buying back real concurrent throughput later means
+/// growing the box's memory specifically to afford it, not raising this
+/// number again. Like `ArgonPool.run`, a busy checkout surfaces as its
+/// own distinct error rather than being folded into "wrong password" —
+/// this is a different failure, and the two shouldn't be told apart only
+/// by someone reading the login UI's text.
+static ARGON2_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
 const ARGON2_CHECKOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Runs `f` on a blocking-pool thread, but only after acquiring one of
-/// [`ARGON2_PERMITS`]'s slots — never more than 2 Argon2 operations run
-/// concurrently, however many requests arrive at once.
+/// Runs `f` on a blocking-pool thread, but only after acquiring
+/// [`ARGON2_PERMITS`]'s single slot — only one Argon2 operation runs at
+/// a time, however many requests arrive at once.
 async fn run_argon2_bounded<F, T>(f: F) -> Result<T, String>
 where
     F: FnOnce() -> T + Send + 'static,

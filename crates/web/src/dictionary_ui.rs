@@ -304,12 +304,12 @@ pub fn DictionaryDetailsEditor(
                 on:click=move |_| {
                     save.dispatch(SaveWordDefinition {
                         target_text: target_text.get_untracked(),
-                        part_of_speech: part_of_speech.get().map(|el| el.value()).unwrap_or_default(),
-                        notes: notes.get().map(|el| el.value()).unwrap_or_default(),
-                        english_translation: english_translation.get().map(|el| el.value()).unwrap_or_default(),
-                        example_target_sentence: example_target.get().map(|el| el.value()).unwrap_or_default(),
-                        example_gloss_sentence: example_gloss.get().map(|el| el.value()).unwrap_or_default(),
-                        linked_words_raw: linked_words.get().map(|el| el.value()).unwrap_or_default(),
+                        part_of_speech: part_of_speech.get().map_or_default(|el| el.value()),
+                        notes: notes.get().map_or_default(|el| el.value()),
+                        english_translation: english_translation.get().map_or_default(|el| el.value()),
+                        example_target_sentence: example_target.get().map_or_default(|el| el.value()),
+                        example_gloss_sentence: example_gloss.get().map_or_default(|el| el.value()),
+                        linked_words_raw: linked_words.get().map_or_default(|el| el.value()),
                     });
                 }
             >

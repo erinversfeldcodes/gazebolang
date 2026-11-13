@@ -824,9 +824,7 @@ fn CardListPage() -> impl IntoView {
             <label>
                 "Filter by deck "
                 <select
-                    prop:value=move || {
-                        deck_filter.get().map(|id| id.to_string()).unwrap_or_default()
-                    }
+                    prop:value=move || deck_filter.get().map_or_default(|id| id.to_string())
                     on:change=move |ev| {
                         let value = event_target_value(&ev);
                         deck_filter.set(Uuid::parse_str(&value).ok());
@@ -1408,21 +1406,19 @@ fn CardDictionarySection(
                 .and_then(|d| d.english_translation.clone())
                 .unwrap_or_default()
             example_target_initial=first_example
-                .map(|e| e.target_sentence.clone())
-                .unwrap_or_default()
+                .map_or_default(|e| e.target_sentence.clone())
             example_gloss_initial=first_example
                 .and_then(|e| e.gloss_sentence.clone())
                 .unwrap_or_default()
             linked_words_initial=existing_definition
                 .as_ref()
-                .map(|d| {
+                .map_or_default(|d| {
                     d.linked_words
                         .iter()
                         .map(|l| l.target_text.clone())
                         .collect::<Vec<_>>()
                         .join(", ")
                 })
-                .unwrap_or_default()
         />
     }
 }
@@ -3893,7 +3889,7 @@ fn SettingsPage() -> impl IntoView {
                                 type="number"
                                 name="limit"
                                 min="0"
-                                value=current.map(|n| n.to_string()).unwrap_or_default()
+                                value=current.map_or_default(|n| n.to_string())
                             />
                         </label>
                         <button type="submit">"Save"</button>
@@ -3944,8 +3940,8 @@ fn AccountPage() -> impl IntoView {
                     return view! { <Redirect path="/login"/> }.into_any();
                 }
                 let current = profile.await.ok();
-                let name_value = current.as_ref().map(|p| p.name.clone()).unwrap_or_default();
-                let email_value = current.as_ref().map(|p| p.email.clone()).unwrap_or_default();
+                let name_value = current.as_ref().map_or_default(|p| p.name.clone());
+                let email_value = current.as_ref().map_or_default(|p| p.email.clone());
 
                 view! {
                     <h2>"Name"</h2>
