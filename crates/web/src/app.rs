@@ -2020,11 +2020,27 @@ fn EditCardPage() -> impl IntoView {
                 remove_link.version().get(),
             )
         },
+        // The word's dictionary entry is fetched here, inside the
+        // Resource, rather than with a bare `.await` in the `Suspend`
+        // below: a Resource's value is serialized into the server-rendered
+        // page and reused by the client, but a plain server-fn call inside
+        // `Suspend` is re-run (a real network request) while the client is
+        // mid-hydration, so the client's view of the page resolves later
+        // than the server's and the two disagree about where the markers
+        // are. CI reproduced the resulting "expected a marker node" panic
+        // on every card page (hydration.spec.ts).
         |(id, ..)| async move {
-            match id {
-                Some(id) => get_card(id).await,
-                None => Ok(None),
-            }
+            let Some(id) = id else {
+                return Ok::<_, ServerFnError>(None);
+            };
+            let Some(detail) = get_card(id).await? else {
+                return Ok(None);
+            };
+            let definition = get_word_definition(detail.target_text.clone())
+                .await
+                .ok()
+                .flatten();
+            Ok(Some((detail, definition)))
         },
     );
     let decks = Resource::new(|| (), |()| list_decks());
@@ -2058,7 +2074,7 @@ fn EditCardPage() -> impl IntoView {
                 match card.await {
                     Ok(None) => view! { <p>"Card not found."</p> }.into_any(),
                     Err(e) => view! { <p>"Error: " {e.to_string()}</p> }.into_any(),
-                    Ok(Some(detail)) => {
+                    Ok(Some((detail, existing_definition))) => {
                         let deck_ids = detail.deck_ids.clone();
                         let page_ids = detail.page_ids.clone();
 
@@ -2068,10 +2084,6 @@ fn EditCardPage() -> impl IntoView {
                         // just-edited rename not yet submitted — rather than
                         // the stale value this page loaded with.
                         let target_text_signal = RwSignal::new(detail.target_text.clone());
-                        let existing_definition = get_word_definition(detail.target_text.clone())
-                            .await
-                            .ok()
-                            .flatten();
 
                         // Every child component here returns `impl IntoView`,
                         // not `AnyView` — fine individually, but composing

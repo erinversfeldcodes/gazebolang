@@ -1,6 +1,6 @@
 import { Page } from "@playwright/test";
 import { test, expect } from "./fixtures";
-import { createCardInOwnDeck, withServerResponse } from "./helpers";
+import { createCardInOwnDeck, uniqueWord, withServerResponse } from "./helpers";
 
 // Saves dictionary details for the word a card was just created with, from
 // that card's own edit page. Assumes `page` is already signed in and the
