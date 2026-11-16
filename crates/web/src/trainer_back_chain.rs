@@ -39,6 +39,8 @@ impl From<CardRow> for crate::cards::Card {
         crate::cards::Card {
             id: r.id,
             card_type: r.card_type,
+            // A game step shows its one image at full size; no preview.
+            thumb_url: None,
             image_url: r.image_url,
             audio_url: r.audio_url,
             video_url: r.video_url,

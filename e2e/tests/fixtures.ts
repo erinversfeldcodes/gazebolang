@@ -13,6 +13,22 @@ import { test as base, expect } from "@playwright/test";
 // exactly this reason.
 export const test = base.extend({
   page: async ({ page }, use) => {
+    // A wasm panic (e.g. a hydration mismatch) leaves the page server-
+    // rendered but dead. goto's data-hydrated wait catches one on a hard
+    // load, but a panic on a client-side navigation (clicking a link) never
+    // goes through goto — and one such crash shipped to production
+    // unnoticed because the specs reached the card page by clicking "Edit".
+    // So every test fails if the app panics in the browser, whichever way
+    // it got to the page.
+    const panics: string[] = [];
+    page.on("console", (msg) => {
+      if (msg.type() === "error" && /panicked at|hydration error/i.test(msg.text())) {
+        panics.push(msg.text().slice(0, 400));
+      }
+    });
+    page.on("pageerror", (err) => {
+      if (/unreachable/.test(err.message)) panics.push(err.message.slice(0, 400));
+    });
     const originalGoto = page.goto.bind(page);
     page.goto = (async (url, options) => {
       const response = await originalGoto(url, options);
@@ -20,6 +36,7 @@ export const test = base.extend({
       return response;
     }) as typeof page.goto;
     await use(page);
+    expect(panics, "the app panicked in the browser during this test").toEqual([]);
   },
 });
 

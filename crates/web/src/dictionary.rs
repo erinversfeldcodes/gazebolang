@@ -1,5 +1,6 @@
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WordExample {
@@ -159,4 +160,138 @@ mod tests {
         assert_eq!(non_empty_trimmed("   "), None);
         assert_eq!(non_empty_trimmed(" noun "), Some("noun".to_string()));
     }
+}
+
+/// One row of the dictionary index — a word that has at least one card.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DictionaryEntrySummary {
+    pub id: Uuid,
+    pub target_text: String,
+    pub part_of_speech: Option<String>,
+    pub english_translation: Option<String>,
+    pub card_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DictionaryPageData {
+    pub entries: Vec<DictionaryEntrySummary>,
+    /// Matching words across all pages, for the pager.
+    pub total: i64,
+}
+
+/// Every word that has at least one card, sorted by English
+/// (`english_first`) or by the target-language spelling, optionally
+/// filtered by text in either. Public, like `list_cards` — browsing needs
+/// no account.
+#[server]
+pub async fn list_dictionary(
+    english_first: bool,
+    search: String,
+    page: i64,
+    page_size: i64,
+) -> Result<DictionaryPageData, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let page_size = crate::cards::clamp_page_size(page_size);
+    let order = if english_first {
+        crate::db::DictionaryOrder::EnglishFirst
+    } else {
+        crate::db::DictionaryOrder::TargetFirst
+    };
+    let (rows, total) = crate::db::list_dictionary_entries(
+        &state.db_pool,
+        order,
+        Some(&search),
+        page_size,
+        page.max(0) * page_size,
+    )
+    .await
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    Ok(DictionaryPageData {
+        entries: rows
+            .into_iter()
+            .map(|r| DictionaryEntrySummary {
+                id: r.id,
+                target_text: r.target_text,
+                part_of_speech: r.part_of_speech,
+                english_translation: r.english_translation,
+                card_count: r.card_count,
+            })
+            .collect(),
+        total,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DictionaryCard {
+    pub id: Uuid,
+    pub card_type: String,
+    pub image_url: Option<String>,
+    pub two_way: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DictionaryLink {
+    pub id: Uuid,
+    pub target_text: String,
+    pub link_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DictionaryEntry {
+    pub id: Uuid,
+    pub target_text: String,
+    pub part_of_speech: Option<String>,
+    pub notes: Option<String>,
+    pub english_translation: Option<String>,
+    pub examples: Vec<WordExample>,
+    pub linked_words: Vec<DictionaryLink>,
+    /// Every card whose `target_text` is this word.
+    pub cards: Vec<DictionaryCard>,
+}
+
+/// A word's full entry, with links to all of its cards. `Ok(None)` for an
+/// unknown id.
+#[server]
+pub async fn get_dictionary_entry(word_id: Uuid) -> Result<Option<DictionaryEntry>, ServerFnError> {
+    let state = expect_context::<crate::state::AppState>();
+    let Some(row) = crate::db::get_dictionary_entry(&state.db_pool, word_id)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(DictionaryEntry {
+        id: row.word.id,
+        target_text: row.word.target_text,
+        part_of_speech: row.word.part_of_speech,
+        notes: row.word.notes,
+        english_translation: row.word.english_translation,
+        examples: row
+            .examples
+            .into_iter()
+            .map(|e| WordExample {
+                target_sentence: e.target_sentence,
+                gloss_sentence: e.gloss_sentence,
+            })
+            .collect(),
+        linked_words: row
+            .linked_words
+            .into_iter()
+            .map(|l| DictionaryLink {
+                id: l.id,
+                target_text: l.target_text,
+                link_type: l.link_type,
+            })
+            .collect(),
+        cards: row
+            .cards
+            .into_iter()
+            .map(|c| DictionaryCard {
+                id: c.id,
+                card_type: c.card_type,
+                image_url: c.image_url,
+                two_way: c.two_way,
+            })
+            .collect(),
+    }))
 }

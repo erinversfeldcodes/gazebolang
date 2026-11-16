@@ -17,6 +17,8 @@ test("typing the wrong spelling shows the correct answer, and Next loads a fresh
 
   await page.goto("/new");
   await page.getByLabel("Target-language word/phrase").fill(word);
+  // Video and YouTube are offered on "Video → written" cards only.
+  await page.getByLabel("Card type").selectOption("video_to_written");
   await page
     .getByLabel("Or link a YouTube video")
     .fill("https://www.youtube.com/watch?v=dQw4w9WgXcQ");

@@ -4793,6 +4793,7 @@ dependencies = [
  "console_log",
  "domain",
  "env_logger",
+ "image",
  "insta",
  "js-sys",
  "leptos",

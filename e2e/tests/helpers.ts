@@ -1,6 +1,7 @@
 import { Page, expect } from "@playwright/test";
 import { Client } from "pg";
 import * as crypto from "crypto";
+import * as zlib from "zlib";
 
 // Every environment that actually sends mail (preview, and prod) uses
 // Resend's sandbox sender (onboarding@resend.dev) rather than a verified
@@ -194,6 +195,123 @@ export async function deleteInvitedTestUser(email: string): Promise<void> {
     );
     await client.query("DELETE FROM invites WHERE email = $1", [lowered]);
     await client.query("DELETE FROM users WHERE email = $1", [lowered]);
+  } finally {
+    await client.end();
+  }
+}
+
+// Writes `count` plain cards carrying `tag` straight into Postgres — far
+// faster than creating dozens through the UI, for specs (pagination) that
+// only need many cards to exist, not to exercise card creation itself.
+export async function seedTaggedCards(tag: string, count: number): Promise<void> {
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    const userId = await ensureBootstrapInviter(client);
+    for (let i = 0; i < count; i++) {
+      const inserted = await client.query(
+        "INSERT INTO cards (card_type, target_text, created_by) " +
+          "VALUES ('image_to_target', $1, $2) RETURNING id",
+        [`${tag}-${String(i).padStart(2, "0")}`, userId],
+      );
+      await client.query("INSERT INTO card_tags (card_id, tag) VALUES ($1, $2)", [
+        inserted.rows[0].id,
+        tag,
+      ]);
+    }
+  } finally {
+    await client.end();
+  }
+}
+
+// Removes everything seedTaggedCards wrote for `tag`.
+export async function deleteTaggedCards(tag: string): Promise<void> {
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    await client.query(
+      "DELETE FROM cards WHERE id IN (SELECT card_id FROM card_tags WHERE tag = $1)",
+      [tag],
+    );
+  } finally {
+    await client.end();
+  }
+}
+
+// A valid RGB PNG of random noise — incompressible, so it is genuinely
+// large (a 1200x800 one is ~2.9 MB) without needing a fixture file in the
+// repo. `noise: false` gives a flat colour instead: tiny on disk.
+export function makePng(width: number, height: number, noise = true): Buffer {
+  const crcTable = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+  const crc32 = (buf: Buffer): number => {
+    let c = 0xffffffff;
+    for (const byte of buf) c = crcTable[(c ^ byte) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type: string, data: Buffer): Buffer => {
+    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const out = Buffer.alloc(8 + data.length + 4);
+    out.writeUInt32BE(data.length, 0);
+    body.copy(out, 4);
+    out.writeUInt32BE(crc32(body), 8 + data.length);
+    return out;
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8; // bit depth
+  header[9] = 2; // colour type: RGB
+  const stride = width * 3 + 1; // each row starts with a filter byte (0)
+  const raw = Buffer.alloc(stride * height);
+  for (let y = 0; y < height; y++) {
+    if (noise) {
+      crypto.randomFillSync(raw, y * stride + 1, width * 3);
+    } else {
+      raw.fill(0x7f, y * stride + 1, (y + 1) * stride);
+    }
+  }
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", header),
+    chunk("IDAT", zlib.deflateSync(raw)),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+// Reads an <img>'s natural (intrinsic) width once it has loaded.
+export async function naturalWidth(img: import("@playwright/test").Locator): Promise<number> {
+  await expect(img).toBeVisible();
+  await expect
+    .poll(() => img.evaluate((el: HTMLImageElement) => el.complete && el.naturalWidth))
+    .toBeGreaterThan(0);
+  return img.evaluate((el: HTMLImageElement) => el.naturalWidth);
+}
+
+// Deletes the thumbnail row recorded for `imageUrl`, putting the image back
+// in the state of one uploaded before thumbnails existed.
+export async function forgetThumbnail(imageUrl: string): Promise<void> {
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    await client.query("DELETE FROM image_thumbnails WHERE image_url = $1", [imageUrl]);
+  } finally {
+    await client.end();
+  }
+}
+
+// The thumbnail URL recorded for `imageUrl`, or null when there's no row.
+export async function recordedThumbnail(imageUrl: string): Promise<string | null> {
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    const res = await client.query("SELECT thumb_url FROM image_thumbnails WHERE image_url = $1", [
+      imageUrl,
+    ]);
+    return res.rows.length > 0 ? (res.rows[0].thumb_url as string) : null;
   } finally {
     await client.end();
   }

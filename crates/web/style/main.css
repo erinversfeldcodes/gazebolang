@@ -472,10 +472,21 @@ select {
    centered below the grid rather than beside the filters. */
 .card-pager {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: center;
-    gap: 1rem;
-    margin-top: 1.8rem;
+    gap: 0.6rem 1rem;
+    margin: 1.2rem 0;
+}
+
+.card-pager-range {
+    flex-basis: 100%;
+    text-align: center;
+}
+
+.card-pager-jump input {
+    width: 4.5rem;
+    margin: 0 0.3rem;
 }
 
 .card-pager span {
@@ -2612,4 +2623,80 @@ main:has(> .wiki-shell) {
     h1 {
         font-size: 1.5rem;
     }
+}
+
+/* --- Dictionary --- */
+
+.dictionary-direction button {
+    font-family: var(--font-serif);
+    font-size: 0.85rem;
+    letter-spacing: 0.05em;
+    color: var(--ink);
+    background: transparent;
+    border: 1px solid var(--brass-dim);
+    border-radius: 2px;
+    padding: 0.4rem 0.9rem;
+}
+
+.dictionary-direction button.active {
+    color: var(--paper);
+    background: linear-gradient(var(--wood-light), var(--wood-dark));
+}
+
+.dictionary-list,
+.dictionary-cards,
+.dictionary-examples,
+.dictionary-related {
+    list-style: none;
+    margin: 1rem 0;
+    padding: 0;
+}
+
+.dictionary-list li {
+    display: flex;
+    align-items: baseline;
+    gap: 1rem;
+    padding: 0.55rem 0;
+    border-bottom: 1px solid var(--brass-dim);
+}
+
+.dictionary-list li a {
+    flex: 1;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.2rem 1rem;
+}
+
+.dictionary-headword {
+    font-weight: 600;
+}
+
+.dictionary-other,
+.dictionary-meta {
+    color: var(--ink);
+    opacity: 0.75;
+    font-size: 0.9rem;
+}
+
+.dictionary-gloss {
+    font-size: 1.2rem;
+}
+
+.dictionary-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr));
+    gap: 1rem;
+}
+
+.dictionary-cards a {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+}
+
+.dictionary-cards img {
+    width: 100%;
+    height: 8rem;
+    object-fit: cover;
 }

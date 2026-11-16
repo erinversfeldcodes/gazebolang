@@ -7,6 +7,9 @@ pub struct Card {
     pub id: Uuid,
     pub card_type: String,
     pub image_url: Option<String>,
+    /// A small preview of `image_url` (see `thumbnail.rs`) for grids and
+    /// lists; `None` means there's no separate one, so show `image_url`.
+    pub thumb_url: Option<String>,
     pub audio_url: Option<String>,
     pub video_url: Option<String>,
     pub youtube_url: Option<String>,
@@ -43,6 +46,7 @@ pub const CARD_TYPES: &[(&str, &str)] = &[
     ("image_to_target", "Image → written"),
     ("sound_to_written", "Audio → written"),
     ("image_to_audio", "Image → audio"),
+    ("video_to_written", "Video → written"),
     ("sentence_translation", "Sentence translation"),
 ];
 
@@ -102,6 +106,8 @@ pub struct ReviewCard {
     pub id: Uuid,
     pub card_type: String,
     pub image_url: Option<String>,
+    /// Small preview of `image_url`; see `Card::thumb_url`.
+    pub thumb_url: Option<String>,
     pub audio_url: Option<String>,
     pub video_url: Option<String>,
     pub youtube_url: Option<String>,
@@ -172,6 +178,22 @@ async fn require_user() -> Result<crate::auth::UserRow, ServerFnError> {
 /// number and gets back a total it can turn into "page X of Y".
 pub const CARDS_PAGE_SIZE: i64 = 50;
 
+/// The page sizes `CardListPage` offers. The server clamps any requested
+/// size to the nearest allowed value (see `clamp_page_size`) so a crafted
+/// request can't ask for the whole table in one response.
+pub const CARDS_PAGE_SIZE_OPTIONS: [i64; 5] = [12, 25, 50, 100, 200];
+
+/// Largest allowed size that doesn't exceed `requested`, falling back to
+/// the default when `requested` is below the smallest option.
+#[cfg(feature = "ssr")]
+pub(crate) fn clamp_page_size(requested: i64) -> i64 {
+    CARDS_PAGE_SIZE_OPTIONS
+        .into_iter()
+        .rev()
+        .find(|&o| o <= requested)
+        .unwrap_or(CARDS_PAGE_SIZE)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CardsPage {
     pub cards: Vec<Card>,
@@ -181,33 +203,62 @@ pub struct CardsPage {
     pub total: i64,
 }
 
+/// Thumbnails for a page of cards' images in one query. A failed lookup is
+/// logged and treated as "no thumbnails": cards just show their full image.
+#[cfg(feature = "ssr")]
+async fn thumbnails_for_urls<'a>(
+    state: &crate::state::AppState,
+    urls: impl Iterator<Item = &'a str>,
+) -> std::collections::HashMap<String, String> {
+    let urls: Vec<String> = urls.map(str::to_string).collect();
+    crate::db::thumbnails_for(&state.db_pool, &urls)
+        .await
+        .unwrap_or_else(|e| {
+            log::warn!("looking up thumbnails failed: {e}");
+            std::collections::HashMap::new()
+        })
+}
+
+/// The thumbnail to show for `image_url`, or `None` when there isn't a
+/// separate one (no row, or the original is fine as it is).
+#[cfg(feature = "ssr")]
+fn thumb_of(
+    thumbs: &std::collections::HashMap<String, String>,
+    image_url: Option<&str>,
+) -> Option<String> {
+    let image_url = image_url?;
+    thumbs
+        .get(image_url)
+        .filter(|t| t.as_str() != image_url)
+        .cloned()
+}
+
 #[server]
 pub async fn list_cards(
     tag: Option<String>,
     deck_id: Option<Uuid>,
     page: i64,
+    page_size: i64,
 ) -> Result<CardsPage, ServerFnError> {
     // Browsing the shared card pool is public; only mutating it needs auth.
     let state = expect_context::<crate::state::AppState>();
-    let offset = page.max(0) * CARDS_PAGE_SIZE;
-    let rows = crate::db::list_cards(
-        &state.db_pool,
-        tag.as_deref(),
-        deck_id,
-        CARDS_PAGE_SIZE,
-        offset,
-    )
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let page_size = clamp_page_size(page_size);
+    let offset = page.max(0) * page_size;
+    let rows = crate::db::list_cards(&state.db_pool, tag.as_deref(), deck_id, page_size, offset)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
     let total = crate::db::count_cards(&state.db_pool, tag.as_deref(), deck_id)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let thumbs =
+        thumbnails_for_urls(&state, rows.iter().filter_map(|r| r.image_url.as_deref())).await;
     Ok(CardsPage {
         cards: rows
             .into_iter()
             .map(|r| Card {
                 id: r.id,
                 card_type: r.card_type,
+                thumb_url: thumb_of(&thumbs, r.image_url.as_deref()),
                 image_url: r.image_url,
                 audio_url: r.audio_url,
                 video_url: r.video_url,
@@ -321,11 +372,14 @@ pub async fn search_cards(
     let rows = crate::db::search_cards(&state.db_pool, &query, exclude_card_id)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let thumbs =
+        thumbnails_for_urls(&state, rows.iter().filter_map(|r| r.image_url.as_deref())).await;
     Ok(rows
         .into_iter()
         .map(|r| Card {
             id: r.id,
             card_type: r.card_type,
+            thumb_url: thumb_of(&thumbs, r.image_url.as_deref()),
             image_url: r.image_url,
             audio_url: r.audio_url,
             video_url: r.video_url,
@@ -395,9 +449,8 @@ pub async fn import_card_image(provider: String, id: String) -> Result<String, S
         .storage
         .as_ref()
         .ok_or_else(|| ServerFnError::new("image storage isn't configured"))?;
-    let key = format!("cards/{}", crate::storage::random_key());
     storage
-        .upload(&key, &content_type, &bytes)
+        .upload_card_image(&state.db_pool, &content_type, &bytes)
         .await
         .map_err(ServerFnError::new)
 }
@@ -429,6 +482,11 @@ pub async fn review_queue(
     )
     .await
     .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let thumbs = thumbnails_for_urls(
+        &state,
+        queue.cards.iter().filter_map(|r| r.image_url.as_deref()),
+    )
+    .await;
     Ok(ReviewQueueView {
         cards: queue
             .cards
@@ -437,6 +495,7 @@ pub async fn review_queue(
                 id: r.id,
                 card_type: r.card_type,
                 source_text: r.source_text,
+                thumb_url: thumb_of(&thumbs, r.image_url.as_deref()),
                 image_url: r.image_url,
                 audio_url: r.audio_url,
                 video_url: r.video_url,
@@ -468,4 +527,38 @@ pub async fn grade_card(
     .await
     .map_err(|e| ServerFnError::new(e.to_string()))?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "ssr"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_card_falls_back_to_its_full_image_unless_it_has_a_separate_thumbnail() {
+        let mut thumbs = std::collections::HashMap::new();
+        thumbs.insert("full-a".to_string(), "small-a".to_string());
+        // Recorded as "the original is fine as it is".
+        thumbs.insert("full-b".to_string(), "full-b".to_string());
+
+        assert_eq!(
+            thumb_of(&thumbs, Some("full-a")),
+            Some("small-a".to_string())
+        );
+        assert_eq!(thumb_of(&thumbs, Some("full-b")), None);
+        assert_eq!(thumb_of(&thumbs, Some("never-seen")), None);
+        assert_eq!(thumb_of(&thumbs, None), None);
+    }
+
+    #[test]
+    fn page_size_snaps_down_to_an_allowed_option() {
+        assert_eq!(clamp_page_size(50), 50);
+        assert_eq!(clamp_page_size(99), 50);
+        assert_eq!(clamp_page_size(100_000), 200);
+    }
+
+    #[test]
+    fn page_size_below_the_smallest_option_falls_back_to_default() {
+        assert_eq!(clamp_page_size(0), CARDS_PAGE_SIZE);
+        assert_eq!(clamp_page_size(-5), CARDS_PAGE_SIZE);
+    }
 }

@@ -8,14 +8,16 @@ use crate::account::{
     current_user_name, user_stats,
 };
 use crate::cards::{
-    AddCardLink, CARD_TYPES, CARDS_PAGE_SIZE, CardLink, DeleteCard, DirectionInput, GradeCard,
-    GradeInput, ImageSearchResult, ImportCardImage, LINK_TYPES, RemoveCardLink, ReviewOrderInput,
-    SearchCardImages, get_card, list_tags, review_queue, search_cards,
+    AddCardLink, CARD_TYPES, CARDS_PAGE_SIZE, CARDS_PAGE_SIZE_OPTIONS, CardLink, DeleteCard,
+    DirectionInput, GradeCard, GradeInput, ImageSearchResult, ImportCardImage, LINK_TYPES,
+    RemoveCardLink, ReviewOrderInput, SearchCardImages, get_card, list_tags, review_queue,
+    search_cards,
 };
 use crate::decks::{
     AddCardToDeck, CreateDeck, Deck, DeleteDeck, RemoveCardFromDeck, RenameDeck, list_decks,
 };
 use crate::dictionary::{WordDefinition, get_word_definition};
+use crate::dictionary_page::{DictionaryEntryPage, DictionaryPage};
 use crate::dictionary_ui::{ClickableWord, DictionaryDetailsEditor};
 use crate::media_recorder::RecordButton;
 use crate::trainer_back_chain::BackChainGamePage;
@@ -236,35 +238,54 @@ fn ImageSearchPicker(
     }
 }
 
-/// Which of `MediaAttachmentFields`' image/audio fields a given card type
-/// actually uses — `image_to_target`/`sound_to_written`/`image_to_audio`
-/// each want a specific, narrow subset. Video and `YouTube` aren't part of
-/// this: they're supplementary media that can ride alongside *any* type
-/// (`ReviewPage`'s generic `media_view` already renders whichever of the
-/// four fields a card has, for every type except `image_to_audio`/
-/// `sentence_translation`), not something tied to one particular type the
-/// way image and audio are — confirmed live as a real regression, not
-/// just a test-script mismatch, when gating them the same way made
-/// video/`YouTube` unreachable from every card type's own create/edit
-/// form.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MediaFields {
-    Image,
-    Audio,
-    ImageAndAudio,
+/// Which of `MediaAttachmentFields`' media fields a given card type
+/// actually uses. Each type wants a specific, narrow subset: images for
+/// `image_to_target`, audio for `sound_to_written`, both for
+/// `image_to_audio`, and video (an uploaded file or a `YouTube` link) for
+/// `video_to_written` only — no other type offers video or `YouTube`.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct MediaFields {
+    image: bool,
+    audio: bool,
+    /// Video file *and* `YouTube` link — they're the same kind of prompt.
+    video: bool,
+}
+
+impl MediaFields {
+    /// Adds whatever a card already carries, so an existing attachment
+    /// that its type wouldn't normally offer is still visible (and
+    /// removable) on its edit form.
+    fn with_existing(self, image: bool, audio: bool, video: bool) -> Self {
+        Self {
+            image: self.image || image,
+            audio: self.audio || audio,
+            video: self.video || video,
+        }
+    }
 }
 
 /// `card_type`'s nominal `MediaFields` — shared by `NewCardPage`/
-/// `BulkAddPage` (a brand new card only ever has the image/audio fields
-/// its chosen type actually uses, though video/YouTube are always
-/// offered regardless — see `MediaFields`'s own doc comment). `EditCardPage`
-/// starts from this too, but widens it to `ImageAndAudio` when the card
-/// already has the *other* one set — see its own call site.
+/// `BulkAddPage` and `EditCardPage` (which widens it with
+/// `MediaFields::with_existing`).
 fn media_fields_for(card_type: &str) -> MediaFields {
     match card_type {
-        "sound_to_written" => MediaFields::Audio,
-        "image_to_target" => MediaFields::Image,
-        _ => MediaFields::ImageAndAudio,
+        "sound_to_written" => MediaFields {
+            audio: true,
+            ..MediaFields::default()
+        },
+        "video_to_written" => MediaFields {
+            video: true,
+            ..MediaFields::default()
+        },
+        "image_to_audio" => MediaFields {
+            image: true,
+            audio: true,
+            ..MediaFields::default()
+        },
+        _ => MediaFields {
+            image: true,
+            ..MediaFields::default()
+        },
     }
 }
 
@@ -286,7 +307,7 @@ fn MediaAttachmentFields(
     #[prop(default = false)] has_audio: bool,
     #[prop(default = false)] has_video: bool,
     #[prop(default = false)] has_youtube: bool,
-    #[prop(default = MediaFields::ImageAndAudio)] fields: MediaFields,
+    #[prop(default = MediaFields { image: true, audio: true, video: false })] fields: MediaFields,
     // Appended to every field name below ("image", "audio", "card_type",
     // ...) — empty for NewCardPage/EditCardPage (one card per form, so
     // plain names), `"_{idx}"` for BulkAddPage (many cards in one
@@ -362,43 +383,45 @@ fn MediaAttachmentFields(
         })}
     };
 
-    let image_or_audio_fields = match fields {
-        MediaFields::Image => image_fields.into_any(),
-        MediaFields::Audio => audio_fields.into_any(),
-        MediaFields::ImageAndAudio => view! { {image_fields} {audio_fields} }.into_any(),
-    };
+    let show_video = fields.video;
+    let show_youtube = fields.video;
 
     view! {
-        {image_or_audio_fields}
-        <label>
-            {video_label}
-            <input
-                type="file"
-                name=format!("video{field_suffix}")
-                accept="video/*"
-                node_ref=video_input
-            />
-        </label>
-        <RecordButton kind="video" target_input=video_input />
-        {has_video.then(|| view! {
+        {fields.image.then_some(image_fields)}
+        {fields.audio.then_some(audio_fields)}
+        {show_video.then(|| view! {
             <label>
-                <input type="checkbox" name=format!("remove_video{field_suffix}") />
-                "Remove video"
+                {video_label}
+                <input
+                    type="file"
+                    name=format!("video{field_suffix}")
+                    accept="video/*"
+                    node_ref=video_input
+                />
             </label>
+            <RecordButton kind="video" target_input=video_input />
+            {has_video.then(|| view! {
+                <label>
+                    <input type="checkbox" name=format!("remove_video{field_suffix}") />
+                    "Remove video"
+                </label>
+            })}
         })}
-        <label>
-            {youtube_label}
-            <input
-                type="url"
-                name=format!("youtube_url{field_suffix}")
-                placeholder="https://www.youtube.com/watch?v=..."
-            />
-        </label>
-        {has_youtube.then(|| view! {
+        {show_youtube.then(|| view! {
             <label>
-                <input type="checkbox" name=format!("remove_youtube{field_suffix}") />
-                "Remove YouTube link"
+                {youtube_label}
+                <input
+                    type="url"
+                    name=format!("youtube_url{field_suffix}")
+                    placeholder="https://www.youtube.com/watch?v=..."
+                />
             </label>
+            {has_youtube.then(|| view! {
+                <label>
+                    <input type="checkbox" name=format!("remove_youtube{field_suffix}") />
+                    "Remove YouTube link"
+                </label>
+            })}
         })}
     }
     .into_any()
@@ -427,6 +450,10 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
             <head>
                 <meta charset="utf-8"/>
                 <meta name="viewport" content="width=device-width, initial-scale=1"/>
+                // Real-user performance beacon — see rum.js and perf.rs. First
+                // in <head> so it's already listening when a later script
+                // (the wasm bundle) errors or panics.
+                <script inner_html=include_str!("rum.js")></script>
                 <AutoReload options=options.clone() />
                 <HydrationScripts options/>
                 <link id="leptos" rel="stylesheet" href="/pkg/web.css"/>
@@ -501,6 +528,8 @@ pub fn App() -> impl IntoView {
                 <A href="/decks">"Decks"</A>
                 " · "
                 <A href="/wiki">"Grammar"</A>
+                " · "
+                <A href="/dictionary">"Dictionary"</A>
                 // Public like Decks/Grammar — nothing is mutated or
                 // persisted by walking a back-chain, so it needs no
                 // account, unlike the other two practice modes below.
@@ -581,6 +610,8 @@ pub fn App() -> impl IntoView {
                     <Route path=StaticSegment("bulk-add") view=BulkAddPage/>
                     <Route path=path!("/cards/:id") view=EditCardPage/>
                     <Route path=StaticSegment("decks") view=DecksPage/>
+                    <Route path=StaticSegment("dictionary") view=DictionaryPage/>
+                    <Route path=path!("/dictionary/:id") view=DictionaryEntryPage/>
                     <Route path=StaticSegment("wiki") view=WikiListPage/>
                     // The slug is cosmetic — routing is by :id alone, so a
                     // page surviving a rename/reparent never breaks a link
@@ -764,6 +795,7 @@ fn CardListPage() -> impl IntoView {
             .and_then(|id| Uuid::parse_str(&id).ok()),
     );
     let page = RwSignal::new(0_i64);
+    let page_size = RwSignal::new(CARDS_PAGE_SIZE);
 
     let tags = Resource::new(|| (), |()| list_tags());
     let decks = Resource::new(|| (), |()| list_decks());
@@ -774,10 +806,13 @@ fn CardListPage() -> impl IntoView {
                 tag_filter.get(),
                 deck_filter.get(),
                 page.get(),
+                page_size.get(),
                 delete.version().get(),
             )
         },
-        |(tag, deck_id, page, _)| crate::cards::list_cards(tag, deck_id, page),
+        |(tag, deck_id, page, page_size, _)| {
+            crate::cards::list_cards(tag, deck_id, page, page_size)
+        },
     );
 
     // A delete can empty out the last page (e.g. the one card left on page
@@ -841,6 +876,26 @@ fn CardListPage() -> impl IntoView {
                     </Transition>
                 </select>
             </label>
+            " "
+            <label>
+                "Cards per page "
+                <select
+                    prop:value=move || page_size.get().to_string()
+                    on:change=move |ev| {
+                        if let Ok(new_size) = event_target_value(&ev).parse::<i64>() {
+                            // Keep the first card currently on screen in
+                            // view rather than snapping back to page 1.
+                            let first_item = page.get_untracked() * page_size.get_untracked();
+                            page_size.set(new_size);
+                            page.set(first_item / new_size);
+                        }
+                    }
+                >
+                    {CARDS_PAGE_SIZE_OPTIONS.into_iter().map(|n| view! {
+                        <option value=n.to_string()>{n.to_string()}</option>
+                    }).collect_view()}
+                </select>
+            </label>
         </div>
         <Transition fallback=|| view! { <p>"Loading…"</p> }>
             {move || Suspend::new(async move {
@@ -864,20 +919,26 @@ fn CardListPage() -> impl IntoView {
                     Ok(result) => {
                         let total = result.total;
                         let current_page = page.get_untracked();
-                        let total_pages = ((total + CARDS_PAGE_SIZE - 1) / CARDS_PAGE_SIZE).max(1);
-                        let has_more = (current_page + 1) * CARDS_PAGE_SIZE < total;
+                        let size = page_size.get_untracked();
+                        let total_pages = ((total + size - 1) / size).max(1);
                         view! {
+                        <CardPager page current_page total_pages total size />
                         <ul class="card-grid">
                             {result.cards
                                 .into_iter()
                                 .map(|card| {
                                     let edit_href = format!("/cards/{}", card.id);
+                                    // The small preview when there is one: the grid shows
+                                    // up to 200 of these, so full-size originals (often
+                                    // 200-800 KB each) would dominate load time. Lazy, so
+                                    // only the ones scrolled into view are fetched.
+                                    let image = card.thumb_url.or(card.image_url);
                                     view! {
                                         <li>
                                             {card.source_text.map(|text| view! { <p>{text}</p> })}
-                                            {card
-                                                .image_url
-                                                .map(|url| view! { <img src=url alt="" /> })}
+                                            {image.map(|url| view! {
+                                                <img src=url alt="" loading="lazy" decoding="async" />
+                                            })}
                                             {card
                                                 .audio_url
                                                 .map(|url| view! { <audio controls src=url></audio> })}
@@ -923,25 +984,7 @@ fn CardListPage() -> impl IntoView {
                                 })
                                 .collect_view()}
                         </ul>
-                        {(total_pages > 1).then(|| view! {
-                            <div class="card-pager">
-                                <button
-                                    type="button"
-                                    disabled=current_page == 0
-                                    on:click=move |_| page.update(|p| *p -= 1)
-                                >
-                                    "Previous"
-                                </button>
-                                <span>{format!("Page {} of {total_pages}", current_page + 1)}</span>
-                                <button
-                                    type="button"
-                                    disabled=!has_more
-                                    on:click=move |_| page.update(|p| *p += 1)
-                                >
-                                    "Next"
-                                </button>
-                            </div>
-                        })}
+                        <CardPager page current_page total_pages total size />
                     }
                     .into_any()
                     }
@@ -949,6 +992,61 @@ fn CardListPage() -> impl IntoView {
                 }
             })}
         </Transition>
+    }
+}
+
+/// "Showing 51–100 of 3,336", first/previous/next/last buttons and a page
+/// box to jump straight to a page. Rendered above and below the grid so
+/// it's reachable without scrolling past a screenful of images.
+#[component]
+pub(crate) fn CardPager(
+    page: RwSignal<i64>,
+    current_page: i64,
+    total_pages: i64,
+    total: i64,
+    size: i64,
+) -> impl IntoView {
+    let first = current_page * size + 1;
+    let last = ((current_page + 1) * size).min(total);
+    let at_start = current_page == 0;
+    let at_end = current_page + 1 >= total_pages;
+    view! {
+        <div class="card-pager">
+            <span class="card-pager-range">
+                {format!("Showing {first}–{last} of {total}")}
+            </span>
+            <button type="button" disabled=at_start on:click=move |_| page.set(0)>
+                "First"
+            </button>
+            <button type="button" disabled=at_start on:click=move |_| page.update(|p| *p -= 1)>
+                "Previous"
+            </button>
+            <label class="card-pager-jump">
+                "Page "
+                <input
+                    type="number"
+                    min="1"
+                    max=total_pages.to_string()
+                    prop:value=(current_page + 1).to_string()
+                    on:change=move |ev| {
+                        if let Ok(n) = event_target_value(&ev).parse::<i64>() {
+                            page.set((n - 1).clamp(0, total_pages - 1));
+                        }
+                    }
+                />
+                {format!(" of {total_pages}")}
+            </label>
+            <button type="button" disabled=at_end on:click=move |_| page.update(|p| *p += 1)>
+                "Next"
+            </button>
+            <button
+                type="button"
+                disabled=at_end
+                on:click=move |_| page.set(total_pages - 1)
+            >
+                "Last"
+            </button>
+        </div>
     }
 }
 
@@ -1022,11 +1120,10 @@ fn NewCardPage() -> impl IntoView {
                             "Card type "
                             <select
                                 name="card_type"
-                                prop:value=move || card_type.get()
                                 on:change=move |ev| card_type.set(event_target_value(&ev))
                             >
                                 {CARD_TYPES.iter().map(|(value, label)| {
-                                    view! { <option value=*value>{*label}</option> }
+                                    view! { <option value=*value selected=move || card_type.get() == *value>{*label}</option> }
                                 }).collect_view()}
                             </select>
                         </label>
@@ -1252,11 +1349,10 @@ fn BulkAddPage() -> impl IntoView {
                                                 "Card type "
                                                 <select
                                                     name=format!("card_type{suffix}")
-                                                    prop:value=move || card_type.get()
                                                     on:change=move |ev| card_type.set(event_target_value(&ev))
                                                 >
                                                     {CARD_TYPES.iter().map(|(value, label)| {
-                                                        view! { <option value=*value>{*label}</option> }
+                                                        view! { <option value=*value selected=move || card_type.get() == *value>{*label}</option> }
                                                     }).collect_view()}
                                                 </select>
                                             </label>
@@ -1486,11 +1582,10 @@ fn CardEditForm(
                 "Card type "
                 <select
                     name="card_type"
-                    prop:value=move || card_type_signal.get()
                     on:change=move |ev| card_type_signal.set(event_target_value(&ev))
                 >
                     {CARD_TYPES.iter().map(|(value, label)| {
-                        view! { <option value=*value>{*label}</option> }
+                        view! { <option value=*value selected=move || card_type_signal.get() == *value>{*label}</option> }
                     }).collect_view()}
                 </select>
             </label>
@@ -1504,20 +1599,15 @@ fn CardEditForm(
                     }
                     .into_any()
                 } else {
-                    // Narrowed from the type's nominal MediaFields only
-                    // when nothing already set would end up hidden with no
-                    // other way left on this form to see or remove it —
-                    // e.g. a card that's (say) sound_to_written but already
-                    // carries an image from before this type existed.
-                    // Video/youtube need no such check: MediaAttachmentFields
-                    // always offers them regardless of `fields`.
-                    let card_type = card_type_signal.get();
-                    let nominal = media_fields_for(&card_type);
-                    let fields = match nominal {
-                        MediaFields::Audio if has_image => MediaFields::ImageAndAudio,
-                        MediaFields::Image if has_audio => MediaFields::ImageAndAudio,
-                        other => other,
-                    };
+                    // The type's own fields, plus whatever the card already
+                    // carries — so an attachment its type wouldn't normally
+                    // offer (e.g. an image on an audio card, or a video on
+                    // any non-video card) can still be seen and removed.
+                    let fields = media_fields_for(&card_type_signal.get()).with_existing(
+                        has_image,
+                        has_audio,
+                        has_video || has_youtube,
+                    );
                     view! {
                         <MediaAttachmentFields
                             editing=true
@@ -1935,11 +2025,27 @@ fn EditCardPage() -> impl IntoView {
                 remove_link.version().get(),
             )
         },
+        // The word's dictionary entry is fetched here, inside the
+        // Resource, rather than with a bare `.await` in the `Suspend`
+        // below: a Resource's value is serialized into the server-rendered
+        // page and reused by the client, but a plain server-fn call inside
+        // `Suspend` is re-run (a real network request) while the client is
+        // mid-hydration, so the client's view of the page resolves later
+        // than the server's and the two disagree about where the markers
+        // are. CI reproduced the resulting "expected a marker node" panic
+        // on every card page (hydration.spec.ts).
         |(id, ..)| async move {
-            match id {
-                Some(id) => get_card(id).await,
-                None => Ok(None),
-            }
+            let Some(id) = id else {
+                return Ok::<_, ServerFnError>(None);
+            };
+            let Some(detail) = get_card(id).await? else {
+                return Ok(None);
+            };
+            let definition = get_word_definition(detail.target_text.clone())
+                .await
+                .ok()
+                .flatten();
+            Ok(Some((detail, definition)))
         },
     );
     let decks = Resource::new(|| (), |()| list_decks());
@@ -1973,7 +2079,7 @@ fn EditCardPage() -> impl IntoView {
                 match card.await {
                     Ok(None) => view! { <p>"Card not found."</p> }.into_any(),
                     Err(e) => view! { <p>"Error: " {e.to_string()}</p> }.into_any(),
-                    Ok(Some(detail)) => {
+                    Ok(Some((detail, existing_definition))) => {
                         let deck_ids = detail.deck_ids.clone();
                         let page_ids = detail.page_ids.clone();
 
@@ -1983,10 +2089,6 @@ fn EditCardPage() -> impl IntoView {
                         // just-edited rename not yet submitted — rather than
                         // the stale value this page loaded with.
                         let target_text_signal = RwSignal::new(detail.target_text.clone());
-                        let existing_definition = get_word_definition(detail.target_text.clone())
-                            .await
-                            .ok()
-                            .flatten();
 
                         // Every child component here returns `impl IntoView`,
                         // not `AnyView` — fine individually, but composing
@@ -3700,10 +3802,24 @@ fn ReviewPage() -> impl IntoView {
                                 {q.due_review_count} " due · " {q.new_available_today} " new available today"
                             </p>
                         };
-                        match q.cards.into_iter().next() {
+                        let mut queued = q.cards.into_iter();
+                        let first = queued.next();
+                        // The next card's image is fetched now, hidden, while this
+                        // one is being answered — so grading moves to a card whose
+                        // image is already in the browser's cache instead of
+                        // waiting on the network.
+                        let preload = queued
+                            .next()
+                            .and_then(|next| next.thumb_url.or(next.image_url))
+                            .map(|url| view! {
+                                <img src=url alt="" hidden=true aria-hidden="true" decoding="async" />
+                            });
+                        match first {
                             None => view! { {counts} <p>"Nothing due. Nice."</p> }.into_any(),
                             Some(card) => {
                                 let card_id = card.id;
+                                // Same preview-first choice as the card grid.
+                                let review_image = card.thumb_url.clone().or_else(|| card.image_url.clone());
                                 let direction = card.direction;
                                 // image_to_audio is the one type where the
                                 // generic media_view below would be wrong, not
@@ -3718,7 +3834,7 @@ fn ReviewPage() -> impl IntoView {
                                 // same slot media_view would), which the
                                 // generic path already does handle inline below.
                                 let prompt_and_answer = if card.card_type == "image_to_audio" {
-                                    let image = card.image_url.map(|url| view! { <img src=url alt="" /> });
+                                    let image = review_image.map(|url| view! { <img src=url alt="" decoding="async" /> });
                                     let audio = card
                                         .audio_url
                                         .map(|url| view! { <audio controls src=url></audio> });
@@ -3748,7 +3864,7 @@ fn ReviewPage() -> impl IntoView {
                                             .into_any()
                                     } else {
                                         view! {
-                                            {card.image_url.map(|url| view! { <img src=url alt="" /> })}
+                                            {review_image.map(|url| view! { <img src=url alt="" decoding="async" /> })}
                                             {card.audio_url.map(|url| view! { <audio controls src=url></audio> })}
                                             {card.video_url.map(|url| view! { <video controls src=url></video> })}
                                             {card.youtube_url.map(youtube_embed)}
@@ -3799,6 +3915,7 @@ fn ReviewPage() -> impl IntoView {
                                             }>"Easy"</button>
                                         </div>
                                     </div>
+                                    {preload}
                                 }
                                 .into_any()
                             }
@@ -4062,5 +4179,49 @@ mod tests {
     #[test]
     fn rejects_an_empty_line() {
         assert_eq!(parse_bulk_line(""), None);
+    }
+}
+
+#[cfg(test)]
+mod media_fields_tests {
+    use super::*;
+
+    fn offered(card_type: &str) -> (bool, bool, bool) {
+        let f = media_fields_for(card_type);
+        (f.image, f.audio, f.video)
+    }
+
+    #[test]
+    fn each_card_type_offers_only_its_own_media_fields() {
+        assert_eq!(offered("image_to_target"), (true, false, false));
+        assert_eq!(offered("sound_to_written"), (false, true, false));
+        assert_eq!(offered("image_to_audio"), (true, true, false));
+        assert_eq!(offered("video_to_written"), (false, false, true));
+    }
+
+    #[test]
+    fn only_the_video_type_offers_video_and_youtube() {
+        for (card_type, _) in CARD_TYPES {
+            assert_eq!(
+                media_fields_for(card_type).video,
+                *card_type == "video_to_written",
+                "{card_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_audio_card_offers_no_image_or_video_field() {
+        let f = media_fields_for("sound_to_written");
+        assert!(f.audio && !f.image && !f.video);
+    }
+
+    #[test]
+    fn existing_attachments_stay_visible_on_a_type_that_would_hide_them() {
+        let f = media_fields_for("sound_to_written").with_existing(true, false, true);
+        assert!(f.image && f.audio && f.video);
+        // ...and adding nothing changes nothing.
+        let unchanged = media_fields_for("sound_to_written").with_existing(false, false, false);
+        assert!(unchanged == media_fields_for("sound_to_written"));
     }
 }

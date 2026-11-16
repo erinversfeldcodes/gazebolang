@@ -93,6 +93,8 @@ test("submitting an invalid YouTube link on the new-card form shows an inline er
 
   await page.goto("/new");
   await page.getByLabel("Target-language word/phrase").fill(word);
+  // Video and YouTube are offered on "Video → written" cards only.
+  await page.getByLabel("Card type").selectOption("video_to_written");
   await page.getByLabel("Or link a YouTube video").fill("https://example.com/not-a-youtube-link");
   await page.getByRole("button", { name: "Add" }).click();
 
@@ -113,6 +115,8 @@ test("saving an edited card with an invalid YouTube link shows an inline error w
 
   await page.goto("/new");
   await page.getByLabel("Target-language word/phrase").fill(word);
+  // Video and YouTube are offered on "Video → written" cards only.
+  await page.getByLabel("Card type").selectOption("video_to_written");
   await page.getByRole("button", { name: "Add" }).click();
   await expect(page).toHaveURL("/");
 
