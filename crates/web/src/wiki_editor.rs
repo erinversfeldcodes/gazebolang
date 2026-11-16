@@ -71,7 +71,20 @@ pub fn WikiEditor(
                         browser::unmount_with_snapshot(
                             &mount_id,
                             move |content_json, content_markdown| {
-                                cb.run((content_json, content_markdown));
+                                // Runs a microtask after this editor was torn
+                                // down, by which time whatever owned `cb` may
+                                // be disposed too (e.g. the page just left
+                                // edit mode via "Done", re-rendering its
+                                // Suspend) — `run` panics on a disposed
+                                // callback ("tried to access a reactive value
+                                // that has already been disposed", seen on
+                                // every wiki edit in CI). A disposed callback
+                                // means that owner is gone and has nothing
+                                // left to save, so skipping is correct.
+                                let _ = leptos::callback::Callable::try_run(
+                                    &cb,
+                                    (content_json, content_markdown),
+                                );
                             },
                         );
                     }

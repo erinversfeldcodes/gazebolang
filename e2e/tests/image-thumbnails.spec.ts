@@ -97,26 +97,34 @@ test("grid images are lazy-loaded", async ({ page }) => {
   );
 });
 
-test("review preloads the next card's image while the current one is answered", async ({ page }) => {
-  // Two cards with images in one deck: the deck's review shows the first
-  // and has the second's image already queued (hidden) in the page.
-  const { deckName } = await createCardInOwnDeck(page, "thumb-preload");
-  const wordA = await createCardWithImage(page, makePng(BIG.width, BIG.height), "thumb-preload-a");
-  const wordB = await createCardWithImage(page, makePng(BIG.width, BIG.height), "thumb-preload-b");
-  for (const word of [wordA, wordB]) {
-    await page.goto("/");
+test("review preloads the next card's image while the current one is answered", async ({
+  page,
+}) => {
+  // The deck holds an imageless card (made by the helper, so it's shown
+  // first — oldest first), then two cards with images. While the first is
+  // on screen, the next card's preview is already queued (hidden) in the
+  // page; grading moves on to a card showing that same, already-fetched URL.
+  const { deckName, word: plainWord } = await createCardInOwnDeck(page, "thumb-preload");
+  for (const prefix of ["thumb-preload-a", "thumb-preload-b"]) {
+    const word = await createCardWithImage(page, makePng(BIG.width, BIG.height), prefix);
     await page.locator("li", { hasText: word }).getByRole("link", { name: "Edit" }).click();
     await withServerResponse(page, "add_card_to_deck", () => page.getByLabel(deckName).check());
   }
 
   await page.goto("/review");
   await page.getByLabel("Deck").selectOption(deckName);
-  await expect(page.locator(".review-card img")).toBeVisible();
-  // At least one hidden preload image (the next card with an image).
-  await expect(page.locator("img[hidden]").first()).toHaveAttribute("src", /.+/);
-  const shown = await page.locator(".review-card img").first().getAttribute("src");
+  await expect(page.getByText("Reveal")).toBeVisible();
+  await expect(page.locator(".review-card img")).toHaveCount(0);
   const preloaded = await page.locator("img[hidden]").first().getAttribute("src");
-  expect(preloaded).not.toBe(shown);
+  expect(preloaded).toBeTruthy();
+
+  await page.getByText("Reveal").click();
+  await expect(page.getByText(plainWord, { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Good" }).click();
+
+  const shown = page.locator(".review-card img");
+  await expect(shown).toBeVisible();
+  expect(await shown.getAttribute("src")).toBe(preloaded);
 });
 
 test("the backfill makes previews for images stored before previews existed", async ({ page }) => {
