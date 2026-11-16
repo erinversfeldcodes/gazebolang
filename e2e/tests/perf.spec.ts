@@ -11,21 +11,30 @@ test("a page load sends a report with timings, and the server stores it", async 
   const stored = page.waitForResponse(
     (res) => res.url().endsWith("/api/perf") && res.request().method() === "POST",
   );
-  const sent = page.waitForRequest(
-    (req) => req.url().endsWith("/api/perf") && req.method() === "POST",
-  );
   await page.evaluate(() => (window as unknown as { __rumFlush: () => void }).__rumFlush());
-
-  const report = (await sent).postDataJSON();
-  expect(report.path).toBe("/");
-  expect(report.ttfb_ms).toBeGreaterThan(0);
-  expect(report.fcp_ms).toBeGreaterThan(0);
-  expect(report.hydrated_ms).toBeGreaterThan(0);
-  expect(report.js_error).toBeUndefined();
-  // The server reports its own timing on the navigation response.
-  expect(report.server_ms).toBeGreaterThanOrEqual(0);
-  expect(report.server_uptime_s).toBeGreaterThanOrEqual(0);
   expect((await stored).status()).toBe(204);
+
+  // The beacon's body isn't observable from Playwright (navigator.sendBeacon
+  // payloads come back as null from request.postDataJSON()), so check what
+  // actually matters instead: what the server stored.
+  const res = await page.request.get("/api/perf/summary?days=1");
+  expect(res.status()).toBe(200);
+  const rows = (await res.json()) as Array<{
+    path: string;
+    loads: number;
+    ttfb_p50: number;
+    fcp_p50: number;
+    hydrated_p50: number;
+    server_p50: number;
+  }>;
+  const home = rows.find((r) => r.path === "/");
+  expect(home, "a / row").toBeTruthy();
+  expect(home!.loads).toBeGreaterThan(0);
+  expect(home!.ttfb_p50).toBeGreaterThan(0);
+  expect(home!.fcp_p50).toBeGreaterThan(0);
+  expect(home!.hydrated_p50).toBeGreaterThan(0);
+  // Came from the response's Server-Timing header.
+  expect(home!.server_p50).toBeGreaterThanOrEqual(0);
 });
 
 test("the summary reports percentiles per release and route, with ids collapsed", async ({

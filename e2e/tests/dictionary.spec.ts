@@ -15,7 +15,7 @@ async function saveDictionaryDetails(
   // Dictionary details is an always-visible section now, not a disclosure
   // to expand first.
   if (details.english) {
-    await page.getByLabel("English translation").fill(details.english);
+    await page.getByLabel("English translation", { exact: true }).fill(details.english);
   }
   if (details.partOfSpeech) {
     await page.getByLabel("Part of speech").fill(details.partOfSpeech);
