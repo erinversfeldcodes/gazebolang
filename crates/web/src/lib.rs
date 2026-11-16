@@ -14,6 +14,7 @@ pub mod dictionary_ui;
 pub mod email;
 pub mod image_search;
 pub mod media_recorder;
+pub mod perf;
 pub mod state;
 pub mod storage;
 pub mod trainer_back_chain;

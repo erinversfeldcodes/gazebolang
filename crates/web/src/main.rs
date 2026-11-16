@@ -1006,6 +1006,7 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let conf = get_configuration(None).unwrap();
+    web::perf::init();
     let leptos_options = conf.leptos_options;
     let addr = leptos_options.site_addr;
     let routes = generate_route_list(App);
@@ -1025,6 +1026,13 @@ async fn main() {
         .run(&db_pool)
         .await
         .expect("failed to run database migrations");
+
+    // Keep the real-user performance table bounded.
+    match web::perf::prune(&db_pool, 90).await {
+        Ok(0) => {}
+        Ok(n) => log::info!("pruned {n} old perf reports"),
+        Err(e) => log::warn!("pruning perf reports failed: {e}"),
+    }
 
     let state = AppState {
         leptos_options: leptos_options.clone(),
@@ -1052,12 +1060,24 @@ async fn main() {
             "/api/importer/cards-with-broken-images",
             axum::routing::get(importer_cards_with_broken_images),
         )
+        .route(
+            "/api/perf",
+            axum::routing::post(web::perf::receive_report)
+                // A report is a few hundred bytes; don't let this public
+                // endpoint accept the 50MB the upload routes do.
+                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/api/perf/summary",
+            axum::routing::get(web::perf::summary_report),
+        )
         .route("/cards/new", axum::routing::post(cards_new))
         .route("/cards/bulk", axum::routing::post(cards_bulk))
         .route("/cards/{id}", axum::routing::post(cards_update))
         .fallback(leptos_axum::file_and_error_handler::<AppState, _>(shell))
         .layer(tower_cookies::CookieManagerLayer::new())
         .layer(axum::extract::DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
+        .layer(axum::middleware::from_fn(web::perf::server_timing))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

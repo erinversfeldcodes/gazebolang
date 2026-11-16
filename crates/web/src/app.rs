@@ -450,6 +450,10 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
             <head>
                 <meta charset="utf-8"/>
                 <meta name="viewport" content="width=device-width, initial-scale=1"/>
+                // Real-user performance beacon — see rum.js and perf.rs. First
+                // in <head> so it's already listening when a later script
+                // (the wasm bundle) errors or panics.
+                <script inner_html=include_str!("rum.js")></script>
                 <AutoReload options=options.clone() />
                 <HydrationScripts options/>
                 <link id="leptos" rel="stylesheet" href="/pkg/web.css"/>
