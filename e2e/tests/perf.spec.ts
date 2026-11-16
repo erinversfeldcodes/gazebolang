@@ -23,6 +23,7 @@ test("a page load sends a report with timings, and the server stores it", async 
     path: string;
     loads: number;
     ttfb_p50: number;
+    response_end_p50: number;
     fcp_p50: number;
     hydrated_p50: number;
     server_p50: number;
@@ -31,6 +32,7 @@ test("a page load sends a report with timings, and the server stores it", async 
   expect(home, "a / row").toBeTruthy();
   expect(home!.loads).toBeGreaterThan(0);
   expect(home!.ttfb_p50).toBeGreaterThan(0);
+  expect(home!.response_end_p50).toBeGreaterThan(0);
   expect(home!.fcp_p50).toBeGreaterThan(0);
   expect(home!.hydrated_p50).toBeGreaterThan(0);
   // Came from the response's Server-Timing header.

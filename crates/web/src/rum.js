@@ -92,6 +92,7 @@
       path: location.pathname,
       nav_type: nav.type,
       ttfb_ms: round(nav.responseStart),
+      response_end_ms: round(nav.responseEnd),
       fcp_ms: round(m.fcp_ms),
       lcp_ms: round(m.lcp_ms),
       dom_ready_ms: round(nav.domContentLoadedEventEnd),

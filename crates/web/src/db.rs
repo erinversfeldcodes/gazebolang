@@ -1622,6 +1622,71 @@ pub async fn search_cards(
         .await
 }
 
+// --- image thumbnails -----------------------------------------------------
+
+/// Thumbnails for the given full-image URLs, keyed by full URL. URLs with no
+/// recorded thumbnail are simply absent — callers fall back to the full
+/// image.
+pub async fn thumbnails_for(
+    pool: &PgPool,
+    image_urls: &[String],
+) -> sqlx::Result<std::collections::HashMap<String, String>> {
+    if image_urls.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT image_url, thumb_url FROM image_thumbnails WHERE image_url = ANY($1)",
+    )
+    .bind(image_urls)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Records (or replaces) the thumbnail for `image_url`. `thumb_url` equal to
+/// `image_url` means "use the original".
+pub async fn record_thumbnail(pool: &PgPool, image_url: &str, thumb_url: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO image_thumbnails (image_url, thumb_url) VALUES ($1, $2) \
+         ON CONFLICT (image_url) DO UPDATE SET thumb_url = EXCLUDED.thumb_url",
+    )
+    .bind(image_url)
+    .bind(thumb_url)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Card images hosted under `url_prefix` (our own storage) that have no
+/// thumbnail row yet, for the backfill — up to `limit`, plus how many are
+/// left in total.
+pub async fn images_without_thumbnails(
+    pool: &PgPool,
+    url_prefix: &str,
+    limit: i64,
+) -> sqlx::Result<(Vec<String>, i64)> {
+    let pattern = format!("{}/%", like_escape(url_prefix));
+    let urls = sqlx::query_scalar(
+        "SELECT DISTINCT c.image_url FROM cards c \
+         WHERE c.image_url LIKE $1 \
+           AND NOT EXISTS (SELECT 1 FROM image_thumbnails t WHERE t.image_url = c.image_url) \
+         ORDER BY c.image_url LIMIT $2",
+    )
+    .bind(&pattern)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let remaining = sqlx::query_scalar(
+        "SELECT count(DISTINCT c.image_url) FROM cards c \
+         WHERE c.image_url LIKE $1 \
+           AND NOT EXISTS (SELECT 1 FROM image_thumbnails t WHERE t.image_url = c.image_url)",
+    )
+    .bind(&pattern)
+    .fetch_one(pool)
+    .await?;
+    Ok((urls, remaining))
+}
+
 // --- dictionary browsing ----------------------------------------------
 
 /// One row of the dictionary index: a word that has at least one card.
@@ -1646,12 +1711,13 @@ pub enum DictionaryOrder {
 /// `%`/`_`/`\` in a user's search text must match literally, not act as
 /// `LIKE` wildcards.
 fn like_pattern(query: &str) -> String {
-    let escaped = query
-        .trim()
-        .replace('\\', "\\\\")
+    format!("%{}%", like_escape(query.trim()))
+}
+
+fn like_escape(text: &str) -> String {
+    text.replace('\\', "\\\\")
         .replace('%', "\\%")
-        .replace('_', "\\_");
-    format!("%{escaped}%")
+        .replace('_', "\\_")
 }
 
 /// Words that have at least one card, optionally filtered by a substring
@@ -3019,5 +3085,90 @@ mod tests {
             .collect();
         got.sort();
         assert_eq!(got, ["hotlinked", "no-image"]);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn thumbnails_round_trip_and_are_replaced_on_rerecord(pool: PgPool) {
+        assert!(thumbnails_for(&pool, &[]).await.unwrap().is_empty());
+        record_thumbnail(&pool, "https://s/cards/a", "https://s/cards/a-small")
+            .await
+            .unwrap();
+        record_thumbnail(&pool, "https://s/cards/b", "https://s/cards/b")
+            .await
+            .unwrap();
+        let got = thumbnails_for(
+            &pool,
+            &[
+                "https://s/cards/a".to_string(),
+                "https://s/cards/b".to_string(),
+                "https://s/cards/unknown".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.len(), 2, "an image with no row is simply absent");
+        assert_eq!(got["https://s/cards/a"], "https://s/cards/a-small");
+
+        record_thumbnail(&pool, "https://s/cards/a", "https://s/cards/a-new")
+            .await
+            .unwrap();
+        let got = thumbnails_for(&pool, &["https://s/cards/a".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(got["https://s/cards/a"], "https://s/cards/a-new");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn backfill_candidates_are_our_own_images_without_a_thumbnail_row(pool: PgPool) {
+        let user_id = test_user(&pool).await;
+        let make = |text: &'static str, image_url: &'static str| {
+            let pool = pool.clone();
+            async move {
+                create_card(
+                    &pool,
+                    user_id,
+                    NewCard {
+                        image_url,
+                        target_text: text,
+                        ..Default::default()
+                    },
+                    &[],
+                )
+                .await
+                .unwrap()
+            }
+        };
+        make("needs-one", "https://cdn.test/cards/needs").await;
+        make("has-one", "https://cdn.test/cards/has").await;
+        make("same-image", "https://cdn.test/cards/needs").await;
+        make("foreign", "https://pixabay.com/get/x.jpg").await;
+        make("no-image", "").await;
+        record_thumbnail(
+            &pool,
+            "https://cdn.test/cards/has",
+            "https://cdn.test/cards/has-t",
+        )
+        .await
+        .unwrap();
+
+        let (urls, remaining) = images_without_thumbnails(&pool, "https://cdn.test", 10)
+            .await
+            .unwrap();
+        // One row per distinct image, even though two cards share it; images
+        // not under our storage prefix are never candidates.
+        assert_eq!(urls, ["https://cdn.test/cards/needs"]);
+        assert_eq!(remaining, 1);
+
+        let (none, remaining) = images_without_thumbnails(&pool, "https://cdn.test", 0)
+            .await
+            .unwrap();
+        assert!(none.is_empty(), "limit 0 returns no urls");
+        assert_eq!(remaining, 1, "but still reports how many are left");
+
+        // A wildcard in the prefix must match literally.
+        let (urls, _) = images_without_thumbnails(&pool, "https://%", 10)
+            .await
+            .unwrap();
+        assert_eq!(urls, Vec::<String>::new());
     }
 }

@@ -928,12 +928,17 @@ fn CardListPage() -> impl IntoView {
                                 .into_iter()
                                 .map(|card| {
                                     let edit_href = format!("/cards/{}", card.id);
+                                    // The small preview when there is one: the grid shows
+                                    // up to 200 of these, so full-size originals (often
+                                    // 200-800 KB each) would dominate load time. Lazy, so
+                                    // only the ones scrolled into view are fetched.
+                                    let image = card.thumb_url.or(card.image_url);
                                     view! {
                                         <li>
                                             {card.source_text.map(|text| view! { <p>{text}</p> })}
-                                            {card
-                                                .image_url
-                                                .map(|url| view! { <img src=url alt="" /> })}
+                                            {image.map(|url| view! {
+                                                <img src=url alt="" loading="lazy" decoding="async" />
+                                            })}
                                             {card
                                                 .audio_url
                                                 .map(|url| view! { <audio controls src=url></audio> })}
@@ -3797,10 +3802,24 @@ fn ReviewPage() -> impl IntoView {
                                 {q.due_review_count} " due · " {q.new_available_today} " new available today"
                             </p>
                         };
-                        match q.cards.into_iter().next() {
+                        let mut queued = q.cards.into_iter();
+                        let first = queued.next();
+                        // The next card's image is fetched now, hidden, while this
+                        // one is being answered — so grading moves to a card whose
+                        // image is already in the browser's cache instead of
+                        // waiting on the network.
+                        let preload = queued
+                            .next()
+                            .and_then(|next| next.thumb_url.or(next.image_url))
+                            .map(|url| view! {
+                                <img src=url alt="" hidden=true aria-hidden="true" decoding="async" />
+                            });
+                        match first {
                             None => view! { {counts} <p>"Nothing due. Nice."</p> }.into_any(),
                             Some(card) => {
                                 let card_id = card.id;
+                                // Same preview-first choice as the card grid.
+                                let review_image = card.thumb_url.clone().or_else(|| card.image_url.clone());
                                 let direction = card.direction;
                                 // image_to_audio is the one type where the
                                 // generic media_view below would be wrong, not
@@ -3815,7 +3834,7 @@ fn ReviewPage() -> impl IntoView {
                                 // same slot media_view would), which the
                                 // generic path already does handle inline below.
                                 let prompt_and_answer = if card.card_type == "image_to_audio" {
-                                    let image = card.image_url.map(|url| view! { <img src=url alt="" /> });
+                                    let image = review_image.map(|url| view! { <img src=url alt="" decoding="async" /> });
                                     let audio = card
                                         .audio_url
                                         .map(|url| view! { <audio controls src=url></audio> });
@@ -3845,7 +3864,7 @@ fn ReviewPage() -> impl IntoView {
                                             .into_any()
                                     } else {
                                         view! {
-                                            {card.image_url.map(|url| view! { <img src=url alt="" /> })}
+                                            {review_image.map(|url| view! { <img src=url alt="" decoding="async" /> })}
                                             {card.audio_url.map(|url| view! { <audio controls src=url></audio> })}
                                             {card.video_url.map(|url| view! { <video controls src=url></video> })}
                                             {card.youtube_url.map(youtube_embed)}
@@ -3896,6 +3915,7 @@ fn ReviewPage() -> impl IntoView {
                                             }>"Easy"</button>
                                         </div>
                                     </div>
+                                    {preload}
                                 }
                                 .into_any()
                             }

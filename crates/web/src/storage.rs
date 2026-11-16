@@ -82,6 +82,13 @@ impl Storage {
         })
     }
 
+    /// Where this storage's public objects live — the prefix of every URL
+    /// `upload` returns.
+    #[must_use]
+    pub fn public_url_prefix(&self) -> &str {
+        self.public_base_url.trim_end_matches('/')
+    }
+
     pub async fn upload(
         &self,
         key: &str,
@@ -89,10 +96,20 @@ impl Storage {
         bytes: &[u8],
     ) -> Result<String, String> {
         let bucket = &self.bucket;
+        // Card media keys are random and never rewritten, so what's behind a
+        // URL can't change: let browsers keep it for a year instead of
+        // re-fetching after an hour. Other keys (health checks) are fixed
+        // and rewritten, so they keep the default.
+        let cache_control = if key.starts_with("cards/") {
+            "public, max-age=31536000, immutable"
+        } else {
+            "no-cache"
+        };
         self.client
             .objects()
             .put(bucket, key)
             .content_type(content_type)
+            .and_then(|put| put.cache_control(cache_control))
             .inspect_err(|e| log::error!("storage: upload to {bucket}/{key} failed: {e}"))
             .map_err(|e| e.to_string())?
             .body_bytes(bytes.to_vec())
@@ -100,10 +117,53 @@ impl Storage {
             .await
             .inspect_err(|e| log::error!("storage: upload to {bucket}/{key} failed: {e}"))
             .map_err(|e| e.to_string())?;
-        Ok(format!(
-            "{}/{key}",
-            self.public_base_url.trim_end_matches('/')
-        ))
+        Ok(format!("{}/{key}", self.public_url_prefix()))
+    }
+
+    /// Uploads an image for a card, plus a small preview of it when one
+    /// helps (see `thumbnail::make_thumbnail`), and records the pairing in
+    /// `image_thumbnails`. Returns the full image's URL. A thumbnail that
+    /// can't be made or stored is logged and skipped — the card just falls
+    /// back to showing the full image, which is no worse than before.
+    pub async fn upload_card_image(
+        &self,
+        pool: &sqlx::PgPool,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<String, String> {
+        let key = format!("cards/{}", random_key());
+        let url = self.upload(&key, content_type, bytes).await?;
+        let thumb_url = self.make_and_upload_thumbnail(bytes, &url).await;
+        if let Err(e) = crate::db::record_thumbnail(pool, &url, &thumb_url).await {
+            log::warn!("storage: recording the thumbnail for {url} failed: {e}");
+        }
+        Ok(url)
+    }
+
+    /// The thumbnail's URL, or `image_url` itself when the original should
+    /// be used as-is (already small, unsupported format, or undecodable).
+    pub(crate) async fn make_and_upload_thumbnail(&self, bytes: &[u8], image_url: &str) -> String {
+        let owned = bytes.to_vec();
+        let made = tokio::task::spawn_blocking(move || crate::thumbnail::make_thumbnail(&owned))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+        match made {
+            Ok(Some(jpeg)) => {
+                let key = format!("cards/{}", random_key());
+                match self.upload(&key, "image/jpeg", &jpeg).await {
+                    Ok(thumb_url) => thumb_url,
+                    Err(e) => {
+                        log::warn!("storage: uploading the thumbnail for {image_url} failed: {e}");
+                        image_url.to_string()
+                    }
+                }
+            }
+            Ok(None) => image_url.to_string(),
+            Err(e) => {
+                log::warn!("storage: no thumbnail for {image_url}: {e}");
+                image_url.to_string()
+            }
+        }
     }
 }
 

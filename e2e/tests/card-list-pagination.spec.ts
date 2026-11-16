@@ -51,6 +51,11 @@ test.describe("card list paging", () => {
     await page.getByLabel("Cards per page").selectOption("12");
 
     const pager = page.locator(".card-pager").first();
+    // Wait for the page-size change to finish re-rendering the pager before
+    // typing into it: on a slow backend (the preview stack) the refetch
+    // lands after `fill`, replacing the input with a fresh one showing "1"
+    // and silently discarding what was typed.
+    await expect(pager.getByText(`Showing 1–12 of ${COUNT}`)).toBeVisible();
     await pager.getByLabel("Page").fill("2");
     await pager.getByLabel("Page").press("Enter");
     await expect(pager.getByText(`Showing 13–13 of ${COUNT}`)).toBeVisible();

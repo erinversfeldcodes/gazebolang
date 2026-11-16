@@ -116,14 +116,19 @@ async fn upload_media_field(
     }
     match (&state.storage, content_type) {
         (Some(storage), Some(content_type)) => {
-            let key = format!("cards/{}", web::storage::random_key());
-            let url = storage
-                .upload(&key, &content_type, &data)
-                .await
-                .map_err(|e| {
-                    log::error!("card {kind} upload failed: {e}");
-                    (axum::http::StatusCode::BAD_GATEWAY, e)
-                })?;
+            let uploaded = if kind == "image" {
+                // Also stores a small preview for the grid and review.
+                storage
+                    .upload_card_image(&state.db_pool, &content_type, &data)
+                    .await
+            } else {
+                let key = format!("cards/{}", web::storage::random_key());
+                storage.upload(&key, &content_type, &data).await
+            };
+            let url = uploaded.map_err(|e| {
+                log::error!("card {kind} upload failed: {e}");
+                (axum::http::StatusCode::BAD_GATEWAY, e)
+            })?;
             Ok(Some(url))
         }
         (None, _) => {
@@ -1066,6 +1071,10 @@ async fn main() {
                 // A report is a few hundred bytes; don't let this public
                 // endpoint accept the 50MB the upload routes do.
                 .layer(axum::extract::DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/api/admin/backfill-thumbnails",
+            axum::routing::post(web::thumbnail::backfill_handler),
         )
         .route(
             "/api/perf/summary",

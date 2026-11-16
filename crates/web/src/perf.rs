@@ -40,10 +40,13 @@ pub fn release() -> String {
     std::env::var("FLY_MACHINE_VERSION").unwrap_or_else(|_| "dev".to_string())
 }
 
-/// Adds `Server-Timing: app;dur=<ms to produce the response headers>,
-/// up;dur=<seconds since the process booted>` to every response, which the
-/// browser exposes on the navigation entry — so each report carries how
-/// long the server took and whether it had just cold-started.
+/// Adds a `Server-Timing` header to every response: `app` is the time in
+/// milliseconds to produce the response headers (first byte only — the page
+/// shell streams immediately, so it says little about slow queries; see
+/// `response_end_ms` for the full page) and `up` is seconds since the
+/// process booted. The browser exposes both on the navigation entry, so
+/// each report carries the server's timing and whether it had just
+/// cold-started.
 pub async fn server_timing(
     request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -110,6 +113,7 @@ pub struct PerfReport {
     pub path: String,
     pub nav_type: Option<String>,
     pub ttfb_ms: Option<f64>,
+    pub response_end_ms: Option<f64>,
     pub fcp_ms: Option<f64>,
     pub lcp_ms: Option<f64>,
     pub dom_ready_ms: Option<f64>,
@@ -137,8 +141,8 @@ pub async fn insert_report(pool: &PgPool, release: &str, report: PerfReport) -> 
         "INSERT INTO perf_events \
          (release, path, nav_type, ttfb_ms, fcp_ms, lcp_ms, dom_ready_ms, load_ms, hydrated_ms, \
           cls, inp_ms, server_ms, server_uptime_s, wasm_transfer_bytes, wasm_decoded_bytes, \
-          wasm_fetch_ms, connection, viewport_w, js_error) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)",
+          wasm_fetch_ms, connection, viewport_w, js_error, response_end_ms) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)",
     )
     .bind(release)
     .bind(normalize_path(&report.path))
@@ -159,6 +163,7 @@ pub async fn insert_report(pool: &PgPool, release: &str, report: PerfReport) -> 
     .bind(clip(report.connection, 12))
     .bind(clamp(report.viewport_w, 20_000.0))
     .bind(clip(report.js_error, 400))
+    .bind(clamp(report.response_end_ms, MS_MAX))
     .execute(pool)
     .await?;
     Ok(())
@@ -228,6 +233,10 @@ pub struct SummaryRow {
     pub last_seen: time::OffsetDateTime,
     pub ttfb_p50: Option<f64>,
     pub ttfb_p95: Option<f64>,
+    /// Whole HTML response received, including streamed data-dependent
+    /// sections — the metric that reflects slow queries.
+    pub response_end_p50: Option<f64>,
+    pub response_end_p95: Option<f64>,
     pub fcp_p50: Option<f64>,
     pub fcp_p95: Option<f64>,
     pub lcp_p50: Option<f64>,
@@ -257,6 +266,8 @@ pub async fn summary(pool: &PgPool, days: i32) -> sqlx::Result<Vec<SummaryRow>> 
                 min(created_at) AS first_seen, max(created_at) AS last_seen, \
                 percentile_cont(0.5) WITHIN GROUP (ORDER BY ttfb_ms) AS ttfb_p50, \
                 percentile_cont(0.95) WITHIN GROUP (ORDER BY ttfb_ms) AS ttfb_p95, \
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY response_end_ms) AS response_end_p50, \
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY response_end_ms) AS response_end_p95, \
                 percentile_cont(0.5) WITHIN GROUP (ORDER BY fcp_ms) AS fcp_p50, \
                 percentile_cont(0.95) WITHIN GROUP (ORDER BY fcp_ms) AS fcp_p95, \
                 percentile_cont(0.5) WITHIN GROUP (ORDER BY lcp_ms) AS lcp_p50, \
@@ -286,22 +297,55 @@ pub async fn summary(pool: &PgPool, days: i32) -> sqlx::Result<Vec<SummaryRow>> 
     .await
 }
 
+/// Minimum length of `PERF_API_TOKEN` for it to be honoured at all — a short
+/// or empty secret must never act as a password.
+const MIN_TOKEN_LEN: usize = 32;
+
+/// True when `authorization` is `Bearer <token>` and the token equals the
+/// configured secret. Compares in constant time so response timing can't be
+/// used to guess the token a byte at a time.
+fn bearer_token_matches(authorization: Option<&str>, configured: Option<&str>) -> bool {
+    let (Some(authorization), Some(configured)) = (authorization, configured) else {
+        return false;
+    };
+    let Some(presented) = authorization.strip_prefix("Bearer ") else {
+        return false;
+    };
+    if configured.len() < MIN_TOKEN_LEN || presented.len() != configured.len() {
+        return false;
+    }
+    presented
+        .bytes()
+        .zip(configured.bytes())
+        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SummaryQuery {
     days: Option<i32>,
 }
 
 /// `GET /api/perf/summary?days=7` — percentiles per release and route as
-/// JSON. Needs a signed-in session (the same cookie the app uses), so it's
-/// not a public view of usage data.
+/// JSON. Needs either a signed-in session (the same cookie the app uses) or
+/// `Authorization: Bearer <PERF_API_TOKEN>`, so it's not a public view of
+/// usage data. The token is a Fly secret, unset by default (no token access).
 pub async fn summary_report(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     cookies: tower_cookies::Cookies,
     Query(query): Query<SummaryQuery>,
 ) -> axum::response::Response {
-    if crate::auth::require_user(&state.db_pool, &cookies)
-        .await
-        .is_err()
+    let has_token = bearer_token_matches(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+        std::env::var("PERF_API_TOKEN").ok().as_deref(),
+    );
+    if !has_token
+        && crate::auth::require_user(&state.db_pool, &cookies)
+            .await
+            .is_err()
     {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -363,6 +407,24 @@ mod tests {
         assert_eq!(clip(Some(String::new()), 10), None);
     }
 
+    #[test]
+    fn only_the_exact_long_enough_bearer_token_is_accepted() {
+        let secret = "a".repeat(40);
+        let header = format!("Bearer {secret}");
+        assert!(bearer_token_matches(Some(&header), Some(&secret)));
+        // Wrong token, wrong scheme, missing header, missing secret.
+        assert!(!bearer_token_matches(
+            Some(&format!("Bearer {}b", "a".repeat(39))),
+            Some(&secret)
+        ));
+        assert!(!bearer_token_matches(Some(&secret), Some(&secret)));
+        assert!(!bearer_token_matches(None, Some(&secret)));
+        assert!(!bearer_token_matches(Some(&header), None));
+        // A short secret is never honoured, even when presented exactly.
+        assert!(!bearer_token_matches(Some("Bearer short"), Some("short")));
+        assert!(!bearer_token_matches(Some("Bearer "), Some("")));
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn reports_are_stored_normalized_and_summarised_per_release(pool: PgPool) {
         for (release, ttfb) in [("v1", 100.0), ("v1", 300.0), ("v2", 50.0)] {
@@ -372,6 +434,7 @@ mod tests {
                 PerfReport {
                     path: "/cards/09e6f782-bfd0-44e3-8b8e-5ef8433739e6".into(),
                     ttfb_ms: Some(ttfb),
+                    response_end_ms: Some(ttfb * 4.0),
                     hydrated_ms: Some(900.0),
                     ..Default::default()
                 },
@@ -397,6 +460,7 @@ mod tests {
         assert_eq!(v1.path, "/cards/:id");
         assert_eq!(v1.loads, 2);
         assert_eq!(v1.ttfb_p50, Some(200.0));
+        assert_eq!(v1.response_end_p50, Some(800.0));
         assert_eq!(v1.errors, 0);
         let v2 = rows.iter().find(|r| r.release == "v2").unwrap();
         assert_eq!(v2.errors, 1);

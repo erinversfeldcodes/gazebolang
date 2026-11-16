@@ -17,6 +17,7 @@ pub mod media_recorder;
 pub mod perf;
 pub mod state;
 pub mod storage;
+pub mod thumbnail;
 pub mod trainer_back_chain;
 pub mod trainer_minimal_pairs;
 pub mod trainer_sound_spelling;
