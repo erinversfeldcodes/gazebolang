@@ -443,16 +443,21 @@ pub async fn delete_card(pool: &PgPool, card_id: Uuid) -> sqlx::Result<()> {
     Ok(())
 }
 
-/// A card whose `image_url` still points straight at Pixabay's own hotlink
-/// host rather than our own storage — the importer used to store that raw
-/// provider URL directly instead of re-hosting it (see `crates/importer`'s
+/// An `image_to_target` card that needs a (re-)search: either its
+/// `image_url` still points straight at Pixabay's own hotlink host rather
+/// than our own storage — the importer used to store that raw provider URL
+/// directly instead of re-hosting it (see `crates/importer`'s
 /// `pixabay.rs`/`create.rs`), and those links went dark once Pixabay
-/// started 503ing hotlinked requests. Everything here is exactly what the
-/// importer's backfill needs to resubmit a faithful `/cards/{id}` edit —
-/// `target_text`/`tags`/`card_type`/`two_way` alongside the one field it's
-/// actually replacing, the image — since `cards_update` has no "leave
-/// unspecified fields alone" behavior for those columns the way it does
-/// for the media URLs.
+/// started 503ing hotlinked requests — or it has no image at all (never
+/// resolved on the original import pass). Restricted to `image_to_target`
+/// specifically: `sound_to_written`/`sentence_translation` cards are
+/// imageless by design (see `create::run_create`'s placeholder-card
+/// comment), not cards this backfill should ever touch. Everything here is
+/// exactly what the importer's backfill needs to resubmit a faithful
+/// `/cards/{id}` edit — `target_text`/`tags`/`card_type`/`two_way`
+/// alongside the one field it's actually replacing, the image — since
+/// `cards_update` has no "leave unspecified fields alone" behavior for
+/// those columns the way it does for the media URLs.
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct BrokenImageCardRow {
     pub id: Uuid,
@@ -479,7 +484,9 @@ pub async fn cards_with_broken_external_image(
          FROM cards c \
          LEFT JOIN card_tags t ON t.card_id = c.id \
          LEFT JOIN words w ON w.target_text = c.target_text \
-         WHERE c.image_url LIKE 'https://pixabay.com/%' \
+         WHERE c.card_type = 'image_to_target' \
+           AND (c.image_url IS NULL OR c.image_url = '' \
+                OR c.image_url LIKE 'https://pixabay.com/%') \
          GROUP BY c.id, w.english_translation",
     )
     .fetch_all(pool)
@@ -1615,6 +1622,156 @@ pub async fn search_cards(
         .await
 }
 
+// --- dictionary browsing ----------------------------------------------
+
+/// One row of the dictionary index: a word that has at least one card.
+/// Cards are matched to words on exact `target_text`, the same join
+/// `cards_with_broken_external_image`/the review queue already use.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DictionaryListRow {
+    pub id: Uuid,
+    pub target_text: String,
+    pub part_of_speech: Option<String>,
+    pub english_translation: Option<String>,
+    pub card_count: i64,
+}
+
+/// Which side a dictionary listing is sorted and headed by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DictionaryOrder {
+    EnglishFirst,
+    TargetFirst,
+}
+
+/// `%`/`_`/`\` in a user's search text must match literally, not act as
+/// `LIKE` wildcards.
+fn like_pattern(query: &str) -> String {
+    let escaped = query
+        .trim()
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
+/// Words that have at least one card, optionally filtered by a substring
+/// of either side, plus the total matching count for pagination.
+pub async fn list_dictionary_entries(
+    pool: &PgPool,
+    order: DictionaryOrder,
+    search: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> sqlx::Result<(Vec<DictionaryListRow>, i64)> {
+    let pattern = search
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(like_pattern);
+    // Only the ORDER BY differs between the two orders; written out as two
+    // literal statements because sqlx only accepts `&'static str` SQL.
+    // Words with no English gloss sort last in English-first order rather
+    // than clumping at the top as empty strings.
+    macro_rules! list_sql {
+        ($order_by:literal) => {
+            concat!(
+                "SELECT w.id, w.target_text, w.part_of_speech, w.english_translation, \
+                        (SELECT count(*) FROM cards c WHERE c.target_text = w.target_text) AS card_count \
+                 FROM words w \
+                 WHERE EXISTS (SELECT 1 FROM cards c WHERE c.target_text = w.target_text) \
+                   AND ($1::text IS NULL OR w.target_text ILIKE $1 OR w.english_translation ILIKE $1) \
+                 ORDER BY ",
+                $order_by,
+                " LIMIT $2 OFFSET $3"
+            )
+        };
+    }
+    let sql = match order {
+        DictionaryOrder::EnglishFirst => list_sql!(
+            "(w.english_translation IS NULL), lower(w.english_translation), lower(w.target_text)"
+        ),
+        DictionaryOrder::TargetFirst => list_sql!("lower(w.target_text)"),
+    };
+    let rows = sqlx::query_as(sql)
+        .bind(pattern.as_deref())
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+    let total = sqlx::query_scalar(
+        "SELECT count(*) FROM words w \
+         WHERE EXISTS (SELECT 1 FROM cards c WHERE c.target_text = w.target_text) \
+           AND ($1::text IS NULL OR w.target_text ILIKE $1 OR w.english_translation ILIKE $1)",
+    )
+    .bind(pattern.as_deref())
+    .fetch_one(pool)
+    .await?;
+    Ok((rows, total))
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DictionaryCardRow {
+    pub id: Uuid,
+    pub card_type: String,
+    pub image_url: Option<String>,
+    pub two_way: bool,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DictionaryLinkedWordRow {
+    pub id: Uuid,
+    pub target_text: String,
+    pub link_type: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DictionaryEntryRow {
+    pub word: WordRow,
+    pub examples: Vec<WordExampleRow>,
+    pub linked_words: Vec<DictionaryLinkedWordRow>,
+    pub cards: Vec<DictionaryCardRow>,
+}
+
+/// A word's full dictionary entry by id, including every card whose
+/// `target_text` is this word.
+pub async fn get_dictionary_entry(
+    pool: &PgPool,
+    word_id: Uuid,
+) -> sqlx::Result<Option<DictionaryEntryRow>> {
+    let Some(word): Option<WordRow> = sqlx::query_as(
+        "SELECT id, target_text, part_of_speech, notes, english_translation \
+         FROM words WHERE id = $1",
+    )
+    .bind(word_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let examples = word_examples(pool, word.id).await?;
+    let linked_words = sqlx::query_as(
+        "SELECT w.id, w.target_text, wl.link_type FROM word_links wl \
+         JOIN words w ON w.id = CASE WHEN wl.word_id = $1 THEN wl.linked_word_id ELSE wl.word_id END \
+         WHERE wl.word_id = $1 OR wl.linked_word_id = $1 \
+         ORDER BY w.target_text",
+    )
+    .bind(word.id)
+    .fetch_all(pool)
+    .await?;
+    let cards = sqlx::query_as(
+        "SELECT id, card_type, image_url, two_way FROM cards \
+         WHERE target_text = $1 ORDER BY created_at",
+    )
+    .bind(&word.target_text)
+    .fetch_all(pool)
+    .await?;
+    Ok(Some(DictionaryEntryRow {
+        word,
+        examples,
+        linked_words,
+        cards,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2706,5 +2863,161 @@ mod tests {
         let results = search_cards(&pool, "p", pan).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, pin);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn dictionary_lists_only_words_with_cards_in_either_order(pool: PgPool) {
+        let user_id = test_user(&pool).await;
+        for (target, english) in [
+            ("zebra-t", "zebra"),
+            ("apple-t", "apple"),
+            ("nocard-t", "x"),
+        ] {
+            upsert_word_definition(
+                &pool,
+                target,
+                user_id,
+                WordFields {
+                    english_translation: Some(english),
+                    ..Default::default()
+                },
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        }
+        // "zebra-t" gets two cards, "apple-t" one; "nocard-t" none.
+        for t in ["zebra-t", "zebra-t", "apple-t"] {
+            create_card(&pool, user_id, card_with_text(t), &[])
+                .await
+                .unwrap();
+        }
+
+        let (rows, total) =
+            list_dictionary_entries(&pool, DictionaryOrder::EnglishFirst, None, 50, 0)
+                .await
+                .unwrap();
+        assert_eq!(total, 2);
+        let texts: Vec<_> = rows.iter().map(|r| r.target_text.as_str()).collect();
+        assert_eq!(texts, ["apple-t", "zebra-t"]);
+        assert_eq!(rows[1].card_count, 2);
+
+        let (rows, _) = list_dictionary_entries(&pool, DictionaryOrder::TargetFirst, None, 50, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].target_text, "apple-t");
+
+        let (rows, total) =
+            list_dictionary_entries(&pool, DictionaryOrder::EnglishFirst, Some("zeb"), 50, 0)
+                .await
+                .unwrap();
+        assert_eq!((rows.len(), total), (1, 1));
+        let (_, total) =
+            list_dictionary_entries(&pool, DictionaryOrder::EnglishFirst, Some("%"), 50, 0)
+                .await
+                .unwrap();
+        assert_eq!(total, 0, "a literal % must not act as a wildcard");
+
+        let entry = get_dictionary_entry(&pool, rows[0].id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.cards.len(), 2);
+    }
+
+    #[test]
+    fn like_pattern_escapes_wildcards_and_trims() {
+        assert_eq!(like_pattern("  abc "), "%abc%");
+        assert_eq!(like_pattern("50%_off"), "%50\\%\\_off%");
+        assert_eq!(like_pattern("a\\b"), "%a\\\\b%");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn video_to_written_is_an_accepted_card_type_and_unknown_types_are_rejected(
+        pool: PgPool,
+    ) {
+        let user_id = test_user(&pool).await;
+        let id = create_card(
+            &pool,
+            user_id,
+            NewCard {
+                card_type: "video_to_written",
+                youtube_url: "https://www.youtube.com/embed/dQw4w9WgXcQ",
+                target_text: "kunjani",
+                ..Default::default()
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get_card(&pool, id).await.unwrap().unwrap().card_type,
+            "video_to_written"
+        );
+
+        let bad = create_card(
+            &pool,
+            user_id,
+            NewCard {
+                card_type: "not_a_real_type",
+                target_text: "x",
+                ..Default::default()
+            },
+            &[],
+        )
+        .await;
+        assert!(
+            bad.is_err(),
+            "the CHECK constraint must reject unknown types"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn broken_image_backfill_covers_missing_and_pixabay_links_only(pool: PgPool) {
+        let user_id = test_user(&pool).await;
+        let make = |target_text: &'static str, card_type: &'static str, image_url: &'static str| {
+            let pool = pool.clone();
+            async move {
+                create_card(
+                    &pool,
+                    user_id,
+                    NewCard {
+                        image_url,
+                        target_text,
+                        card_type,
+                        ..Default::default()
+                    },
+                    &[],
+                )
+                .await
+                .unwrap()
+            }
+        };
+        make(
+            "hotlinked",
+            "image_to_target",
+            "https://pixabay.com/get/abc.jpg",
+        )
+        .await;
+        make("no-image", "image_to_target", "").await;
+        make(
+            "hosted",
+            "image_to_target",
+            "https://gazebo-cards.t3.tigrisfiles.io/cards/x",
+        )
+        .await;
+        // Imageless by design — must never be touched by the backfill.
+        make("audio-card", "sound_to_written", "").await;
+        make("video-card", "video_to_written", "").await;
+
+        let mut got: Vec<String> = cards_with_broken_external_image(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.target_text)
+            .collect();
+        got.sort();
+        assert_eq!(got, ["hotlinked", "no-image"]);
     }
 }

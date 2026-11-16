@@ -34,6 +34,8 @@ test("recording video attaches a playable clip to a new card", async ({ page }) 
 
   await page.goto("/new");
   await page.getByLabel("Target-language word/phrase").fill(word);
+  // Video and YouTube are offered on "Video → written" cards only.
+  await page.getByLabel("Card type").selectOption("video_to_written");
   await recordClip(page, "video");
 
   const videoInput = page.locator('input[name="video"]');
@@ -80,6 +82,8 @@ test("linking a YouTube video attaches a playable embed to a new card", async ({
 
   await page.goto("/new");
   await page.getByLabel("Target-language word/phrase").fill(word);
+  // Video and YouTube are offered on "Video → written" cards only.
+  await page.getByLabel("Card type").selectOption("video_to_written");
   await page
     .getByLabel("Or link a YouTube video")
     .fill("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLxyz");
@@ -104,6 +108,8 @@ test("removing a linked YouTube video clears it from the card", async ({ page })
 
   await page.goto("/new");
   await page.getByLabel("Target-language word/phrase").fill(word);
+  // Video and YouTube are offered on "Video → written" cards only.
+  await page.getByLabel("Card type").selectOption("video_to_written");
   await page.getByLabel("Or link a YouTube video").fill("https://youtu.be/dQw4w9WgXcQ");
   await page.getByRole("button", { name: "Add" }).click();
   await expect(page).toHaveURL("/");
@@ -129,6 +135,8 @@ test("linking a non-YouTube video shows an error, not a silent failure", async (
 
   await page.goto("/new");
   await page.getByLabel("Target-language word/phrase").fill(word);
+  // Video and YouTube are offered on "Video → written" cards only.
+  await page.getByLabel("Card type").selectOption("video_to_written");
   await page.getByLabel("Or link a YouTube video").fill("https://vimeo.com/123456");
   await page.getByRole("button", { name: "Add" }).click();
 
@@ -186,4 +194,29 @@ test("a two-way card is reviewed in both directions, independently", async ({ pa
   await page.waitForLoadState("networkidle");
 
   await expect(page.getByText("Nothing due. Nice.")).toBeVisible();
+});
+
+test("recording audio works on an existing audio card's edit page", async ({ page }) => {
+  // Regression: on production the Record button on a card's edit page did
+  // nothing, because the page had crashed while hydrating (see
+  // hydration.spec.ts). The existing recording tests only covered /new.
+  const word = uniqueWord("media-spec-edit-record");
+  await page.goto("/new");
+  await page.getByLabel("Card type").selectOption("sound_to_written");
+  await page.getByLabel("Target-language word/phrase").fill(word);
+  await page.getByRole("button", { name: "Add" }).click();
+  await expect(page).toHaveURL("/");
+  await page.locator("li", { hasText: word }).getByRole("link", { name: "Edit" }).click();
+
+  // An audio card offers audio only — no video or YouTube controls.
+  await expect(page.locator('input[name="video"]')).toHaveCount(0);
+  await expect(page.getByLabel(/YouTube/)).toHaveCount(0);
+
+  await recordClip(page, "audio");
+  const audioInput = page.locator('input[name="audio"]');
+  await expect
+    .poll(() => audioInput.evaluate((el: HTMLInputElement) => el.files?.length ?? 0))
+    .toBe(1);
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page.locator("audio").first()).toBeVisible();
 });

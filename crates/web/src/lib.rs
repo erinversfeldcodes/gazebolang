@@ -9,6 +9,7 @@ pub mod cards;
 pub mod db;
 pub mod decks;
 pub mod dictionary;
+pub mod dictionary_page;
 pub mod dictionary_ui;
 pub mod email;
 pub mod image_search;

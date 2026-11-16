@@ -198,3 +198,41 @@ export async function deleteInvitedTestUser(email: string): Promise<void> {
     await client.end();
   }
 }
+
+// Writes `count` plain cards carrying `tag` straight into Postgres — far
+// faster than creating dozens through the UI, for specs (pagination) that
+// only need many cards to exist, not to exercise card creation itself.
+export async function seedTaggedCards(tag: string, count: number): Promise<void> {
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    const userId = await ensureBootstrapInviter(client);
+    for (let i = 0; i < count; i++) {
+      const inserted = await client.query(
+        "INSERT INTO cards (card_type, target_text, created_by) " +
+          "VALUES ('image_to_target', $1, $2) RETURNING id",
+        [`${tag}-${String(i).padStart(2, "0")}`, userId],
+      );
+      await client.query("INSERT INTO card_tags (card_id, tag) VALUES ($1, $2)", [
+        inserted.rows[0].id,
+        tag,
+      ]);
+    }
+  } finally {
+    await client.end();
+  }
+}
+
+// Removes everything seedTaggedCards wrote for `tag`.
+export async function deleteTaggedCards(tag: string): Promise<void> {
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    await client.query(
+      "DELETE FROM cards WHERE id IN (SELECT card_id FROM card_tags WHERE tag = $1)",
+      [tag],
+    );
+  } finally {
+    await client.end();
+  }
+}

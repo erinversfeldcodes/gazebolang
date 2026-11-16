@@ -43,6 +43,7 @@ pub const CARD_TYPES: &[(&str, &str)] = &[
     ("image_to_target", "Image → written"),
     ("sound_to_written", "Audio → written"),
     ("image_to_audio", "Image → audio"),
+    ("video_to_written", "Video → written"),
     ("sentence_translation", "Sentence translation"),
 ];
 
@@ -172,6 +173,22 @@ async fn require_user() -> Result<crate::auth::UserRow, ServerFnError> {
 /// number and gets back a total it can turn into "page X of Y".
 pub const CARDS_PAGE_SIZE: i64 = 50;
 
+/// The page sizes `CardListPage` offers. The server clamps any requested
+/// size to the nearest allowed value (see `clamp_page_size`) so a crafted
+/// request can't ask for the whole table in one response.
+pub const CARDS_PAGE_SIZE_OPTIONS: [i64; 5] = [12, 25, 50, 100, 200];
+
+/// Largest allowed size that doesn't exceed `requested`, falling back to
+/// the default when `requested` is below the smallest option.
+#[cfg(feature = "ssr")]
+pub(crate) fn clamp_page_size(requested: i64) -> i64 {
+    CARDS_PAGE_SIZE_OPTIONS
+        .into_iter()
+        .rev()
+        .find(|&o| o <= requested)
+        .unwrap_or(CARDS_PAGE_SIZE)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CardsPage {
     pub cards: Vec<Card>,
@@ -186,19 +203,15 @@ pub async fn list_cards(
     tag: Option<String>,
     deck_id: Option<Uuid>,
     page: i64,
+    page_size: i64,
 ) -> Result<CardsPage, ServerFnError> {
     // Browsing the shared card pool is public; only mutating it needs auth.
     let state = expect_context::<crate::state::AppState>();
-    let offset = page.max(0) * CARDS_PAGE_SIZE;
-    let rows = crate::db::list_cards(
-        &state.db_pool,
-        tag.as_deref(),
-        deck_id,
-        CARDS_PAGE_SIZE,
-        offset,
-    )
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let page_size = clamp_page_size(page_size);
+    let offset = page.max(0) * page_size;
+    let rows = crate::db::list_cards(&state.db_pool, tag.as_deref(), deck_id, page_size, offset)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
     let total = crate::db::count_cards(&state.db_pool, tag.as_deref(), deck_id)
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
@@ -468,4 +481,22 @@ pub async fn grade_card(
     .await
     .map_err(|e| ServerFnError::new(e.to_string()))?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "ssr"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_size_snaps_down_to_an_allowed_option() {
+        assert_eq!(clamp_page_size(50), 50);
+        assert_eq!(clamp_page_size(99), 50);
+        assert_eq!(clamp_page_size(100_000), 200);
+    }
+
+    #[test]
+    fn page_size_below_the_smallest_option_falls_back_to_default() {
+        assert_eq!(clamp_page_size(0), CARDS_PAGE_SIZE);
+        assert_eq!(clamp_page_size(-5), CARDS_PAGE_SIZE);
+    }
 }

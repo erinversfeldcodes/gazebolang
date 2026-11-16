@@ -35,6 +35,13 @@ struct PixabayHit {
 /// for this card."
 pub fn find_image(api_key: Option<&str>, query: &str) -> Option<(Vec<u8>, String)> {
     let api_key = api_key?;
+    // Pixabay's own docs cap this endpoint at 100 requests/60s per key, with
+    // no burst allowance beyond that — a bulk backfill over hundreds of
+    // cards blows through that in the first few seconds without this, and
+    // every subsequent search that run just silently returns "no image
+    // found" (429 is treated the same as any other non-success status).
+    // 700ms/call paces to ~85/min, leaving some margin.
+    std::thread::sleep(std::time::Duration::from_millis(700));
     let url = match reqwest::Url::parse_with_params(
         "https://pixabay.com/api/",
         &[
