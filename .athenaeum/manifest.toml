@@ -1,0 +1,36 @@
+schema_version = 0
+
+[components.domain]
+pack = "rust"
+root = "."
+paths = ["crates/domain/**"]
+test = ["cargo", "nextest", "run", "-p", "domain"]
+
+[components.importer]
+pack = "rust"
+root = "."
+paths = ["crates/importer/**"]
+
+[components.web]
+pack = "rust"
+root = "."
+paths = ["crates/web/**", "editor/**", "migrations/**", "e2e/**"]
+
+[components.platform]
+root = "."
+paths = [".github/**", "Dockerfile", "docker-compose.yml", "flake.nix", "flake.lock", "justfile", "fly*.toml", "garage.toml", "deny.toml", "scripts/**"]
+
+[gates.format]
+run = ["just", "fmt-check"]
+when_paths = ["crates/**"]
+timeout_seconds = 300
+
+[gates.lint]
+run = ["just", "lint"]
+when_paths = ["crates/**", "Cargo.toml", "Cargo.lock"]
+timeout_seconds = 3600
+
+[gates.test]
+run = ["just", "test"]
+when_paths = ["crates/**", "migrations/**", "Cargo.toml", "Cargo.lock"]
+timeout_seconds = 3600
