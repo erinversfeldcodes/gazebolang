@@ -8,6 +8,9 @@ concurrency:
   group: preview-pr-${{ github.event.number }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   neon-branch:
     name: Create/refresh Neon preview branch
