@@ -16,6 +16,7 @@ jobs:
     name: Create/refresh Neon preview branch
     if: github.event.action != 'closed'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       # Not the action's `db_url` output: GitHub's runner silently drops any
       # step/job output shaped like a credentialed URL ("Skip output 'db_url'
@@ -145,6 +146,7 @@ jobs:
     if: github.event.action != 'closed'
     needs: neon-branch
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       # Explicit ref, not actions/checkout's default `github.sha`: for a
       # `pull_request` event that default is the ephemeral `refs/pull/N/merge`
@@ -315,6 +317,7 @@ jobs:
     if: github.event.action != 'closed'
     needs: [neon-branch, deploy-preview]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       BASE_URL: https://gazebo-pr-${{ github.event.number }}.fly.dev
     steps:
@@ -393,6 +396,7 @@ jobs:
     name: Tear down preview app + Neon branch
     if: github.event.action == 'closed'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       # See the matching comment in `deploy-preview` above — same stale-ref
       # risk on a re-run, pinned the same way.
