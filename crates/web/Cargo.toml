@@ -14,7 +14,7 @@ path = "src/main.rs"
 required-features = ["ssr"]
 
 [dependencies]
-argon2 = { version = "0.5", optional = true }
+argon2 = { version = "0.6", optional = true }
 axum = { version = "0.8.9", optional = true, features = ["multipart"] }
 console_error_panic_hook = { version = "0.1.7", optional = true }
 console_log = { version = "1.1.0", optional = true }
