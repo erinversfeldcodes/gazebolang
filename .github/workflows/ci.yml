@@ -12,6 +12,7 @@ jobs:
   check:
     name: fmt + clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
@@ -45,6 +46,7 @@ jobs:
   harness:
     name: harness (manifest + skills)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     env:
       HEPH_VERSION: v0.7.0
       HEPH_SHA256: 819fa0d63b6135393aa9bfef4502f4832857bad5f5f61bcb45fd8748839d623f
@@ -67,6 +69,7 @@ jobs:
   importer-macos:
     name: importer (macOS/Metal)
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
@@ -80,6 +83,7 @@ jobs:
     name: test
     needs: check
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17-alpine
