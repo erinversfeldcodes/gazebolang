@@ -393,6 +393,48 @@ pub async fn summary_report(
 mod tests {
     use super::*;
 
+    async fn cache_control_of(path: &str) -> (axum::http::StatusCode, Option<String>) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let app = axum::Router::new()
+            .route("/pkg/web.wasm", get(|| async { "wasm" }))
+            .route("/health", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(revalidate_app_bundle));
+        let response = app
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let cache_control = response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .map(|value| value.to_str().unwrap().to_owned());
+        (response.status(), cache_control)
+    }
+
+    #[tokio::test]
+    async fn a_successful_bundle_response_is_revalidated_before_reuse() {
+        let (status, cache_control) = cache_control_of("/pkg/web.wasm").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cache_control.as_deref(), Some("no-cache"));
+    }
+
+    #[tokio::test]
+    async fn a_bundle_path_that_is_not_found_is_not_marked() {
+        let (status, cache_control) = cache_control_of("/pkg/missing.wasm").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(cache_control, None);
+    }
+
+    #[tokio::test]
+    async fn responses_outside_the_bundle_keep_their_own_caching() {
+        let (status, cache_control) = cache_control_of("/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cache_control, None);
+    }
+
     #[test]
     fn uuids_collapse_and_query_strings_are_dropped() {
         assert_eq!(
