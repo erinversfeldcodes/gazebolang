@@ -19,6 +19,16 @@ export const RESEND_ALLOWED_EMAIL = "erinversfeld@gmail.com";
 // value staying in sync with whatever auth.setup.ts actually set.
 export const TEST_PASSWORD = "correct-horse-battery-staple";
 
+// Waits until the page's wasm has taken over its forms. `page.goto` (see
+// fixtures.ts) already does this, but a navigation the app makes itself, such
+// as the redirect to /login after a password change, loads a new document that
+// goto never sees. Submitting a form on it before this resolves falls through
+// to a plain POST: the page reloads, the fields are empty, and the next fill
+// types into a form that has lost the email.
+export async function waitForHydration(page: Page): Promise<void> {
+  await page.locator('body[data-hydrated="true"]').waitFor();
+}
+
 export function uniqueWord(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 }
