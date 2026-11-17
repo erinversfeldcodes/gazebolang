@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
-      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - uses: superfly/flyctl-actions/setup-flyctl@98172f70657cb3e15db199af139be99bd3e61200 # master
       # These four are tracked as GitHub secrets/variables and can be
       # rotated there independently of what's actually stored on the Fly
       # app — unlike `fly-pr-review-apps` (used for preview deploys), a
