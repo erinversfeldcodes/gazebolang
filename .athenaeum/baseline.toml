@@ -3,5 +3,5 @@ schema_version = 0
 licence = "source-available"
 holder = "Erin Versfeld"
 contact = "https://github.com/erinversfeldcodes/gazebolang/security/advisories/new"
-required_checks = ["fmt + clippy", "test", "E2E (local)", "harness (manifest + skills)"]
+required_checks = ["fmt + clippy", "test", "E2E (local)", "harness (manifest, skills and baseline)"]
 default_branch_bypass = "admin-pull-request"

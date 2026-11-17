@@ -47,12 +47,12 @@ jobs:
   # heph is the released binary, pinned by version and by the SHA-256 GitHub
   # reports for the asset, so a replaced release fails here instead of running.
   harness:
-    name: harness (manifest + skills)
+    name: harness (manifest, skills and baseline)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      HEPH_VERSION: v0.7.0
-      HEPH_SHA256: 819fa0d63b6135393aa9bfef4502f4832857bad5f5f61bcb45fd8748839d623f
+      HEPH_VERSION: v0.12.1
+      HEPH_SHA256: aab445e83904f15e8f292d88865bce6463418c36984a04e0341c0930fc12c32c
     steps:
       - uses: actions/checkout@v7
       - name: Install heph
@@ -64,6 +64,10 @@ jobs:
           install -m 0755 "heph-${HEPH_VERSION}-linux-x86_64/heph" /usr/local/bin/heph
       - run: heph manifest check
       - run: heph sync --check
+      # Without --settings: the workflow token cannot read the security settings
+      # or the rulesets, so a person with admin access checks those.
+      - name: The files and workflows satisfy the baseline
+        run: heph baseline check
 
   # Exercises the `metal` feature path (see crates/importer/Cargo.toml's
   # comment on how it gets pulled in on macOS/aarch64) — the `check` job
