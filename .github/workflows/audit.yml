@@ -10,6 +10,9 @@ on:
     - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC — catches newly disclosed advisories
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   cargo-deny:
     name: cargo-deny (licenses, bans, advisories)
