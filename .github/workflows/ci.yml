@@ -38,6 +38,28 @@ jobs:
       - run: cargo clippy -p web --no-default-features --features hydrate --target wasm32-unknown-unknown --lib -- -W clippy::pedantic -D warnings
       - run: cargo clippy -p importer --all-targets -- -W clippy::pedantic -D warnings
 
+  # The agent harness: `.athenaeum/manifest.toml` must be valid, and the
+  # skills vendored under `.athenaeum/skills/` must match `.athenaeum/lock.toml`.
+  # heph is the released binary, pinned by version and by the SHA-256 GitHub
+  # reports for the asset, so a replaced release fails here instead of running.
+  harness:
+    name: harness (manifest + skills)
+    runs-on: ubuntu-latest
+    env:
+      HEPH_VERSION: v0.6.0
+      HEPH_SHA256: e28c509a23e5daf23674bc513094cb74126d9d8e4d3bf66bdc2c95064463f7a2
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install heph
+        run: |
+          archive="heph-${HEPH_VERSION}-linux-x86_64.tar.gz"
+          curl -fsSL -o "$archive" "https://github.com/erinversfeldcodes/hephaestium/releases/download/${HEPH_VERSION}/${archive}"
+          echo "${HEPH_SHA256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "$archive"
+          install -m 0755 "heph-${HEPH_VERSION}-linux-x86_64/heph" /usr/local/bin/heph
+      - run: heph manifest check
+      - run: heph sync --check
+
   # Exercises the `metal` feature path (see crates/importer/Cargo.toml's
   # comment on how it gets pulled in on macOS/aarch64) — the `check` job
   # above only builds/lints importer on Linux, which never compiles that
