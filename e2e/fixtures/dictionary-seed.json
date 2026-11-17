@@ -1,0 +1,218 @@
+[
+  {
+    "english": "adversity",
+    "target_text": "ubunzima",
+    "part_of_speech": "n",
+    "notes": "idiom: 'be in adversity'",
+    "example_target": "Ubunzima buyaphela.",
+    "example_gloss": "Hardship comes to an end.",
+    "image_query": ""
+  },
+  {
+    "english": "accredited (of belief, accepted)",
+    "target_text": "-amkelwe(yo)",
+    "part_of_speech": "adj",
+    "notes": "",
+    "example_target": "",
+    "example_gloss": "",
+    "image_query": ""
+  },
+  {
+    "english": "adjoin",
+    "target_text": "-ba kufuphi na- / -ayamana na-",
+    "part_of_speech": "vt",
+    "notes": "also: 'be next to'",
+    "example_target": "",
+    "example_gloss": "",
+    "image_query": ""
+  },
+  {
+    "english": "agree (accept as correct)",
+    "target_text": "-amkela",
+    "part_of_speech": "vt",
+    "notes": "",
+    "example_target": "Ndiyamkela.",
+    "example_gloss": "I accept.",
+    "image_query": ""
+  },
+  {
+    "english": "abstract (extract, take out)",
+    "target_text": "-caphula / -rhola / -khupha",
+    "part_of_speech": "vt",
+    "notes": "",
+    "example_target": "",
+    "example_gloss": "",
+    "image_query": ""
+  },
+  {
+    "english": "alien (strange, foreign)",
+    "target_text": "-asemzini",
+    "part_of_speech": "adj",
+    "notes": "used of people & customs",
+    "example_target": "Umntu wasemzini.",
+    "example_gloss": "A foreign person.",
+    "image_query": ""
+  },
+  {
+    "english": "about (near to)",
+    "target_text": "kufuphi na-",
+    "part_of_speech": "prep",
+    "notes": "",
+    "example_target": "",
+    "example_gloss": "",
+    "image_query": ""
+  },
+  {
+    "english": "about-face (turn around)",
+    "target_text": "-jika",
+    "part_of_speech": "vi",
+    "notes": "",
+    "example_target": "Wajika waya ekhaya.",
+    "example_gloss": "He turned and went home.",
+    "image_query": ""
+  },
+  {
+    "english": "out of reach",
+    "target_text": "-ngenakufikelelwa",
+    "part_of_speech": "adj",
+    "notes": "",
+    "example_target": "",
+    "example_gloss": "",
+    "image_query": ""
+  },
+  {
+    "english": "about to (going to)",
+    "target_text": "-za ku-",
+    "part_of_speech": "aux",
+    "notes": "tense marker",
+    "example_target": "Ndiza kuhamba.",
+    "example_gloss": "I am going to walk.",
+    "image_query": ""
+  },
+  {
+    "english": "above (earlier, in a text)",
+    "target_text": "ngasentla",
+    "part_of_speech": "adv",
+    "notes": "",
+    "example_target": "",
+    "example_gloss": "",
+    "image_query": ""
+  },
+  {
+    "english": "above (too difficult for, beyond)",
+    "target_text": "-dlula",
+    "part_of_speech": "prep",
+    "notes": "",
+    "example_target": "",
+    "example_gloss": "",
+    "image_query": ""
+  },
+  {
+    "english": "aflame (burning)",
+    "target_text": "-vutha",
+    "part_of_speech": "vi",
+    "notes": "",
+    "example_target": "Umlilo uyavutha.",
+    "example_gloss": "The fire is burning.",
+    "image_query": ""
+  },
+  {
+    "english": "abridge (shorten a text)",
+    "target_text": "-finyeza",
+    "part_of_speech": "vt",
+    "notes": "",
+    "example_target": "",
+    "example_gloss": "",
+    "image_query": ""
+  },
+  {
+    "english": "affect (pretend)",
+    "target_text": "-ngxama",
+    "part_of_speech": "vt",
+    "notes": "contains \"quotes\" and a % sign",
+    "example_target": "",
+    "example_gloss": "",
+    "image_query": ""
+  },
+  {
+    "english": "age (make old)",
+    "target_text": "-aluphaza",
+    "part_of_speech": "vt",
+    "notes": "",
+    "example_target": "",
+    "example_gloss": "",
+    "image_query": ""
+  },
+  {
+    "english": "adipose",
+    "target_text": "-amafutha",
+    "part_of_speech": "adj",
+    "notes": "medical; rare",
+    "example_target": "",
+    "example_gloss": "",
+    "image_query": ""
+  },
+  {
+    "english": "ill-affected (towards someone)",
+    "target_text": "-bukuzile(yo)",
+    "part_of_speech": "adj",
+    "notes": "",
+    "example_target": "",
+    "example_gloss": "",
+    "image_query": ""
+  },
+  {
+    "english": "acquit (declare not guilty)",
+    "target_text": "-gwebela / -khulula etyaleni",
+    "part_of_speech": "vt",
+    "notes": "law",
+    "example_target": "",
+    "example_gloss": "",
+    "image_query": ""
+  },
+  {
+    "english": "act for / on behalf of",
+    "target_text": "-emela",
+    "part_of_speech": "vt",
+    "notes": "",
+    "example_target": "Uyamela umntakwabo.",
+    "example_gloss": "He represents his sibling.",
+    "image_query": ""
+  },
+  {
+    "english": "abate (of wind, storm, pain - die down)",
+    "target_text": "-dambisa",
+    "part_of_speech": "vt",
+    "notes": "",
+    "example_target": "",
+    "example_gloss": "",
+    "image_query": ""
+  },
+  {
+    "english": "abnegate (renounce)",
+    "target_text": "-khanyela",
+    "part_of_speech": "vt",
+    "notes": "",
+    "example_target": "",
+    "example_gloss": "",
+    "image_query": ""
+  },
+  {
+    "english": "alight (get off/down)",
+    "target_text": "-hla",
+    "part_of_speech": "vi",
+    "notes": "",
+    "example_target": "Wehla ebhasini.",
+    "example_gloss": "He got off the bus.",
+    "image_query": ""
+  },
+  {
+    "english": "alimony",
+    "target_text": "imali yokondla",
+    "part_of_speech": "n",
+    "notes": "",
+    "example_target": "",
+    "example_gloss": "",
+    "image_query": ""
+  }
+]

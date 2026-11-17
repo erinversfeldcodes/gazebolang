@@ -1,6 +1,6 @@
 import { Page } from "@playwright/test";
 import { test, expect } from "./fixtures";
-import { uniqueWord } from "./helpers";
+import { uniqueWord, withServerResponse } from "./helpers";
 
 // A hydration panic leaves a page server-rendered but dead: no handlers
 // run, so buttons (Record, Save, ...) silently do nothing. It was seen on
@@ -78,3 +78,43 @@ test("a dictionary entry page hydrates without errors", async ({ page }) => {
   await page.locator('body[data-hydrated="true"]').waitFor();
   expect(errors).toEqual([]);
 });
+
+// Production's cards all have a dictionary entry (and tags), unlike the bare
+// cards the tests above create — and every one of them still failed to
+// hydrate after the earlier fixes, which a card with no entry never
+// reproduced. So exercise the same shape: tags, a deck, and a saved
+// dictionary entry with every field filled in, then hard-load the page.
+for (const type of ["sound_to_written", "image_to_target"]) {
+  test(`a "${type}" card with tags and a full dictionary entry hydrates without errors`, async ({
+    page,
+  }) => {
+    const word = uniqueWord(`hydrate-dict-${type}`);
+    await page.goto("/new");
+    await page.getByLabel("Card type").selectOption(type);
+    await page.getByLabel(/^Target-language/).fill(word);
+    await page.getByLabel("Tags (comma separated)").fill("noun, hydrate-spec");
+    await page.getByRole("button", { name: "Add" }).click();
+    await expect(page).toHaveURL("/");
+    await page.locator("li", { hasText: word }).getByRole("link", { name: "Edit" }).click();
+    await expect(page).toHaveURL(/\/cards\/[0-9a-f-]+$/);
+    const cardUrl = new URL(page.url()).pathname;
+
+    await page.getByLabel("English translation", { exact: true }).fill("a test gloss");
+    await page.getByLabel("Part of speech").fill("noun");
+    await page.getByLabel("Notes").fill("idiom: 'a note with an apostrophe'");
+    await page.getByLabel("Example sentence (target language)").fill("an example sentence");
+    await page.getByLabel(/^Example sentence gloss/).fill("its gloss");
+    await page.getByLabel("Related words (comma separated)").fill(uniqueWord("related"));
+    await withServerResponse(page, "save_word_definition", () =>
+      page.getByRole("button", { name: "Save dictionary details" }).click(),
+    );
+    await expect(page.getByText("Saved.")).toBeVisible();
+
+    const errors = collectErrors(page);
+    await page.goto(cardUrl);
+    await expect(page.getByLabel("Card type")).toBeEnabled();
+    // Alive, not just present: the dictionary section's own button responds.
+    await page.getByLabel("Part of speech").fill("verb");
+    expect(errors).toEqual([]);
+  });
+}

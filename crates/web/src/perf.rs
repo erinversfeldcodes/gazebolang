@@ -64,6 +64,30 @@ pub async fn server_timing(
     response
 }
 
+/// Marks the app bundle (`/pkg/*`: the wasm, its JS glue and the CSS) as
+/// "revalidate before reuse". Those files have fixed names that don't change
+/// when the contents do, and the server sends a `Last-Modified` but no
+/// `Cache-Control`, so a browser applies heuristic caching and keeps serving
+/// the *previous* deploy's wasm for hours against the new deploy's HTML —
+/// the client then can't hydrate the page ("expected a marker node"), and
+/// every button on it (Record, Save, ...) silently does nothing. Seen live:
+/// production's card pages failed this way until the cached wasm was
+/// refreshed. `no-cache` still lets the browser keep the file; it just asks
+/// first (a cheap 304 when unchanged).
+pub async fn revalidate_app_bundle(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let is_bundle = request.uri().path().starts_with("/pkg/");
+    let mut response = next.run(request).await;
+    if is_bundle && response.status().is_success() {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    }
+    response
+}
+
 /// Collapses a request path to its route pattern: query/fragment dropped,
 /// UUID segments become `:id`, at most 6 segments and 120 bytes kept.
 #[must_use]
@@ -368,6 +392,48 @@ pub async fn summary_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn cache_control_of(path: &str) -> (axum::http::StatusCode, Option<String>) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let app = axum::Router::new()
+            .route("/pkg/web.wasm", get(|| async { "wasm" }))
+            .route("/health", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(revalidate_app_bundle));
+        let response = app
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let cache_control = response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .map(|value| value.to_str().unwrap().to_owned());
+        (response.status(), cache_control)
+    }
+
+    #[tokio::test]
+    async fn a_successful_bundle_response_is_revalidated_before_reuse() {
+        let (status, cache_control) = cache_control_of("/pkg/web.wasm").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cache_control.as_deref(), Some("no-cache"));
+    }
+
+    #[tokio::test]
+    async fn a_bundle_path_that_is_not_found_is_not_marked() {
+        let (status, cache_control) = cache_control_of("/pkg/missing.wasm").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(cache_control, None);
+    }
+
+    #[tokio::test]
+    async fn responses_outside_the_bundle_keep_their_own_caching() {
+        let (status, cache_control) = cache_control_of("/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cache_control, None);
+    }
 
     #[test]
     fn uuids_collapse_and_query_strings_are_dropped() {

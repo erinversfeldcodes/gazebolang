@@ -1087,6 +1087,7 @@ async fn main() {
         .layer(tower_cookies::CookieManagerLayer::new())
         .layer(axum::extract::DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(axum::middleware::from_fn(web::perf::server_timing))
+        .layer(axum::middleware::from_fn(web::perf::revalidate_app_bundle))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
