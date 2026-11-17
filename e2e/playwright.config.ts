@@ -16,6 +16,14 @@ export default defineConfig({
       testMatch: /.*\.setup\.ts/,
     },
     {
+      // Production-shaped data (via the importer's own `create` stage) that
+      // specs can rely on — see dictionary.seed.ts for why it exists.
+      name: "seed",
+      testMatch: /.*\.seed\.ts/,
+      use: { storageState: ".auth/user.json" },
+      dependencies: ["setup"],
+    },
+    {
       name: "chromium",
       use: {
         ...devices["Desktop Chrome"],
@@ -36,7 +44,7 @@ export default defineConfig({
           ],
         },
       },
-      dependencies: ["setup"],
+      dependencies: ["setup", "seed"],
     },
   ],
 });

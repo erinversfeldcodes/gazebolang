@@ -93,3 +93,20 @@ test("the beacon endpoint rejects garbage and oversized bodies instead of storin
   });
   expect(huge.status()).toBe(413);
 });
+
+test("the app bundle is revalidated on every load, so a deploy can't leave a stale wasm in the browser", async ({
+  page,
+}) => {
+  // Regression: /pkg/web.wasm had a Last-Modified but no Cache-Control, so
+  // browsers heuristically cached it across deploys; the old wasm then
+  // failed to hydrate the new deploy's HTML (a card page "expected a marker
+  // node" panic) and Record/Save did nothing until a hard refresh.
+  for (const path of ["/pkg/web.wasm", "/pkg/web.js", "/pkg/web.css"]) {
+    const res = await page.request.get(path);
+    expect(res.status(), path).toBe(200);
+    expect(res.headers()["cache-control"], path).toBe("no-cache");
+  }
+  // Other responses keep their own caching.
+  const health = await page.request.get("/health");
+  expect(health.headers()["cache-control"]).not.toBe("no-cache");
+});
