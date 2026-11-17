@@ -25,7 +25,7 @@ leptos_axum = { version = "0.8.10", optional = true }
 leptos_meta = "0.8.7"
 leptos_router = "0.8.17"
 log = "0.4.34"
-password-hash = { version = "0.5", optional = true, features = ["getrandom"] }
+password-hash = { version = "0.6", optional = true, features = ["getrandom"] }
 rand = { version = "0.10.3", optional = true }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "query", "rustls"], optional = true }
 s3 = { version = "0.1.38", default-features = false, optional = true, features = ["async", "rustls"] }
