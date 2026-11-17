@@ -1,6 +1,12 @@
 import { test, expect } from "./fixtures";
 import { Client } from "pg";
-import { uniqueWord, withServerResponse, createInviteToken, RESEND_ALLOWED_EMAIL } from "./helpers";
+import {
+  uniqueWord,
+  withServerResponse,
+  createInviteToken,
+  waitForHydration,
+  RESEND_ALLOWED_EMAIL,
+} from "./helpers";
 
 // Every test here signs up its own throwaway account rather than using
 // auth.setup.ts's shared storageState — changing the shared account's
@@ -212,6 +218,7 @@ test("changing your password logs you out and lets you sign in with the new one"
     // its comment above.
     await expect(page).toHaveURL("/login?reset=success", { timeout: 15_000 });
     await expect(page.getByText("Password updated")).toBeVisible();
+    await waitForHydration(page);
 
     await page.getByLabel("Email").fill(email);
     await page.getByLabel("Password").fill("correct-horse-battery");

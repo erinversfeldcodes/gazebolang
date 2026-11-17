@@ -1,6 +1,6 @@
 import { test, expect } from "./fixtures";
 import { Client } from "pg";
-import { RESEND_ALLOWED_EMAIL, uniqueWord, createInviteToken } from "./helpers";
+import { RESEND_ALLOWED_EMAIL, uniqueWord, createInviteToken, waitForHydration } from "./helpers";
 
 // Runs signed out, deliberately ignoring the project's saved auth state.
 test.use({ storageState: { cookies: [], origins: [] } });
@@ -118,6 +118,7 @@ test("a full password reset lets you log in with the new password", async ({ pag
     await page.getByLabel("Confirm new password").fill(newPassword);
     await page.getByRole("button", { name: "Reset password" }).click();
     await expect(page).toHaveURL("/login?reset=success", { timeout: 15_000 });
+    await waitForHydration(page);
 
     // The old password no longer works…
     await page.getByLabel("Email").fill(email);
