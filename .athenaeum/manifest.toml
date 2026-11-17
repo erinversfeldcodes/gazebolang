@@ -34,3 +34,7 @@ timeout_seconds = 3600
 run = ["just", "test"]
 when_paths = ["crates/**", "migrations/**", "Cargo.toml", "Cargo.lock"]
 timeout_seconds = 3600
+
+[gates.test.requires]
+DATABASE_URL = "env"
+PIXABAY_API_KEY = "secret"
