@@ -46,8 +46,8 @@ jobs:
     name: harness (manifest + skills)
     runs-on: ubuntu-latest
     env:
-      HEPH_VERSION: v0.6.0
-      HEPH_SHA256: e28c509a23e5daf23674bc513094cb74126d9d8e4d3bf66bdc2c95064463f7a2
+      HEPH_VERSION: v0.7.0
+      HEPH_SHA256: 819fa0d63b6135393aa9bfef4502f4832857bad5f5f61bcb45fd8748839d623f
     steps:
       - uses: actions/checkout@v7
       - name: Install heph
