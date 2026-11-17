@@ -1,0 +1,35 @@
+name: Bug report
+description: Something in gazebolang does not work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. gazebolang does not take outside pull requests, so please describe the problem here rather than sending a fix. See [CONTRIBUTING.md](https://github.com/erinversfeldcodes/gazebolang/blob/main/CONTRIBUTING.md).
+
+        For a security vulnerability, [report it privately](https://github.com/erinversfeldcodes/gazebolang/security/advisories/new) instead.
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened
+      description: What you saw, including any error messages or log lines.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      description: The steps, configuration or command that shows the problem.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The commit you were reading or running.

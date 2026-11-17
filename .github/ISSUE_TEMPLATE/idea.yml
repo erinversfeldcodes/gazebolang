@@ -1,0 +1,22 @@
+name: Idea
+description: Suggest something gazebolang could do.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. gazebolang does not take outside pull requests, so please describe it here rather than sending an implementation. See [CONTRIBUTING.md](https://github.com/erinversfeldcodes/gazebolang/blob/main/CONTRIBUTING.md).
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+      description: How gazebolang could help. Rough is fine.
+    validations:
+      required: true
