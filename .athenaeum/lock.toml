@@ -1,0 +1,7 @@
+schema_version = 0
+
+source = "https://github.com/erinversfeldcodes/athenaeum"
+rev = "v0.7.0"
+commit = "e51af8ca316d7d08fbb8f0e7668903ab54b02da3"
+skills = ["completion-audit", "feature-completeness", "scope-request", "verify-and-followup"]
+harnesses = ["claude-code"]
