@@ -38,3 +38,18 @@ timeout_seconds = 3600
 [gates.test.requires]
 DATABASE_URL = "env"
 PIXABAY_API_KEY = "secret"
+
+# Assumes the app is already running: heph does not start services. Start it
+# first, as README.md describes for running the end-to-end specs locally
+# (`just db-up`, `just storage-init`, `just db-migrate`, `cargo leptos build`,
+# `cargo build -p importer`, then run the built server so it listens on
+# BASE_URL), and install the specs' dependencies once with
+# `cd e2e && npm ci && npx playwright install --with-deps chromium`.
+[gates.e2e]
+run = ["npm", "--prefix", "e2e", "test"]
+when_paths = ["e2e/**", "crates/web/**"]
+timeout_seconds = 3600
+
+[gates.e2e.requires]
+BASE_URL = "env"
+DATABASE_URL = "env"
