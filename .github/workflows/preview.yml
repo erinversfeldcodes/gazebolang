@@ -211,11 +211,49 @@ jobs:
             echo "S3_SECRET_KEY=$AWS_SECRET_ACCESS_KEY"
           } >> "$GITHUB_ENV"
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+      # Runs the same flyctl steps as superfly/fly-pr-review-apps (which this
+      # step used to be) directly on the runner, rather than inside that
+      # action's Docker container, so the deploy's own output can be read:
+      # the remote builder sometimes drops the connection ("rpc error:
+      # code = Unavailable ... EOF"), which is not the change's fault, and a
+      # retry normally succeeds. Only that error is retried; a build that
+      # fails for any other reason (e.g. a compile error) fails at once.
       - name: Deploy preview app
         id: deploy
-        uses: superfly/fly-pr-review-apps@25d03647fb817d35034ce9019429c597940ee0d8 # main
-        with:
-          name: gazebo-pr-${{ github.event.number }}
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          APP_NAME: gazebo-pr-${{ github.event.number }}
+          FLY_CONFIG: fly.preview.toml
+          FLY_REGION: iad
+          FLY_ORG: personal
+          DEPLOY_ATTEMPTS: "3"
+          DEPLOY_RETRY_PAUSE: "30"
+          APP_SECRETS: >
+            DATABASE_URL=postgresql://neondb_owner:${{ steps.dbpass.outputs.password }}@${{ needs.neon-branch.outputs.db_host_pooled }}/neondb?sslmode=require
+            PIXABAY_API_KEY=${{ secrets.PIXABAY_API_KEY }}
+            RESEND_API_KEY=${{ secrets.RESEND_API_KEY }}
+            TEST_EMAIL_RECIPIENT=${{ vars.TEST_EMAIL_RECIPIENT }}
+            APP_BASE_URL=https://gazebo-pr-${{ github.event.number }}.fly.dev
+            INTERNAL_CHECK_TOKEN=${{ secrets.INTERNAL_CHECK_TOKEN }}
+            S3_BUCKET=${{ steps.storage.outputs.bucket }}
+            S3_ENDPOINT=https://t3.storage.dev
+            S3_ACCESS_KEY=${{ env.S3_ACCESS_KEY }}
+            S3_SECRET_KEY=${{ env.S3_SECRET_KEY }}
+            S3_PUBLIC_URL=https://${{ steps.storage.outputs.bucket }}.t3.tigrisfiles.io
+            S3_REGION=auto
+        run: |
+          if ! flyctl status --app "$APP_NAME"; then
+            # `flyctl launch` rewrites the config; keep the original.
+            cp "$FLY_CONFIG" "$FLY_CONFIG.bak"
+            flyctl launch --no-deploy --copy-config --name "$APP_NAME" \
+              --region "$FLY_REGION" --org "$FLY_ORG"
+            cp "$FLY_CONFIG.bak" "$FLY_CONFIG"
+          fi
+
+          printf '%s\n' "$APP_SECRETS" | tr " " "\n" | flyctl secrets import --app "$APP_NAME"
+
+          echo "Contents of config $FLY_CONFIG file: " && cat "$FLY_CONFIG"
+
           # Correction: an earlier version of this comment claimed the
           # --vm-cpu-kind/--vm-cpus/--vm-memory flags fly-pr-review-apps
           # passes to `flyctl deploy` override fly.toml's [[vm]] block
@@ -226,8 +264,8 @@ jobs:
           # cpu/memory bump was merged and deployed twice, `fly machine
           # status` on the live PR #15 preview machine still showed
           # shared-cpu-1x/256MB — the bump was silently never applying.
-          # Fixed by giving preview its own fly.preview.toml (see `config`
-          # below) with a matching [[vm]] block, instead of editing the
+          # Fixed by giving preview its own fly.preview.toml (see `FLY_CONFIG`
+          # above) with a matching [[vm]] block, instead of editing the
           # shared fly.toml that prod's deploy.yml also deploys verbatim —
           # editing that one would've doubled prod's VM spec too.
           #
@@ -246,24 +284,33 @@ jobs:
           # numbers mirror thestacks's own preview-only `--vm-memory 1024`/
           # baseline `cpus = 2` pattern (scripts/deploy-stack.sh) rather
           # than bumping prod's own spec, which doesn't show either symptom.
-          config: fly.preview.toml
-          cpu: "2"
-          memory: "512"
-          secrets: >
-            DATABASE_URL=postgresql://neondb_owner:${{ steps.dbpass.outputs.password }}@${{ needs.neon-branch.outputs.db_host_pooled }}/neondb?sslmode=require
-            PIXABAY_API_KEY=${{ secrets.PIXABAY_API_KEY }}
-            RESEND_API_KEY=${{ secrets.RESEND_API_KEY }}
-            TEST_EMAIL_RECIPIENT=${{ vars.TEST_EMAIL_RECIPIENT }}
-            APP_BASE_URL=https://gazebo-pr-${{ github.event.number }}.fly.dev
-            INTERNAL_CHECK_TOKEN=${{ secrets.INTERNAL_CHECK_TOKEN }}
-            S3_BUCKET=${{ steps.storage.outputs.bucket }}
-            S3_ENDPOINT=https://t3.storage.dev
-            S3_ACCESS_KEY=${{ env.S3_ACCESS_KEY }}
-            S3_SECRET_KEY=${{ env.S3_SECRET_KEY }}
-            S3_PUBLIC_URL=https://${{ steps.storage.outputs.bucket }}.t3.tigrisfiles.io
-            S3_REGION=auto
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          for attempt in $(seq 1 "$DEPLOY_ATTEMPTS"); do
+            if flyctl deploy --config "$FLY_CONFIG" --app "$APP_NAME" \
+              --regions "$FLY_REGION" --strategy immediate --ha=false \
+              --vm-cpu-kind shared --vm-cpus 2 --vm-memory 512 2>&1 | tee deploy.log; then
+              break
+            fi
+            # Retry only when the remote builder was unavailable.
+            if ! grep -q 'code = Unavailable' deploy.log; then
+              echo "::error::flyctl deploy failed with an error that is not the builder being unavailable; not retrying"
+              exit 1
+            fi
+            if [[ "$attempt" -ge "$DEPLOY_ATTEMPTS" ]]; then
+              echo "::error::flyctl deploy failed with the remote builder unavailable on all $DEPLOY_ATTEMPTS attempts"
+              exit 1
+            fi
+            echo "::warning::Fly's remote builder was unavailable (attempt $attempt of $DEPLOY_ATTEMPTS); retrying in ${DEPLOY_RETRY_PAUSE}s..."
+            sleep "$DEPLOY_RETRY_PAUSE"
+          done
+
+          flyctl status --app "$APP_NAME" --json > status.json
+          hostname="$(jq -r .Hostname status.json)"
+          {
+            echo "hostname=$hostname"
+            echo "url=https://$hostname"
+            echo "id=$(jq -r .ID status.json)"
+            echo "name=$APP_NAME"
+          } >> "$GITHUB_OUTPUT"
       - name: Set EMAIL_FROM (may contain spaces, which the deploy action's secrets parser can't handle)
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
