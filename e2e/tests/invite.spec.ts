@@ -1,6 +1,6 @@
 import { test, expect } from "./fixtures";
 import { Client } from "pg";
-import { uniqueWord, deleteInvitedTestUser } from "./helpers";
+import { uniqueWord, deleteInvitedTestUser, withServerCall } from "./helpers";
 
 // Exercises the real create_invite -> send_invite -> sign_up_via_invite
 // path end to end, through the actual UI on both ends, using the signed-in
@@ -38,14 +38,15 @@ test("creating an invite and signing up through it creates a working account", a
       await signupPage.getByLabel("Name").fill("Invited Friend");
       await signupPage.getByLabel("Password", { exact: true }).fill("a-friends-password-99");
       await signupPage.getByLabel("Confirm password").fill("a-friends-password-99");
-      await signupPage.getByRole("button", { name: "Sign up" }).click();
-      // Default 5s expect timeout is too tight for this specific
-      // assertion: by the time this test runs, dozens of other specs have
-      // already loaded the shared preview app and Neon branch, and the
-      // password hash + insert this round trip does can occasionally miss
-      // that window under contention — not a UI bug (no error renders;
-      // the request is just still in flight).
-      await expect(signupPage).toHaveURL("/", { timeout: 15_000 });
+      // Wait for the server's answer, not a clock: the password hash is
+      // bounded to one Argon2 operation at a time (auth.rs), so by the time
+      // this runs it can queue behind other specs' — the request is simply
+      // still in flight, and no error renders while it is.
+      const signup = await withServerCall(signupPage, "sign_up_via_invite", () =>
+        signupPage.getByRole("button", { name: "Sign up" }).click(),
+      );
+      expect(signup.ok(), "sign-up request failed").toBe(true);
+      await expect(signupPage).toHaveURL("/");
 
       // Signed in as the brand-new account, not left anonymous — and
       // bound to the invite's own email, never whatever the form itself

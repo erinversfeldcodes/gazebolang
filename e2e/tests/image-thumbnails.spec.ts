@@ -7,6 +7,7 @@ import {
   naturalWidth,
   recordedThumbnail,
   uniqueWord,
+  withFormResponse,
   withServerResponse,
 } from "./helpers";
 
@@ -34,7 +35,12 @@ async function createCardWithImage(page: Page, png: Buffer, prefix: string): Pro
     mimeType: "image/png",
     buffer: png,
   });
-  await page.getByRole("button", { name: "Add" }).click();
+  // The upload is decoded and thumbnailed before the redirect, so on the
+  // preview stack it can outlast the default 5s: wait for the POST to be
+  // answered, then check where it sent us.
+  await withFormResponse(page, /^\/cards\/new$/, () =>
+    page.getByRole("button", { name: "Add" }).click(),
+  );
   await expect(page).toHaveURL("/");
   return word;
 }

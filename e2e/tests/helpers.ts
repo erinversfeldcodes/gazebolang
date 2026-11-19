@@ -1,4 +1,4 @@
-import { Page, expect } from "@playwright/test";
+import { Page, Response, expect } from "@playwright/test";
 import { Client } from "pg";
 import * as crypto from "crypto";
 import * as zlib from "zlib";
@@ -55,6 +55,26 @@ export async function withServerResponse<T>(
     trigger(),
   ]);
   return result;
+}
+
+// Like withServerResponse, but resolves on the response whatever its status,
+// and returns it. For a server action whose outcome the test asserts on
+// afterwards (a sign-up, a login, a password change): the gate is the
+// server's answer arriving, not a clock. The preview runs one Argon2
+// operation at a time (auth.rs's ARGON2_PERMITS), so a hash can legitimately
+// queue behind other specs' for several seconds; a fixed `expect` timeout
+// turns that queueing into a failure, while waiting for the response does not.
+// If the response never comes, the test fails at its own timeout.
+export async function withServerCall<T>(
+  page: Page,
+  fnName: string,
+  trigger: () => Promise<T>,
+): Promise<Response> {
+  const [response] = await Promise.all([
+    page.waitForResponse((res) => res.url().includes(`/api/${fnName}`)),
+    trigger(),
+  ]);
+  return response;
 }
 
 // Same race as withServerResponse, for a plain <Form> that posts straight to

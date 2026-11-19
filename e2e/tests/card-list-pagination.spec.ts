@@ -1,5 +1,5 @@
 import { test, expect } from "./fixtures";
-import { deleteTaggedCards, seedTaggedCards, uniqueWord } from "./helpers";
+import { deleteTaggedCards, seedTaggedCards, uniqueWord, withServerCall } from "./helpers";
 
 // 13 cards sharing one tag: 2 pages at 12 per page, 1 at 25.
 const COUNT = 13;
@@ -69,11 +69,19 @@ test.describe("card list paging", () => {
     await page.goto("/");
     await page.getByLabel("Filter by tag").selectOption(tag);
     await page.getByLabel("Cards per page").selectOption("12");
-    await page.locator(".card-pager").first().getByRole("button", { name: "Next" }).click();
+    const pager = page.locator(".card-pager").first();
+    // Don't click Next on the previous (unfiltered) pager: on the preview
+    // stack the refetches land late, so wait until the filtered page of 12
+    // is what is on screen.
+    await expect(pager.getByText(`Showing 1–12 of ${COUNT}`)).toBeVisible();
+    await pager.getByRole("button", { name: "Next" }).click();
     await expect(page.getByText(`Showing 13–13 of ${COUNT}`).first()).toBeVisible();
 
-    await page.getByLabel("Cards per page").selectOption("25");
-    const pager = page.locator(".card-pager").first();
+    // Wait for the refetch this change triggers (the condition that matters)
+    // instead of a longer timeout on the assertions below.
+    await withServerCall(page, "list_cards", () =>
+      page.getByLabel("Cards per page").selectOption("25"),
+    );
     await expect(pager.getByText(`Showing 1–${COUNT} of ${COUNT}`)).toBeVisible();
     await expect(pager).toContainText("of 1");
     await expect(page.locator(".card-grid > li")).toHaveCount(COUNT);
