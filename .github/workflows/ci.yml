@@ -51,8 +51,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      HEPH_VERSION: v0.12.1
-      HEPH_SHA256: aab445e83904f15e8f292d88865bce6463418c36984a04e0341c0930fc12c32c
+      HEPH_VERSION: v0.39.0
+      HEPH_SHA256: e47663332b9feb6d69446495ea6fd6f6bfaebf24d2f332551696de4bdb5a3d8a
     steps:
       - uses: actions/checkout@v7
       - name: Install heph
