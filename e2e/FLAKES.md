@@ -19,45 +19,53 @@ Job: `Run E2E suite against preview` (workflow `Preview`). Config: 2 workers,
 
 ## Cause, per spec
 
-Not reproduced locally (the preview stack is not available here), so each
-cause below is the best reading of the logs, not a proven one. The
-before/after proof is the run history, below.
+**No cause is proven.** Not reproduced locally (no preview stack here). What the
+failing logs do show, and what they do not:
 
-- **Slow backend, wait too short** — `invite:17`, `account:200`,
-  `image-thumbnails:100`. Every failure is a form submit whose redirect had
-  not happened yet: the page is still on the form's URL, with no error shown.
-  Sign-up, login and password change each run Argon2 through a single-permit
-  semaphore (`ARGON2_PERMITS` in `crates/web/src/auth.rs`, 10s checkout) on a
-  shared-cpu machine, so with two workers they queue behind other specs'
-  hashes; the card upload is decoded and thumbnailed before it redirects.
-  Raising the timeout to 15s (already done for sign-up) did not stop it.
-- **Slow backend, plus acting on a stale page** — `card-list-pagination:68`.
-  The refetch after a filter or page-size change lands late on the preview
-  stack (the sibling spec's comment says the same); this spec clicked Next
-  without first waiting for the filtered pager, then asserted the result of
-  the size change on the default 5s.
-- Shared state (the one Neon branch) and ordering: no log shows either. Each
-  spec seeds its own uniquely named rows (`uniqueWord`, tagged cards) and
-  deletes them. `account.spec.ts` is serial by design. Not ruled out for
-  `image-thumbnails`, which creates cards in the shared account.
+- Shown (run 44482710078, `gh run view 44482710078 --log-failed`): `invite:17`
+  fails on both tries at `invite.spec.ts:48`, `toHaveURL("/")`, 15000ms,
+  `Received: .../signup?token=...`. The page never left the form and no error
+  rendered. The same shape (URL unchanged after a submit, no error text)
+  is logged for `account:200` and `image-thumbnails:100`.
+- Not shown: whether the submit's request was in flight, queued, or never
+  answered. Playwright's `toHaveURL` failure does not say, and no server-side
+  timing was captured. The Argon2 single-permit queue (`ARGON2_PERMITS` in
+  `crates/web/src/auth.rs`, 10s checkout) is a hypothesis for the three
+  form-submit specs; "the response never arrives" fits the same log line.
+  The logs for run 44473605145 are no longer retrievable with `gh run view
+  --log-failed`, so its rows above come from the earlier investigation, not
+  re-verified here.
+- `card-list-pagination:68`: the failing assertion is a 5000ms wait for
+  `Showing 1–13 of 13`; the sibling spec's comment says the refetch lands late
+  on the preview stack. That supports "wait too short" only as a reading.
+- Shared state (the one Neon branch) and order: no log shows either. Specs seed
+  uniquely named rows and delete them; `account.spec.ts` is serial by design.
 
-## Fix
+## Fix (unproven)
 
-The specs now wait on the condition that matters, the server's response to the
-request they triggered (`withServerCall` / `withFormResponse` in
-`tests/helpers.ts`), and then assert as before. No global timeout or retry
-count changed, and no assertion was weakened: each still checks the same
-URL/text, which stays wrong if the behaviour breaks (a failed request fails
-`response.ok()`).
+The specs now wait on the server's response to the request they triggered
+(`withServerCall` / `withFormResponse` in `tests/helpers.ts`), then assert as
+before. No global timeout or retry count changed, and no assertion was
+weakened: each still checks the same URL/text, and a failed request fails
+`response.ok()`.
+
+This turns the next failure into a discriminating one: if no response arrives
+the test fails at its own timeout inside the helper (request never answered);
+if a response arrives but is not ok, it fails on `response.ok()` with the
+status; if it is ok but the URL/text is wrong, that is a behaviour fault. Until
+a run shows which, the fix is a hypothesis, not a demonstrated cure. Next step
+if a red recurs: read that failure's helper line and add server-side timing for
+the request, rather than lengthening any wait.
 
 ## Failure rate
 
 Before: of the last 68 completed `Preview` runs on non-dependabot branches
-(fetched 2026-11-19), 31 ended in failure; these include deploy failures, and
-the e2e share has not been separated out. The e2e specs above failed in 2 of
-the 3 most recent runs inspected (44473605145, 44482710078).
+(fetched 2026-11-19), 31 ended in failure, including deploy failures; the e2e
+share is not separated out. The specs above failed in 2 of the 3 most recent
+runs inspected (44473605145, 44482710078).
 
-After: **not yet measured.** Compare the same number of `Preview` runs after
-this change merges (`gh run list --workflow Preview --json databaseId,conclusion`
-then `--log-failed` for each red) and add the figures here. Until then the
-flakiness is not shown to be fixed.
+After: **not measured.** The only post-change `Preview` run so far is
+44501511299 (this PR), which passed; one run shows nothing about an
+intermittent failure. Compare the same 68 runs after merge
+(`gh run list --workflow Preview --json databaseId,conclusion`, then
+`--log-failed` for each red) and record the figures here.
