@@ -34,6 +34,9 @@ timeout_seconds = 3600
 run = ["just", "test"]
 when_paths = ["crates/**", "migrations/**", "Cargo.toml", "Cargo.lock"]
 timeout_seconds = 3600
+# CI's `test` job runs this same command with a Postgres service and the Pixabay
+# key, so a workspace that cannot may leave the gate to it.
+ci_check = "test"
 
 [gates.test.requires]
 DATABASE_URL = "env"
@@ -49,6 +52,8 @@ PIXABAY_API_KEY = "secret"
 run = ["npm", "--prefix", "e2e", "test"]
 when_paths = ["e2e/**", "crates/web/**"]
 timeout_seconds = 3600
+# CI's `E2E (local)` job runs the same specs against a local instance it starts.
+ci_check = "E2E (local)"
 
 [gates.e2e.requires]
 BASE_URL = "env"
