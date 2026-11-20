@@ -152,7 +152,10 @@ jobs:
     name: E2E (local)
     needs: check
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Warm: ~11 min. Cold (run 44556367034): steps took 14m51 before the cache
+    # save even started, and the job was cancelled at 15m00 during the save.
+    # 20 leaves ~3-5 min for a cold save (unmeasured). See #63.
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:17-alpine
