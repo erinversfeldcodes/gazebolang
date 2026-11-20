@@ -152,10 +152,13 @@ jobs:
     name: E2E (local)
     needs: check
     runs-on: ubuntu-latest
-    # Warm: ~11 min. The only cold run (44556367034) was cancelled at 15m00
-    # during the cache save, so no completed cold duration exists. Unchanged
-    # until the post-merge cold run is measured (#63 item 5).
-    timeout-minutes: 15
+    # Warm: ~11 min. Cold (every v0-rust-* cache absent): 14m28 measured on
+    # main run 44730226542, before sqlx-cli was cached separately (that
+    # step was ~117s of it); an earlier cold run was cancelled at 15m00. The
+    # bound is 18 min: the measurement plus ~20% for a slow runner, which
+    # only costs anything when a run hangs. Re-measure after the post-merge
+    # cold run (#63 item 5, #69) and tighten if the margin is large.
+    timeout-minutes: 18
     services:
       postgres:
         image: postgres:17-alpine
@@ -205,7 +208,20 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
-          tool: sqlx-cli,cargo-leptos,just
+          tool: cargo-leptos,just
+      # sqlx-cli has no prebuilt binary for install-action, so it used to be
+      # compiled by `cargo install` on every run (~117s of the cold run, 44730226542).
+      # Pinned to the sqlx version in Cargo.lock and the binary cached on its
+      # own key, so only a version bump (or a cache eviction) recompiles it.
+      - name: Cache sqlx-cli
+        id: sqlx-cli-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/sqlx
+          key: sqlx-cli-${{ runner.os }}-0.9.0
+      - name: Install sqlx-cli
+        if: steps.sqlx-cli-cache.outputs.cache-hit != 'true'
+        run: cargo install sqlx-cli --version 0.9.0 --locked --no-default-features --features rustls,postgres
       # importer vendors and CMake-builds llama.cpp from source — see the
       # same comment on the `check` job above.
       - run: sudo apt-get update && sudo apt-get install -y cmake
