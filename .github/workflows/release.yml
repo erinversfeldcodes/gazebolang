@@ -24,6 +24,8 @@ jobs:
         with:
           toolchain: "1.99.1"
       - uses: Swatinem/rust-cache@v2
+        with:
+          add-rust-environment-hash-key: false
       - run: cargo build --release -p importer
       - name: Package
         run: |

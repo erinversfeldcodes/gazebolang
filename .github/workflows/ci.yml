@@ -29,6 +29,9 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
+        with:
+          add-rust-environment-hash-key: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # importer vendors and CMake-builds llama.cpp from source (see
       # crates/importer's own Cargo.toml) — can't confirm cmake ships
       # preinstalled on this runner image, so install it explicitly rather
@@ -83,6 +86,9 @@ jobs:
         with:
           toolchain: "1.99.1"
       - uses: Swatinem/rust-cache@v2
+        with:
+          add-rust-environment-hash-key: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build -p importer
       - run: cargo test -p importer
 
@@ -122,6 +128,9 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
+        with:
+          add-rust-environment-hash-key: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -143,6 +152,9 @@ jobs:
     name: E2E (local)
     needs: check
     runs-on: ubuntu-latest
+    # Warm: ~11 min. The only cold run (44556367034) was cancelled at 15m00
+    # during the cache save, so no completed cold duration exists. Unchanged
+    # until the post-merge cold run is measured (#63 item 5).
     timeout-minutes: 15
     services:
       postgres:
@@ -188,6 +200,9 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
+        with:
+          add-rust-environment-hash-key: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: sqlx-cli,cargo-leptos,just
