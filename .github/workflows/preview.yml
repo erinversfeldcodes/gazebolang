@@ -459,19 +459,24 @@ jobs:
           # Read the samples back even if starting the sampler looks like it
           # failed (the ssh call can die after the sampler is running).
           echo "measuring=true" >> "$GITHUB_OUTPUT"
-          # Runs on the machine, detached. Re-finds the `web` pid every
-          # sample, so a restarted process is followed. One line per second,
+          # Runs on the machine, detached. Re-finds the `web` pid when it
+          # changes, so a restarted process is followed. One line per second,
           # tagged RSS_SAMPLE, into pid 1's stdout (the machine's log stream).
           # Stops itself after 40 minutes (more than the job's timeout), so a
           # sampler is never left behind on a reused machine. A reboot kills
           # it; samples after a reboot are lost until it is started again.
           cat > sampler.sh <<'EOF'
           n=0
+          pid=""
           while [ $n -lt 2400 ]; do
-            pid=""
-            for d in /proc/[0-9]*; do
-              if [ "$(cat $d/comm 2>/dev/null)" = web ]; then pid=${d#/proc/}; break; fi
-            done
+            # Scan /proc only when the cached pid is gone or no longer `web`,
+            # so a steady-state sample forks little on a small machine.
+            if [ -z "$pid" ] || [ "$(cat /proc/$pid/comm 2>/dev/null)" != web ]; then
+              pid=""
+              for d in /proc/[0-9]*; do
+                if [ "$(cat $d/comm 2>/dev/null)" = web ]; then pid=${d#/proc/}; break; fi
+              done
+            fi
             st="rss_kb=0 hwm_kb=0"
             if [ -n "$pid" ]; then
               st=$(awk '/^VmRSS/{r=$2}/^VmHWM/{h=$2}END{print "rss_kb=" r+0 " hwm_kb=" h+0}' /proc/$pid/status 2>/dev/null)
