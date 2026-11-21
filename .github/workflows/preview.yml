@@ -387,6 +387,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           add-rust-environment-hash-key: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # importer vendors and CMake-builds llama.cpp from source — see the
       # matching comment in ci.yml.
       - run: sudo apt-get update && sudo apt-get install -y cmake
@@ -430,14 +431,18 @@ jobs:
           done
           echo "::error::preview app never became reachable at ${BASE_URL}/health"
           exit 1
-      # Memory measurement (ticket #71, for #65): best-effort, never fails the
-      # job and never changes what the suite does. FLY_API_TOKEN is given to
-      # the two measurement steps below only (as the deploy steps do), never
-      # to the step that runs the suite or to the job's environment, because
-      # the suite runs this repository's own code. The token is unavailable to
-      # Dependabot and fork pull requests: the sampler step then sees it empty,
-      # prints a notice and a job-summary line saying nothing was measured, and
-      # the fetch step is skipped; the suite runs as usual.
+      # Memory measurement (tickets #71, #73, for #65): best-effort, never
+      # fails the job and never changes what the suite does. FLY_API_TOKEN is
+      # given to the two measurement steps below only (as the deploy steps do),
+      # never to the step that runs the suite or to the job's environment,
+      # because the suite runs this repository's own code. The token is
+      # unavailable to Dependabot and fork pull requests: the sampler step then
+      # sees it empty, prints a notice and a job-summary line saying nothing
+      # was measured, and the report step is skipped; the suite runs as usual.
+      #
+      # The sampler writes to the machine's log stream (/proc/1/fd/1), not to a
+      # file: an OOM kill reboots the whole VM and wipes /tmp, but log lines
+      # have already left the machine by then.
       - uses: superfly/flyctl-actions/setup-flyctl@98172f70657cb3e15db199af139be99bd3e61200 # master
         continue-on-error: true
       - name: Start memory sampler on the preview machine
@@ -452,83 +457,108 @@ jobs:
             echo "Preview memory: not measured (no FLY_API_TOKEN on this run, e.g. Dependabot or a fork)." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          remote_file="/tmp/rss-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.csv"
-          # Runs on the machine, detached. Re-finds the `web` pid every
-          # sample, so a restarted process is followed. Stops itself after
-          # 40 minutes (more than the job's timeout), so a sampler is never
-          # left behind on a reused machine.
-          cat > sampler.sh <<EOF
+          # Read the samples back even if starting the sampler looks like it
+          # failed (the ssh call can die after the sampler is running).
+          echo "measuring=true" >> "$GITHUB_OUTPUT"
+          # Runs on the machine, detached. Re-finds the `web` pid when it
+          # changes, so a restarted process is followed. One line per second,
+          # tagged RSS_SAMPLE, into pid 1's stdout (the machine's log stream).
+          # Stops itself after 40 minutes (more than the job's timeout), so a
+          # sampler is never left behind on a reused machine. A reboot kills
+          # it; samples after a reboot are lost until it is started again.
+          cat > sampler.sh <<'EOF'
           n=0
-          while [ \$n -lt 1200 ]; do
-            pid=""
-            for d in /proc/[0-9]*; do
-              if [ "\$(cat \$d/comm 2>/dev/null)" = web ]; then pid=\${d#/proc/}; break; fi
-            done
-            st=","
-            if [ -n "\$pid" ]; then
-              st=\$(awk '/^VmRSS/{r=\$2}/^VmHWM/{h=\$2}END{print r","h}' /proc/\$pid/status 2>/dev/null)
+          pid=""
+          while [ $n -lt 2400 ]; do
+            # Scan /proc only when the cached pid is gone or no longer `web`,
+            # so a steady-state sample forks little on a small machine.
+            if [ -z "$pid" ] || [ "$(cat /proc/$pid/comm 2>/dev/null)" != web ]; then
+              pid=""
+              for d in /proc/[0-9]*; do
+                if [ "$(cat $d/comm 2>/dev/null)" = web ]; then pid=${d#/proc/}; break; fi
+              done
             fi
-            av=\$(awk '/^MemAvailable/{print \$2}' /proc/meminfo)
-            echo "\$(date -u +%FT%TZ),\$pid,\$st,\$av" >> $remote_file
-            n=\$((n+1))
-            sleep 2
+            st="rss_kb=0 hwm_kb=0"
+            if [ -n "$pid" ]; then
+              st=$(awk '/^VmRSS/{r=$2}/^VmHWM/{h=$2}END{print "rss_kb=" r+0 " hwm_kb=" h+0}' /proc/$pid/status 2>/dev/null)
+            fi
+            up=$(cut -d' ' -f1 /proc/uptime)
+            av=$(awk '/^MemAvailable/{print $2}' /proc/meminfo)
+            echo "RSS_SAMPLE uptime_s=$up epoch_s=$(date +%s) $st memavailable_kb=$av" > /proc/1/fd/1
+            n=$((n+1))
+            sleep 1
           done
           EOF
           encoded=$(base64 -w0 sampler.sh)
           if timeout 90 flyctl ssh console --app "$APP_NAME" \
             -C "sh -c 'echo $encoded | base64 -d > /tmp/sampler.sh; nohup sh /tmp/sampler.sh </dev/null >/dev/null 2>&1 &'"; then
             echo "started=true" >> "$GITHUB_OUTPUT"
-            echo "remote_file=$remote_file" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::Could not start the memory sampler on $APP_NAME; this run's memory is not measured."
-            echo "Preview memory: not measured (the sampler could not be started)." >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Could not confirm the memory sampler started on $APP_NAME; this run's memory may not be measured."
           fi
       - name: Run E2E suite against the deployed preview
         working-directory: e2e
         run: npx playwright test
       - name: Report preview memory
-        if: always() && steps.sampler.outputs.started == 'true'
+        if: always() && steps.sampler.outputs.measuring == 'true'
         continue-on-error: true
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           APP_NAME: gazebo-pr-${{ github.event.number }}
-          REMOTE_FILE: ${{ steps.sampler.outputs.remote_file }}
         run: |
           mkdir -p memory
-          {
-            echo "time,pid,vmrss_kb,vmhwm_kb,memavailable_kb"
-            timeout 90 flyctl ssh console --app "$APP_NAME" -C "cat $REMOTE_FILE" | tr -d '\r' | grep -E '^[0-9]{4}-' || true
-          } > memory/samples.csv
+          now=$(date +%s)  # the suite has just ended; compared with the last sample
+          timeout 120 flyctl logs --app "$APP_NAME" --no-tail 2>&1 | tr -d '\r' > memory/logs.txt || echo "::warning::Could not read the logs of $APP_NAME."
+          grep -o 'RSS_SAMPLE .*' memory/logs.txt > memory/samples.txt || true
+          grep 'Out of memory' memory/logs.txt | tail -n 20 > memory/oom.txt || true
           {
             echo "### Preview \`web\` memory during the E2E run"
             echo
-            rows=$(($(wc -l < memory/samples.csv) - 1))
-            if [[ "$rows" -lt 1 ]]; then
-              echo "No samples could be fetched from the machine (it may have restarted, or ssh failed)."
-              echo "::warning::No memory samples could be fetched from $APP_NAME."
+            if [[ ! -s memory/samples.txt ]]; then
+              echo "No \`RSS_SAMPLE\` lines were found in the app's logs (the sampler did not start, the log read failed, or the logs had rolled over). Nothing was measured."
+              if [[ -s memory/oom.txt ]]; then echo "- **The machine was OOM-killed (and so rebooted) during this run**: Out of memory lines are below. Samples taken after a reboot are lost until the sampler is started again."; fi
+              echo "::warning::No memory samples found in the logs of $APP_NAME."
             else
-              awk -F, 'NR>1 {
-                n++
-                if ($3 != "") { if ($3+0 > r) r = $3+0; seen = 1 } else { gaps++ }
-                if ($4 != "" && $4+0 > h) h = $4+0
-                if ($5 != "" && (a == "" || $5+0 < a)) a = $5+0
-              }
-              END {
-                printf "- Samples: %d (every 2 s), of which %d had no `web` process\n", n, gaps
-                printf "- Peak VmRSS: %d kB (%.1f MB)\n", r, r/1024
-                printf "- Peak VmHWM: %d kB (%.1f MB)\n", h, h/1024
-                printf "- Lowest MemAvailable: %d kB (%.1f MB)\n", a, a/1024
-              }' memory/samples.csv
+              awk '
+                function val(key,   i) { for (i = 1; i <= NF; i++) if (index($i, key "=") == 1) return substr($i, length(key) + 2) + 0; return "" }
+                {
+                  up = val("uptime_s"); ep = val("epoch_s"); r = val("rss_kb"); h = val("hwm_kb"); a = val("memavailable_kb")
+                  if (up == "" || a == "") next
+                  n++
+                  if (n > 1) {
+                    if (up < prev) { reboots++ }
+                    else if (up - prev > 5) { gaps++ }
+                  }
+                  prev = up
+                  if (ep != "") lastep = ep
+                  if (r > pr) pr = r
+                  if (h > ph) ph = h
+                  if (minA == "" || a < minA) minA = a
+                }
+                END {
+                  # An OOM kill stops the samples for good, so also compare the
+                  # last sample with the end of the suite (one sample a second,
+                  # plus some delay in log shipping).
+                  if (lastep != "" && now - lastep > 20) { trailing = now - lastep }
+                  printf "- Samples seen: %d (one per second while the sampler ran)\n", n
+                  printf "- Peak VmRSS: %d kB (%.1f MB)\n", pr, pr/1024
+                  printf "- Peak VmHWM: %d kB (%.1f MB)\n", ph, ph/1024
+                  printf "- Lowest MemAvailable: %d kB (%.1f MB)\n", minA, minA/1024
+                  if (reboots > 0 || gaps > 0 || trailing > 0 || oom > 0)
+                    printf "- **The machine rebooted during this run** (%d uptime reset(s), %d gap(s) over 5 s, samples ended %d s before the suite did, %d Out of memory line(s) in the logs). Samples taken after a reboot are lost until the sampler is started again, so the figures above cover only the time the sampler was running.\n", reboots, gaps, trailing, oom
+                  else
+                    printf "- No reboot seen: uptime never went backwards, no gaps, samples ran up to the end of the suite and no Out of memory lines.\n"
+                }' now="$now" oom="$(wc -l < memory/oom.txt | tr -d ' ')" memory/samples.txt
             fi
             echo
             echo "Out of memory lines in \`flyctl logs --no-tail\`:"
             echo
             echo '```'
-            timeout 90 flyctl logs --app "$APP_NAME" --no-tail 2>&1 | grep 'Out of memory' | tail -n 20 || echo "(none)"
+            if [[ -s memory/oom.txt ]]; then cat memory/oom.txt; else echo "(none)"; fi
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Upload preview memory samples
-        if: always() && steps.sampler.outputs.started == 'true'
+        if: always() && steps.sampler.outputs.measuring == 'true'
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
