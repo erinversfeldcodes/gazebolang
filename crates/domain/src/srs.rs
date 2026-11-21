@@ -6,12 +6,56 @@ const DESIRED_RETENTION: f32 = 0.9;
 
 const RELEARNING_INTERVAL_DAYS: f32 = 10.0 / (24.0 * 60.0); // 10 minutes
 
+/// How well a card was recalled, matching Anki's four answer buttons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Grade {
     Again,
     Hard,
     Good,
     Easy,
+}
+
+/// A button number outside Anki's 1 to 4 range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidButton(pub u8);
+
+impl std::fmt::Display for InvalidButton {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid grade button {}: expected 1 to 4", self.0)
+    }
+}
+
+impl std::error::Error for InvalidButton {}
+
+impl Grade {
+    /// Maps an Anki button number (1 = Again, 2 = Hard, 3 = Good, 4 = Easy)
+    /// to a `Grade`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidButton`] carrying the given number if it is not 1
+    /// to 4.
+    pub const fn from_button(button: u8) -> Result<Self, InvalidButton> {
+        match button {
+            1 => Ok(Self::Again),
+            2 => Ok(Self::Hard),
+            3 => Ok(Self::Good),
+            4 => Ok(Self::Easy),
+            other => Err(InvalidButton(other)),
+        }
+    }
+
+    /// The Anki button number for this grade; the inverse of
+    /// [`Grade::from_button`].
+    #[must_use]
+    pub const fn button(self) -> u8 {
+        match self {
+            Self::Again => 1,
+            Self::Hard => 2,
+            Self::Good => 3,
+            Self::Easy => 4,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -189,6 +233,30 @@ mod tests {
         let next = lapsed.schedule(Grade::Good, 0);
         assert_eq!(next.repetitions, 1);
         assert!(next.interval_days >= 1.0);
+    }
+
+    #[test]
+    fn buttons_one_to_four_map_to_grades() {
+        assert_eq!(Grade::from_button(1), Ok(Grade::Again));
+        assert_eq!(Grade::from_button(2), Ok(Grade::Hard));
+        assert_eq!(Grade::from_button(3), Ok(Grade::Good));
+        assert_eq!(Grade::from_button(4), Ok(Grade::Easy));
+    }
+
+    #[test]
+    fn out_of_range_buttons_are_errors_naming_the_number() {
+        for n in [0u8, 5, 255] {
+            let err = Grade::from_button(n).unwrap_err();
+            assert_eq!(err, InvalidButton(n));
+            assert!(err.to_string().contains(&n.to_string()));
+        }
+    }
+
+    #[test]
+    fn button_round_trips_for_every_grade() {
+        for grade in [Grade::Again, Grade::Hard, Grade::Good, Grade::Easy] {
+            assert_eq!(Grade::from_button(grade.button()), Ok(grade));
+        }
     }
 
     proptest::proptest! {
