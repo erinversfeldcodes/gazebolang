@@ -1,6 +1,6 @@
 //! FSRS-based spaced-repetition scheduling over Anki's 4-button grading
 
-use fsrs::{FSRS, MemoryState};
+use fsrs::{FSRS, FSRS6_DEFAULT_PARAMETERS, MemoryState};
 
 const DESIRED_RETENTION: f32 = 0.9;
 
@@ -75,6 +75,10 @@ impl ReviewState {
             (Some(stability), Some(difficulty)) => Some(MemoryState {
                 stability,
                 difficulty,
+                // fsrs 7 adds a fast-stability trace; its docs say FSRS-6
+                // parameters (the default, which this module uses) set it
+                // equal to `stability`, and it is not persisted.
+                stability_fast: stability,
             }),
             _ => None,
         }
@@ -92,11 +96,15 @@ impl ReviewState {
     /// both of which are fixed, known-valid constants here.
     #[must_use]
     pub fn schedule(self, grade: Grade, elapsed_days: u32) -> Self {
-        let fsrs = FSRS::default();
+        // `FSRS::default()` is FSRS-7 as of fsrs 7.0.0, which moves intervals
+        // and needs a persisted fast-stability trace. Stay on the FSRS-6
+        // parameters this app has always scheduled with.
+        let fsrs =
+            FSRS::new(&FSRS6_DEFAULT_PARAMETERS).expect("the FSRS-6 default parameters are valid");
         let next_states = fsrs
             .next_states(self.memory_state(), DESIRED_RETENTION, elapsed_days)
             .expect(
-                "FSRS::next_states with default parameters and a fixed, valid \
+                "FSRS::next_states with the FSRS-6 default parameters and a fixed, valid \
                  desired_retention does not fail",
             );
 
@@ -257,6 +265,53 @@ mod tests {
         for grade in [Grade::Again, Grade::Hard, Grade::Good, Grade::Easy] {
             assert_eq!(Grade::from_button(grade.button()), Ok(grade));
         }
+    }
+
+    /// Scheduling recorded under `fsrs` 6.6.2 for fixed inputs, as
+    /// (stability, difficulty, `interval_days`, repetitions, lapses). A new
+    /// `fsrs` major that moves any of these changes what a learner is shown.
+    #[test]
+    fn scheduling_for_fixed_inputs_matches_the_fsrs_6_record() {
+        let mid = ReviewState {
+            stability: Some(8.0),
+            difficulty: Some(5.0),
+            interval_days: 6.0,
+            repetitions: 2,
+            lapses: 0,
+        };
+        let mut rows: Vec<String> = Vec::new();
+        for grade in [Grade::Again, Grade::Hard, Grade::Good, Grade::Easy] {
+            for (name, state, elapsed) in [
+                ("new", ReviewState::default(), 0),
+                ("mid", mid, 6),
+                ("late", mid, 20),
+            ] {
+                let n = state.schedule(grade, elapsed);
+                rows.push(format!(
+                    "{grade:?} {name} {:.4} {:.4} {:.4} {} {}",
+                    n.stability.unwrap(),
+                    n.difficulty.unwrap(),
+                    n.interval_days,
+                    n.repetitions,
+                    n.lapses
+                ));
+            }
+        }
+        let expected: &[&str] = &[
+            "Again new 0.2120 6.4133 0.0069 0 0",
+            "Again mid 1.2018 8.3418 0.0069 0 1",
+            "Again late 1.3994 8.3418 0.0069 0 1",
+            "Hard new 1.2931 5.1122 1.2931 1 0",
+            "Hard mid 16.8950 6.6660 16.8950 3 0",
+            "Hard late 27.7042 6.6660 27.7042 3 0",
+            "Good new 2.3065 2.1181 2.3065 1 0",
+            "Good mid 22.7904 4.9902 22.7904 3 0",
+            "Good late 40.7638 4.9902 40.7638 3 0",
+            "Easy new 8.2956 1.0000 8.2956 1 0",
+            "Easy mid 35.7010 3.3145 35.7010 3 0",
+            "Easy late 69.3634 3.3145 69.3634 3 0",
+        ];
+        assert_eq!(rows, expected);
     }
 
     proptest::proptest! {

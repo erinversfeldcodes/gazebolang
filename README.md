@@ -18,7 +18,7 @@ gazebolang is a web app for building and reviewing flashcards in a language you 
 
 This follows the `E2E (local)` job in `.github/workflows/ci.yml`. Do the steps in order.
 
-1. **Install** what [Running it locally](#running-it-locally) lists, plus Node.js (CI uses version 22) with npm, and `cmake` (the importer builds `llama.cpp` from source).
+1. **Install** what [Running it locally](#running-it-locally) lists, plus Node.js (CI uses version 26) with npm, and `cmake` (the importer builds `llama.cpp` from source).
 2. **Set up the environment.** Copy `.env.example` to `.env` and uncomment the `S3_*` lines (`S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_PUBLIC_URL`, `S3_PATH_STYLE`, `S3_REGION`); the specs that upload card images need storage. `image-search.spec.ts` has two tests that call the real Pixabay API and need `PIXABAY_API_KEY`.
 3. **Start PostgreSQL and Garage, and migrate:** `just db-up`, `just storage-init`, `just db-migrate`.
 4. **Build the wiki editor.** The wiki specs time out without it: `cd editor && npm ci && npm run build`.

@@ -4,7 +4,7 @@
 # crates/web/public never gets populated, cargo-leptos below has nothing
 # to copy into the site root, and the deployed app silently ships a wiki
 # editor that can never mount.
-FROM node:22-bookworm-slim AS editor-builder
+FROM node:24-bookworm-slim AS editor-builder
 WORKDIR /app/editor
 COPY editor/package.json editor/package-lock.json ./
 RUN npm ci

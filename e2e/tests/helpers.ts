@@ -155,8 +155,16 @@ export async function reviewOwnCard(page: Page, deckName: string, word: string):
   await expect(page.getByText("Reveal")).toBeVisible();
   await page.getByText("Reveal").click();
   await expect(page.getByText(word, { exact: true })).toBeVisible();
+  // `waitForLoadState("networkidle")` resolves at once here: the review page
+  // already reached it, and a server-function fetch does not reset it. A
+  // caller that navigates next then aborts the grade before it is saved
+  // (run 44927054020: `grade_card` had no response). Wait for the response.
+  const graded = page.waitForResponse(
+    (r) => r.url().includes("/api/grade_card") && r.request().method() === "POST",
+  );
   await page.getByRole("button", { name: "Good" }).click();
-  await page.waitForLoadState("networkidle");
+  const response = await graded;
+  expect(response.ok()).toBe(true);
 }
 
 // Account used only as the `invited_by` of invites this helper mints — a
