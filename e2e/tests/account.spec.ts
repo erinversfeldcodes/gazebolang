@@ -3,6 +3,7 @@ import { Client } from "pg";
 import {
   uniqueWord,
   withServerResponse,
+  withServerCall,
   createInviteToken,
   waitForHydration,
   RESEND_ALLOWED_EMAIL,
@@ -43,11 +44,13 @@ async function signUpFreshAccount(
   await page.getByLabel("Name").fill("Account Spec");
   await page.getByLabel("Password", { exact: true }).fill(password);
   await page.getByLabel("Confirm password").fill(password);
-  await page.getByRole("button", { name: "Sign up" }).click();
-  // Default 5s is too tight here: auth.rs bounds Argon2 work to 2
-  // concurrent operations (to avoid OOMing the small preview app), so a
-  // burst of signups/logins across the suite can briefly queue behind
-  // each other — not a UI bug, the request is just still in flight.
+  // Wait for the server's answer before asserting on the redirect. Whether
+  // Argon2 queueing is why the old 5s wait failed is a hypothesis (see
+  // e2e/FLAKES.md); the explicit 15s bound after the response is unchanged.
+  const response = await withServerCall(page, "sign_up_via_invite", () =>
+    page.getByRole("button", { name: "Sign up" }).click(),
+  );
+  expect(response.ok(), "sign-up request failed").toBe(true);
   await expect(page).toHaveURL("/", { timeout: 15_000 });
   return { email };
 }
@@ -146,7 +149,10 @@ test("changing your email with the right password updates it and future logins",
     await expect(page.getByText("invalid email or password")).toBeVisible({ timeout: 15_000 });
 
     await page.getByLabel("Email").fill(newEmail);
-    await page.getByRole("button", { name: "Sign in" }).click();
+    const login = await withServerCall(page, "log_in", () =>
+      page.getByRole("button", { name: "Sign in" }).click(),
+    );
+    expect(login.ok(), "login request failed").toBe(true);
     await expect(page).toHaveURL("/", { timeout: 15_000 });
   } finally {
     // The account now lives under newEmail, not the original — delete
@@ -211,22 +217,29 @@ test("changing your password logs you out and lets you sign in with the new one"
     // app's own effect, which only fires once the action's value is
     // already Some(Ok(())) — i.e. strictly after the round trip completes,
     // not a navigation this test script is racing against.
-    await page.getByRole("button", { name: "Change password" }).click();
-
     // This change, and both logins below, each go through the same
     // bounded Argon2 verify/hash as signUpFreshAccount's sign-up — see
-    // its comment above.
+    // its comment above — so each waits for the server's answer.
+    const changed = await withServerCall(page, "change_password", () =>
+      page.getByRole("button", { name: "Change password" }).click(),
+    );
+    expect(changed.ok(), "change-password request failed").toBe(true);
     await expect(page).toHaveURL("/login?reset=success", { timeout: 15_000 });
     await expect(page.getByText("Password updated")).toBeVisible();
     await waitForHydration(page);
 
     await page.getByLabel("Email").fill(email);
     await page.getByLabel("Password").fill("correct-horse-battery");
-    await page.getByRole("button", { name: "Sign in" }).click();
+    await withServerCall(page, "log_in", () =>
+      page.getByRole("button", { name: "Sign in" }).click(),
+    );
     await expect(page.getByText("invalid email or password")).toBeVisible({ timeout: 15_000 });
 
     await page.getByLabel("Password").fill("a-brand-new-password-99");
-    await page.getByRole("button", { name: "Sign in" }).click();
+    const login = await withServerCall(page, "log_in", () =>
+      page.getByRole("button", { name: "Sign in" }).click(),
+    );
+    expect(login.ok(), "login request failed").toBe(true);
     await expect(page).toHaveURL("/", { timeout: 15_000 });
   } finally {
     await deleteTestUser(email);
