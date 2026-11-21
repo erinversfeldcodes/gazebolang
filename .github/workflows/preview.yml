@@ -410,7 +410,7 @@ jobs:
           echo "DATABASE_URL=postgresql://neondb_owner:${password}@${{ needs.neon-branch.outputs.db_host_pooled }}/neondb?sslmode=require" >> "$GITHUB_ENV"
       - name: Cache Playwright browsers
         id: playwright-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('e2e/package-lock.json') }}
