@@ -233,7 +233,7 @@ jobs:
       # importer vendors and CMake-builds llama.cpp from source — see the
       # same comment on the `check` job above.
       - run: sudo apt-get update && sudo apt-get install -y cmake
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
