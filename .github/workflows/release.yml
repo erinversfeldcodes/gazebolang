@@ -32,7 +32,7 @@ jobs:
           mkdir -p dist
           tar -czf dist/gazebo-importer-macos-arm64.tar.gz -C target/release importer
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/gazebo-importer-macos-arm64.tar.gz
           # Model weights are never bundled here — importer downloads the
