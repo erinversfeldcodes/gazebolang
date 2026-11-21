@@ -484,7 +484,7 @@ jobs:
             fi
             up=$(cut -d' ' -f1 /proc/uptime)
             av=$(awk '/^MemAvailable/{print $2}' /proc/meminfo)
-            echo "RSS_SAMPLE uptime_s=$up $st memavailable_kb=$av" > /proc/1/fd/1
+            echo "RSS_SAMPLE uptime_s=$up epoch_s=$(date +%s) $st memavailable_kb=$av" > /proc/1/fd/1
             n=$((n+1))
             sleep 1
           done
@@ -507,6 +507,7 @@ jobs:
           APP_NAME: gazebo-pr-${{ github.event.number }}
         run: |
           mkdir -p memory
+          now=$(date +%s)  # the suite has just ended; compared with the last sample
           timeout 120 flyctl logs --app "$APP_NAME" --no-tail 2>&1 | tr -d '\r' > memory/logs.txt || echo "::warning::Could not read the logs of $APP_NAME."
           grep -o 'RSS_SAMPLE .*' memory/logs.txt > memory/samples.txt || true
           grep 'Out of memory' memory/logs.txt | tail -n 20 > memory/oom.txt || true
@@ -515,12 +516,13 @@ jobs:
             echo
             if [[ ! -s memory/samples.txt ]]; then
               echo "No \`RSS_SAMPLE\` lines were found in the app's logs (the sampler did not start, the log read failed, or the logs had rolled over). Nothing was measured."
+              if [[ -s memory/oom.txt ]]; then echo "- **The machine was OOM-killed (and so rebooted) during this run**: Out of memory lines are below. Samples taken after a reboot are lost until the sampler is started again."; fi
               echo "::warning::No memory samples found in the logs of $APP_NAME."
             else
               awk '
                 function val(key,   i) { for (i = 1; i <= NF; i++) if (index($i, key "=") == 1) return substr($i, length(key) + 2) + 0; return "" }
                 {
-                  up = val("uptime_s"); r = val("rss_kb"); h = val("hwm_kb"); a = val("memavailable_kb")
+                  up = val("uptime_s"); ep = val("epoch_s"); r = val("rss_kb"); h = val("hwm_kb"); a = val("memavailable_kb")
                   if (up == "" || a == "") next
                   n++
                   if (n > 1) {
@@ -528,20 +530,25 @@ jobs:
                     else if (up - prev > 5) { gaps++ }
                   }
                   prev = up
+                  if (ep != "") lastep = ep
                   if (r > pr) pr = r
                   if (h > ph) ph = h
                   if (minA == "" || a < minA) minA = a
                 }
                 END {
+                  # An OOM kill stops the samples for good, so also compare the
+                  # last sample with the end of the suite (one sample a second,
+                  # plus some delay in log shipping).
+                  if (lastep != "" && now - lastep > 20) { trailing = now - lastep }
                   printf "- Samples seen: %d (one per second while the sampler ran)\n", n
                   printf "- Peak VmRSS: %d kB (%.1f MB)\n", pr, pr/1024
                   printf "- Peak VmHWM: %d kB (%.1f MB)\n", ph, ph/1024
                   printf "- Lowest MemAvailable: %d kB (%.1f MB)\n", minA, minA/1024
-                  if (reboots > 0 || gaps > 0)
-                    printf "- **The machine rebooted during this run** (%d uptime reset(s), %d gap(s) over 5 s). Samples taken after a reboot are lost until the sampler is started again, so the figures above cover only the time the sampler was running.\n", reboots, gaps
+                  if (reboots > 0 || gaps > 0 || trailing > 0 || oom > 0)
+                    printf "- **The machine rebooted during this run** (%d uptime reset(s), %d gap(s) over 5 s, samples ended %d s before the suite did, %d Out of memory line(s) in the logs). Samples taken after a reboot are lost until the sampler is started again, so the figures above cover only the time the sampler was running.\n", reboots, gaps, trailing, oom
                   else
-                    printf "- No reboot seen in the samples (uptime never went backwards, no gaps). If the machine rebooted after the last sample, nothing after it was captured.\n"
-                }' memory/samples.txt
+                    printf "- No reboot seen: uptime never went backwards, no gaps, samples ran up to the end of the suite and no Out of memory lines.\n"
+                }' now="$now" oom="$(wc -l < memory/oom.txt | tr -d ' ')" memory/samples.txt
             fi
             echo
             echo "Out of memory lines in \`flyctl logs --no-tail\`:"
