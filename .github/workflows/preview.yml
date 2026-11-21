@@ -162,7 +162,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
       - uses: actions/setup-node@v7
         with:
-          node-version: 26
+          node-version: 24
       - uses: superfly/flyctl-actions/setup-flyctl@98172f70657cb3e15db199af139be99bd3e61200 # master
       # See the `db_password_enc` comment on `neon-branch`'s `outputs:` —
       # decrypt and re-mask it locally, in this job, before using it; a
@@ -375,7 +375,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
       - uses: actions/setup-node@v7
         with:
-          node-version: 26
+          node-version: 24
       # import-dictionary.spec.ts execs the importer binary directly
       # against this job's own checkout (only the `create` stage, which
       # needs no model/GPU — see ci.yml's matching comment) — built here
@@ -569,7 +569,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
       - uses: actions/setup-node@v7
         with:
-          node-version: 26
+          node-version: 24
       - name: Delete per-PR Tigris bucket and access key
         env:
           TIGRIS_ACCESS_KEY_ID: ${{ secrets.TIGRIS_CI_ACCESS_KEY_ID }}
