@@ -215,7 +215,7 @@ jobs:
       # own key, so only a version bump (or a cache eviction) recompiles it.
       - name: Cache sqlx-cli
         id: sqlx-cli-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cargo/bin/sqlx
           key: sqlx-cli-${{ runner.os }}-0.9.0
@@ -226,16 +226,16 @@ jobs:
       # cache is invisible to the next pull request (#63, #76).
       - name: Save sqlx-cli cache
         if: github.ref == 'refs/heads/main' && steps.sqlx-cli-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ~/.cargo/bin/sqlx
           key: sqlx-cli-${{ runner.os }}-0.9.0
       # importer vendors and CMake-builds llama.cpp from source — see the
       # same comment on the `check` job above.
       - run: sudo apt-get update && sudo apt-get install -y cmake
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 26
           cache: npm
           cache-dependency-path: editor/package-lock.json
       # wiki-editor.js/.css are gitignored build output (see .gitignore's
@@ -270,7 +270,7 @@ jobs:
         # output.
         run: ./target/debug/web > web-server.log 2>&1 &
       - name: Cache Playwright browsers
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('e2e/package-lock.json') }}
@@ -295,7 +295,7 @@ jobs:
         run: npx playwright test
       - name: Upload Playwright traces (failures only)
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-traces-ci
           path: |
