@@ -387,6 +387,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           add-rust-environment-hash-key: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # importer vendors and CMake-builds llama.cpp from source — see the
       # matching comment in ci.yml.
       - run: sudo apt-get update && sudo apt-get install -y cmake
