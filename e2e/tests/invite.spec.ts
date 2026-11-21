@@ -1,6 +1,6 @@
 import { test, expect } from "./fixtures";
 import { Client } from "pg";
-import { uniqueWord, deleteInvitedTestUser, withServerCall } from "./helpers";
+import { uniqueWord, deleteInvitedTestUser, withServerCall, waitForHydration } from "./helpers";
 
 // Exercises the real create_invite -> send_invite -> sign_up_via_invite
 // path end to end, through the actual UI on both ends, using the signed-in
@@ -35,6 +35,12 @@ test("creating an invite and signing up through it creates a working account", a
     const signupPage = await signupContext.newPage();
     try {
       await signupPage.goto(`/signup?token=${token}`);
+      // A page from browser.newContext() is not the fixture's page, so its
+      // goto does not wait for hydration. Clicking "Sign up" before the wasm
+      // has taken over the form posts it natively: the server signs the
+      // account up, then 302s back to /signup?token=... (run 44866377910's
+      // trace), and the test sees a non-2xx answer and no redirect to "/".
+      await waitForHydration(signupPage);
       await signupPage.getByLabel("Name").fill("Invited Friend");
       await signupPage.getByLabel("Password", { exact: true }).fill("a-friends-password-99");
       await signupPage.getByLabel("Confirm password").fill("a-friends-password-99");
@@ -67,6 +73,7 @@ test("creating an invite and signing up through it creates a working account", a
     const reusePage = await reuseContext.newPage();
     try {
       await reusePage.goto(`/signup?token=${token}`);
+      await waitForHydration(reusePage);
       await reusePage.getByLabel("Name").fill("Second Attempt");
       await reusePage.getByLabel("Password", { exact: true }).fill("another-password-99");
       await reusePage.getByLabel("Confirm password").fill("another-password-99");

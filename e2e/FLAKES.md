@@ -41,6 +41,23 @@ failing logs do show, and what they do not:
 - Shared state (the one Neon branch) and order: no log shows either. Specs seed
   uniquely named rows and delete them; `account.spec.ts` is serial by design.
 
+## Cause found, from run 44866377910 (PR #61, trace artifact `playwright-traces-pr-61`)
+
+- `invite:17` failed on all three tries. The trace's `sign_up_via_invite`
+  request is a form-encoded POST answered `302` with a `session` cookie and
+  `Location: /signup?token=…`: a native form post, not the wasm fetch. The
+  spec's `signupPage` comes from `browser.newContext()`, so its `goto` does not
+  wait for hydration (the fixture only wraps the `page` fixture); clicking
+  "Sign up" before hydration posts natively and lands back on the form. That is
+  the same `URL still /signup?token=…` shape as the 15000ms failures above, so
+  those were likely this, not a slow backend. Fix: `waitForHydration` on both
+  new pages. Not yet shown to hold over several runs.
+- `account:206` (first try) and `bulk-add:4` (both tries): the traces show the
+  Fly proxy answering `502` (`log_in` after 2447ms; `POST /cards/bulk` after
+  1697ms). The app was not answering. **Cause of the 502s not found**: the
+  memory sampler's `samples.csv` is empty (ssh to the machine failed), so a
+  restart/OOM is neither shown nor ruled out. No spec change addresses it.
+
 ## Fix (unproven)
 
 The specs now wait on the server's response to the request they triggered
