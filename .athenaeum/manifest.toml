@@ -14,11 +14,18 @@ paths = ["crates/importer/**"]
 [components.web]
 pack = "rust"
 root = "."
-paths = ["crates/web/**", "editor/**", "migrations/**", "e2e/**"]
+paths = ["crates/web/**", "editor/**", "migrations/**"]
+
+# The end-to-end specs are tests, and are reviewed as tests: whether each would fail if
+# the behaviour it guards broke, and how it waits.
+[components.e2e]
+pack = "test-truth"
+root = "."
+paths = ["e2e/**"]
 
 [components.platform]
 root = "."
-paths = [".github/**", "Dockerfile", "docker-compose.yml", "flake.nix", "flake.lock", "justfile", "fly*.toml", "garage.toml", "deny.toml", "scripts/**"]
+paths = ["AGENTS.md", ".github/**", "Dockerfile", "docker-compose.yml", "flake.nix", "flake.lock", "justfile", "fly*.toml", "garage.toml", "deny.toml", "scripts/**"]
 
 [gates.format]
 run = ["just", "fmt-check"]
