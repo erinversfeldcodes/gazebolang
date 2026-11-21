@@ -542,7 +542,7 @@ jobs:
       - name: Upload preview memory samples
         if: always() && steps.sampler.outputs.measuring == 'true'
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: preview-memory-samples-pr-${{ github.event.number }}
           path: memory/
@@ -550,7 +550,7 @@ jobs:
           retention-days: 14
       - name: Upload Playwright traces (failures only)
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-traces-pr-${{ github.event.number }}
           path: e2e/test-results/
