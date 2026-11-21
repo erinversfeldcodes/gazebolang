@@ -86,13 +86,23 @@ trace and fixed.
 
 ## Failure rate
 
-Before: of the last 68 completed `Preview` runs on non-dependabot branches
-(fetched 2026-11-19), 31 ended in failure, including deploy failures; the e2e
-share is not separated out. The specs above failed in 2 of the 3 most recent
-runs inspected (44473605145, 44482710078).
+Before (measured 2026-11-21, job `Run E2E suite against preview` only): of the
+68 most recent `Preview` runs (`gh run list --workflow Preview --limit 68
+--json databaseId,conclusion,headBranch,status,createdAt`, runs from
+2026-11-19T07:29Z), 41 were completed and not on a `dependabot/*` branch. For
+each, `gh run view <id> --json jobs` gave the conclusions of `Deploy Fly
+preview app` and `Run E2E suite against preview`. Excluded from the rate: 11
+runs where both jobs were skipped, and 2 cancelled. No deploy job failed in
+this sample, so no deploy failure had to be excluded (deploy failures are
+#53). Of the 28 runs where the e2e job ran to a result, 5 failed (18%) and 23
+passed: 44868508885, 44866377910, 44865926306, 44787924409, 44482710078. The
+causes of those five were not each read from `--log-failed` for this
+measurement, so they are not all attributed to the specs above. A failed run
+is not necessarily a flake; PR runs include changes that may have broken a
+spec.
 
-After: **not measured.** The only post-change `Preview` run so far is
-44501511299 (this PR), which passed; one run shows nothing about an
-intermittent failure. Compare the same 68 runs after merge
-(`gh run list --workflow Preview --json databaseId,conclusion`, then
-`--log-failed` for each red) and record the figures here.
+After: **owed.** Not measured. Repeat the same commands over the first 68
+`Preview` runs after merge (at least 28 e2e results) and record the e2e
+failure share here, with the cause of each red from `--log-failed`. The one
+post-change run so far (44501511299) passed, which shows nothing about an
+intermittent failure.
