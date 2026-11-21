@@ -4,8 +4,8 @@
 #![allow(clippy::missing_errors_doc)]
 
 use argon2::Argon2;
-use password_hash::rand_core::OsRng;
-use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use password_hash::phc::PasswordHash;
+use password_hash::{PasswordHasher, PasswordVerifier};
 use rand::RngExt;
 use sqlx::PgPool;
 use std::sync::{LazyLock, OnceLock};
@@ -58,9 +58,8 @@ pub fn build_session_cookie(token: String) -> tower_cookies::Cookie<'static> {
 }
 
 fn hash_password(password: &str) -> Result<String, String> {
-    let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map(|hash| hash.to_string())
         .map_err(|e| e.to_string())
 }
@@ -655,6 +654,32 @@ pub async fn require_user(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Produced by `argon2` 0.5.3 with `password-hash` 0.5.0 (the versions
+    /// before the 0.6 upgrade) for [`STORED_HASH_PASSWORD`]. Stored user
+    /// hashes look like this, so they must keep verifying.
+    const STORED_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$T7K5JjqB1fUUQzsQ/+MR+w$Xpb1teSfij478HKP1JRtuEHb2NyWmv9TfTRaqOhIPUI";
+    const STORED_HASH_PASSWORD: &str = "correct horse battery staple";
+
+    #[test]
+    fn a_hash_stored_by_the_previous_versions_still_verifies() {
+        assert!(verify_password(STORED_HASH_PASSWORD, STORED_HASH));
+        assert!(!verify_password("not the password", STORED_HASH));
+    }
+
+    #[test]
+    fn a_new_hash_verifies_and_a_wrong_password_does_not() {
+        let hash = hash_password("a brand new password").unwrap();
+        assert!(hash.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
+        assert!(verify_password("a brand new password", &hash));
+        assert!(!verify_password("a brand new passwore", &hash));
+        assert_ne!(hash, hash_password("a brand new password").unwrap());
+    }
+
+    #[test]
+    fn a_malformed_hash_does_not_verify() {
+        assert!(!verify_password("anything", "not a phc string"));
+    }
 
     async fn password_hash_for(pool: &PgPool, email: &str) -> Option<String> {
         sqlx::query_scalar("SELECT password_hash FROM users WHERE email = $1")
