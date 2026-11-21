@@ -445,6 +445,8 @@ jobs:
       # have already left the machine by then.
       - uses: superfly/flyctl-actions/setup-flyctl@98172f70657cb3e15db199af139be99bd3e61200 # master
         continue-on-error: true
+      - name: Test the memory sampler's write decision
+        run: sh scripts/preview-memory-sampler.test.sh
       - name: Start memory sampler on the preview machine
         id: sampler
         continue-on-error: true
@@ -460,36 +462,15 @@ jobs:
           # Read the samples back even if starting the sampler looks like it
           # failed (the ssh call can die after the sampler is running).
           echo "measuring=true" >> "$GITHUB_OUTPUT"
-          # Runs on the machine, detached. Re-finds the `web` pid when it
-          # changes, so a restarted process is followed. One line per second,
-          # tagged RSS_SAMPLE, into pid 1's stdout (the machine's log stream).
-          # Stops itself after 40 minutes (more than the job's timeout), so a
-          # sampler is never left behind on a reused machine. A reboot kills
-          # it; samples after a reboot are lost until it is started again.
-          cat > sampler.sh <<'EOF'
-          n=0
-          pid=""
-          while [ $n -lt 2400 ]; do
-            # Scan /proc only when the cached pid is gone or no longer `web`,
-            # so a steady-state sample forks little on a small machine.
-            if [ -z "$pid" ] || [ "$(cat /proc/$pid/comm 2>/dev/null)" != web ]; then
-              pid=""
-              for d in /proc/[0-9]*; do
-                if [ "$(cat $d/comm 2>/dev/null)" = web ]; then pid=${d#/proc/}; break; fi
-              done
-            fi
-            st="rss_kb=0 hwm_kb=0"
-            if [ -n "$pid" ]; then
-              st=$(awk '/^VmRSS/{r=$2}/^VmHWM/{h=$2}END{print "rss_kb=" r+0 " hwm_kb=" h+0}' /proc/$pid/status 2>/dev/null)
-            fi
-            up=$(cut -d' ' -f1 /proc/uptime)
-            av=$(awk '/^MemAvailable/{print $2}' /proc/meminfo)
-            echo "RSS_SAMPLE uptime_s=$up epoch_s=$(date +%s) $st memavailable_kb=$av" > /proc/1/fd/1
-            n=$((n+1))
-            sleep 1
-          done
-          EOF
-          encoded=$(base64 -w0 sampler.sh)
+          # The sampler is scripts/preview-memory-sampler.sh (its write
+          # decision is tested by scripts/preview-memory-sampler.test.sh). It
+          # runs on the machine, detached, reads once a second but writes a
+          # RSS_SAMPLE line only on a change, low memory or a 15 s heartbeat,
+          # so Fly's 100-line log buffer keeps the app's own lines. It stops
+          # itself after 40 minutes (more than the job's timeout), so a sampler
+          # is never left behind on a reused machine. A reboot kills it;
+          # samples after a reboot are lost until it is started again.
+          encoded=$(base64 -w0 scripts/preview-memory-sampler.sh)
           if timeout 90 flyctl ssh console --app "$APP_NAME" \
             -C "sh -c 'echo $encoded | base64 -d > /tmp/sampler.sh; nohup sh /tmp/sampler.sh </dev/null >/dev/null 2>&1 &'"; then
             echo "started=true" >> "$GITHUB_OUTPUT"
@@ -522,12 +503,12 @@ jobs:
               awk '
                 function val(key,   i) { for (i = 1; i <= NF; i++) if (index($i, key "=") == 1) return substr($i, length(key) + 2) + 0; return "" }
                 {
-                  up = val("uptime_s"); ep = val("epoch_s"); r = val("rss_kb"); h = val("hwm_kb"); a = val("memavailable_kb")
+                  up = val("uptime_s"); ep = val("epoch_s"); r = val("max_rss_kb"); h = val("hwm_kb"); a = val("min_avail_kb")
                   if (up == "" || a == "") next
                   n++
                   if (n > 1) {
                     if (up < prev) { reboots++ }
-                    else if (up - prev > 5) { gaps++ }
+                    else if (up - prev > 20) { gaps++ }
                   }
                   prev = up
                   if (ep != "") lastep = ep
@@ -539,13 +520,14 @@ jobs:
                   # An OOM kill stops the samples for good, so also compare the
                   # last sample with the end of the suite (one sample a second,
                   # plus some delay in log shipping).
-                  if (lastep != "" && now - lastep > 20) { trailing = now - lastep }
-                  printf "- Samples seen: %d (one per second while the sampler ran)\n", n
+                  if (lastep != "" && now - lastep > 30) { trailing = now - lastep }
+                  printf "- Lines read: %d (the sampler reads once a second but writes a line only on a change of 10 MB or more, low memory, or every 15 s; the figures use max_rss_kb, hwm_kb and min_avail_kb)\n", n
+                  if (n >= 100) printf "- **100 lines is the limit of Fly'"'"'s log buffer: the series may be cut short and earlier lines may be lost**, so the figures may miss the start of the run.\n"
                   printf "- Peak VmRSS: %d kB (%.1f MB)\n", pr, pr/1024
                   printf "- Peak VmHWM: %d kB (%.1f MB)\n", ph, ph/1024
                   printf "- Lowest MemAvailable: %d kB (%.1f MB)\n", minA, minA/1024
                   if (reboots > 0 || gaps > 0 || trailing > 0 || oom > 0)
-                    printf "- **The machine rebooted during this run** (%d uptime reset(s), %d gap(s) over 5 s, samples ended %d s before the suite did, %d Out of memory line(s) in the logs). Samples taken after a reboot are lost until the sampler is started again, so the figures above cover only the time the sampler was running.\n", reboots, gaps, trailing, oom
+                    printf "- **The machine rebooted during this run** (%d uptime reset(s), %d gap(s) over 20 s, samples ended %d s before the suite did, %d Out of memory line(s) in the logs). Samples taken after a reboot are lost until the sampler is started again, so the figures above cover only the time the sampler was running.\n", reboots, gaps, trailing, oom
                   else
                     printf "- No reboot seen: uptime never went backwards, no gaps, samples ran up to the end of the suite and no Out of memory lines.\n"
                 }' now="$now" oom="$(wc -l < memory/oom.txt | tr -d ' ')" memory/samples.txt
