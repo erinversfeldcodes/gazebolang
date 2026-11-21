@@ -70,15 +70,15 @@ test.describe("card list paging", () => {
     await page.getByLabel("Filter by tag").selectOption(tag);
     await page.getByLabel("Cards per page").selectOption("12");
     const pager = page.locator(".card-pager").first();
-    // Don't click Next on the previous (unfiltered) pager: on the preview
-    // stack the refetches land late, so wait until the filtered page of 12
-    // is what is on screen.
+    // Wait until the filtered page of 12 is on screen before clicking Next,
+    // so the click lands on that pager and not the previous one. Late
+    // refetches on the preview stack are the suspected reason (unproven).
     await expect(pager.getByText(`Showing 1–12 of ${COUNT}`)).toBeVisible();
     await pager.getByRole("button", { name: "Next" }).click();
     await expect(page.getByText(`Showing 13–13 of ${COUNT}`).first()).toBeVisible();
 
-    // Wait for the refetch this change triggers (the condition that matters)
-    // instead of a longer timeout on the assertions below.
+    // Wait for the refetch this change triggers instead of lengthening the
+    // assertions below. Whether it is the cause of the failure is unproven.
     await withServerCall(page, "list_cards", () =>
       page.getByLabel("Cards per page").selectOption("25"),
     );

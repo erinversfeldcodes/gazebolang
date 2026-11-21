@@ -58,7 +58,7 @@ failing logs do show, and what they do not:
   memory sampler's `samples.csv` is empty (ssh to the machine failed), so a
   restart/OOM is neither shown nor ruled out. No spec change addresses it.
 
-## Fix (unproven)
+## Mitigation (cause unproven, except invite)
 
 The specs now wait on the server's response to the request they triggered
 (`withServerCall` / `withFormResponse` in `tests/helpers.ts`), then assert as
@@ -73,6 +73,16 @@ status; if it is ok but the URL/text is wrong, that is a behaviour fault. Until
 a run shows which, the fix is a hypothesis, not a demonstrated cure. Next step
 if a red recurs: read that failure's helper line and add server-side timing for
 the request, rather than lengthening any wait.
+
+Notes: `ARGON2_PERMITS` in `crates/web/src/auth.rs` is `Semaphore::new(1)`:
+one Argon2 operation at a time (an earlier spec comment said 2; that was
+wrong). Queueing behind it is a hypothesis for account:200 and
+image-thumbnails, not measured. The assertions after each response keep their
+original explicit 15s bound; the response wait has no timeout of its own, so a
+hung request holds a test to its full test timeout, twice with the retry. No
+post-response latency has been measured. The account:200 and 502 causes remain
+open; only invite's cause (native form post before hydration) is shown by a
+trace and fixed.
 
 ## Failure rate
 

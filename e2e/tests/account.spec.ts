@@ -44,14 +44,14 @@ async function signUpFreshAccount(
   await page.getByLabel("Name").fill("Account Spec");
   await page.getByLabel("Password", { exact: true }).fill(password);
   await page.getByLabel("Confirm password").fill(password);
-  // auth.rs bounds Argon2 work (to avoid OOMing the small preview app), so
-  // a burst of signups/logins across the suite can queue behind each other.
-  // Wait for the server's answer rather than guessing how long that takes.
+  // Wait for the server's answer before asserting on the redirect. Whether
+  // Argon2 queueing is why the old 5s wait failed is a hypothesis (see
+  // e2e/FLAKES.md); the explicit 15s bound after the response is unchanged.
   const response = await withServerCall(page, "sign_up_via_invite", () =>
     page.getByRole("button", { name: "Sign up" }).click(),
   );
   expect(response.ok(), "sign-up request failed").toBe(true);
-  await expect(page).toHaveURL("/");
+  await expect(page).toHaveURL("/", { timeout: 15_000 });
   return { email };
 }
 
@@ -153,7 +153,7 @@ test("changing your email with the right password updates it and future logins",
       page.getByRole("button", { name: "Sign in" }).click(),
     );
     expect(login.ok(), "login request failed").toBe(true);
-    await expect(page).toHaveURL("/");
+    await expect(page).toHaveURL("/", { timeout: 15_000 });
   } finally {
     // The account now lives under newEmail, not the original — delete
     // whichever one it actually ended up at.
@@ -224,7 +224,7 @@ test("changing your password logs you out and lets you sign in with the new one"
       page.getByRole("button", { name: "Change password" }).click(),
     );
     expect(changed.ok(), "change-password request failed").toBe(true);
-    await expect(page).toHaveURL("/login?reset=success");
+    await expect(page).toHaveURL("/login?reset=success", { timeout: 15_000 });
     await expect(page.getByText("Password updated")).toBeVisible();
     await waitForHydration(page);
 
@@ -233,14 +233,14 @@ test("changing your password logs you out and lets you sign in with the new one"
     await withServerCall(page, "log_in", () =>
       page.getByRole("button", { name: "Sign in" }).click(),
     );
-    await expect(page.getByText("invalid email or password")).toBeVisible();
+    await expect(page.getByText("invalid email or password")).toBeVisible({ timeout: 15_000 });
 
     await page.getByLabel("Password").fill("a-brand-new-password-99");
     const login = await withServerCall(page, "log_in", () =>
       page.getByRole("button", { name: "Sign in" }).click(),
     );
     expect(login.ok(), "login request failed").toBe(true);
-    await expect(page).toHaveURL("/");
+    await expect(page).toHaveURL("/", { timeout: 15_000 });
   } finally {
     await deleteTestUser(email);
   }

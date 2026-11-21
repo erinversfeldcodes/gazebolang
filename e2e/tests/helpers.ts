@@ -60,11 +60,11 @@ export async function withServerResponse<T>(
 // Like withServerResponse, but resolves on the response whatever its status,
 // and returns it. For a server action whose outcome the test asserts on
 // afterwards (a sign-up, a login, a password change): the gate is the
-// server's answer arriving, not a clock. The preview runs one Argon2
-// operation at a time (auth.rs's ARGON2_PERMITS), so a hash can legitimately
-// queue behind other specs' for several seconds; a fixed `expect` timeout
-// turns that queueing into a failure, while waiting for the response does not.
-// If the response never comes, the test fails at its own timeout.
+// server's answer arriving, not a clock. Hypothesis, not shown: auth.rs
+// allows one Argon2 operation at a time (ARGON2_PERMITS = 1), so a hash may
+// queue behind other specs'. This helper only waits for the response; it has
+// no timeout of its own, so a request that never answers holds the test to its
+// full test timeout. Callers keep an explicit timeout on what they assert after.
 export async function withServerCall<T>(
   page: Page,
   fnName: string,

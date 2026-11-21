@@ -35,9 +35,8 @@ async function createCardWithImage(page: Page, png: Buffer, prefix: string): Pro
     mimeType: "image/png",
     buffer: png,
   });
-  // The upload is decoded and thumbnailed before the redirect, so on the
-  // preview stack it can outlast the default 5s: wait for the POST to be
-  // answered, then check where it sent us.
+  // Wait for the POST to be answered, then check where it sent us. That the
+  // old 5s wait failed because of slow decoding is a hypothesis, not shown.
   await withFormResponse(page, /^\/cards\/new$/, () =>
     page.getByRole("button", { name: "Add" }).click(),
   );

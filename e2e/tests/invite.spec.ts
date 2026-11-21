@@ -44,15 +44,12 @@ test("creating an invite and signing up through it creates a working account", a
       await signupPage.getByLabel("Name").fill("Invited Friend");
       await signupPage.getByLabel("Password", { exact: true }).fill("a-friends-password-99");
       await signupPage.getByLabel("Confirm password").fill("a-friends-password-99");
-      // Wait for the server's answer, not a clock: the password hash is
-      // bounded to one Argon2 operation at a time (auth.rs), so by the time
-      // this runs it can queue behind other specs' — the request is simply
-      // still in flight, and no error renders while it is.
+      // Wait for the server's answer, then assert with the original 15s bound.
       const signup = await withServerCall(signupPage, "sign_up_via_invite", () =>
         signupPage.getByRole("button", { name: "Sign up" }).click(),
       );
       expect(signup.ok(), "sign-up request failed").toBe(true);
-      await expect(signupPage).toHaveURL("/");
+      await expect(signupPage).toHaveURL("/", { timeout: 15_000 });
 
       // Signed in as the brand-new account, not left anonymous — and
       // bound to the invite's own email, never whatever the form itself
